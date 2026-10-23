@@ -471,10 +471,41 @@ class MainActivity : Activity() {
     }
 
     private fun showFrnRooms() {
-        val selected = selectedFrnRoom ?: run {
-            showFrn()
+        val activeRoom = gatewayService?.getConnectedFrnRoom()
+        val connected = gatewayService?.getFrnStatus() ==
+            GatewayService.FrnStatus.CONNECTED
+
+        if (!connected || activeRoom == null) {
+            currentPage = "FRN_ROOMS"
+
+            val content = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(20), dp(28), dp(20), dp(20))
+                setBackgroundColor(bg)
+            }
+
+            content.addView(label(
+                "FRN · Räume", 24f, Color.WHITE, true
+            ))
+            content.addView(label(
+                "Keine aktive FRN-Verbindung. " +
+                    "Bitte zuerst einen Server verbinden.",
+                16f, muted
+            ).apply {
+                setPadding(0, dp(20), 0, dp(20))
+            })
+            content.addView(button("Zur Serverliste") {
+                showFrn()
+            })
+
+            showGatewayScreen(ScrollView(this).apply {
+                addView(content)
+            })
             return
         }
+
+        selectedFrnRoom = activeRoom
+        val selected = activeRoom
 
         currentPage = "FRN_ROOMS"
 
@@ -1387,8 +1418,194 @@ class MainActivity : Activity() {
         for (name in listOf("Audio & PTT", "Schutzfunktionen", "Darstellung")) {
             root.addView(button(name) { showPage(name) })
         }
+        root.addView(label("Software & Updates", 19f, accent, true).apply {
+            setPadding(0, dp(24), 0, dp(12))
+        })
+        root.addView(button("Software-Update") {
+            showSoftwareUpdate()
+        })
         root.addView(button("← Zurück zur Übersicht") { showHome() })
         showGatewayScreen(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun showSoftwareUpdate() {
+        currentPage = "Software-Update"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("Software-Update", 24f, Color.WHITE, true))
+
+        val packageInfo = packageManager.getPackageInfo(packageName, 0)
+        val installedVersion = packageInfo.versionName ?: "Unbekannt"
+
+        root.addView(label(
+            "Installierte Version: $installedVersion",
+            16f, muted
+        ).apply {
+            setPadding(0, dp(16), 0, dp(12))
+        })
+
+        val status = label(
+            "Noch keine Updateprüfung durchgeführt.",
+            15f, muted
+        )
+        root.addView(status)
+
+        val changelog = label("", 14f, muted).apply {
+            setPadding(0, dp(12), 0, dp(12))
+        }
+        root.addView(changelog)
+
+        var availableUpdate: MobileUpdateInfo? = null
+        var downloading = false
+
+        val installButton = button("Update herunterladen und installieren") {
+            val update = availableUpdate
+
+            if (update == null || downloading) {
+                status.text = "Bitte zuerst nach Updates suchen."
+            } else {
+                val cachedApk = java.io.File(
+                    cacheDir, "updates/FunkGateway-Mobile.apk"
+                )
+
+                val cacheValid = cachedApk.isFile &&
+                    MobileUpdateVerifier.verify(
+                        this, cachedApk, update
+                    ).isSuccess
+
+                if (cacheValid) {
+                    status.text = "Gespeichertes Update geprüft."
+
+                    if (!packageManager.canRequestPackageInstalls()) {
+                        status.text =
+                            "Bitte Installation aus dieser Quelle erlauben. " +
+                            "Danach erneut auf Update installieren tippen."
+                    } else {
+                        status.text = "Öffne Android-Installation ..."
+                    }
+
+                    MobileUpdateInstaller.install(
+                        this, cachedApk, update
+                    ).onFailure { error ->
+                        status.text =
+                            "Installation konnte nicht gestartet werden: " +
+                            (error.message ?: "Unbekannter Fehler")
+                    }
+                    return@button
+                }
+
+                if (cachedApk.exists()) {
+                    cachedApk.delete()
+                }
+
+                downloading = true
+                status.text = "Lade ${update.version} herunter ..."
+                run {
+                    MobileUpdateDownload.download(
+                        this,
+                        update,
+                        onProgress = { percent ->
+                            if (currentPage == "Software-Update") {
+                                status.text = "Download: $percent %"
+                            }
+                        },
+                        onFinished = { result ->
+                            downloading = false
+
+                            if (currentPage != "Software-Update") {
+                                return@download
+                            }
+
+                            result.fold(
+                                onSuccess = { apk ->
+                                    status.text = "Prüfe heruntergeladene APK ..."
+
+                                    MobileUpdateVerifier.verify(
+                                        this, apk, update
+                                    ).fold(
+                                        onSuccess = {
+                                            status.text =
+                                                "APK geprüft. Öffne Android-Installation ..."
+
+                                            MobileUpdateInstaller.install(
+                                                this, apk, update
+                                            ).onFailure { error ->
+                                                status.text =
+                                                    "Installation konnte nicht gestartet werden: " +
+                                                    (error.message ?: "Unbekannter Fehler")
+                                            }
+                                        },
+                                        onFailure = { error ->
+                                            status.text =
+                                                "APK-Prüfung fehlgeschlagen: " +
+                                                (error.message ?: "Unbekannter Fehler")
+                                            apk.delete()
+                                        }
+                                    )
+                                },
+                                onFailure = { error ->
+                                    status.text =
+                                        "Download fehlgeschlagen: " +
+                                        (error.message ?: "Unbekannter Fehler")
+                                }
+                            )
+                        }
+                    )
+                }
+            }
+        }
+        installButton.visibility = View.GONE
+
+        root.addView(installButton)
+
+        val checkButton = button("Nach Updates suchen") {
+            if (downloading) {
+                status.text = "Bitte laufenden Download abschließen."
+                return@button
+            }
+            availableUpdate = null
+            installButton.visibility = View.GONE
+            status.text = "Prüfe GitHub Releases ..."
+            changelog.text = ""
+
+            MobileUpdater.check(this) { result ->
+                if (currentPage != "Software-Update") return@check
+
+                result.fold(
+                    onSuccess = { update ->
+                        if (update == null) {
+                            status.text = "Keine neuere Version verfügbar."
+                        } else {
+                            availableUpdate = update
+                            installButton.visibility = View.VISIBLE
+                            status.text =
+                                "Neue Version verfügbar: ${update.version}"
+                            changelog.text = update.changelog.ifBlank {
+                                "Kein Änderungsprotokoll vorhanden."
+                            }
+                        }
+                    },
+                    onFailure = { error ->
+                        status.text = "Updateprüfung fehlgeschlagen: " +
+                            (error.message ?: "Unbekannter Fehler")
+                    }
+                )
+            }
+        }
+        root.addView(checkButton)
+
+        root.addView(button("← Zurück zu Einstellungen") {
+            showSettings()
+        })
+
+        showGatewayScreen(ScrollView(this).apply {
+            addView(root)
+        })
     }
 
     private fun showFrnChat() {
