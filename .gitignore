@@ -1,0 +1,37 @@
+# Gradle und Android
+.gradle/
+build/
+**/build/
+local.properties
+.cxx/
+.externalNativeBuild/
+captures/
+
+# Entwicklungsumgebungen
+.idea/
+*.iml
+.vscode/
+
+# Signaturschlüssel und Zugangsdaten
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.env
+.env*
+keystore.properties
+signing.properties
+secrets.properties
+google-services.json
+
+# Lokale Sicherungen und temporäre Dateien
+*.bak
+*.bak-*
+*.orig
+*.swp
+*~
+
+# Historische Kotlin-Sicherungen
+*.kt.vor_*

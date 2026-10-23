@@ -1,0 +1,1636 @@
+package org.funkgateway.mobile
+
+import android.app.Activity
+import android.os.Bundle
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Spinner
+import android.widget.ArrayAdapter
+import org.funkgateway.mobile.frn.FrnSystemManager
+import org.funkgateway.mobile.frn.FrnCache
+
+class MainActivity : Activity() {
+    private var gatewayService: GatewayService? = null
+    private var gatewayBound = false
+    private var refreshFrnRoomStatus: (() -> Unit)? = null
+    private var refreshFrnParticipantsView: (() -> Unit)? = null
+
+    private val gatewayConnection = object : ServiceConnection {
+        override fun onServiceConnected(
+            name: ComponentName?,
+            binder: IBinder?
+        ) {
+            gatewayService =
+                (binder as? GatewayService.LocalBinder)?.getService()
+            if (currentPage == "FRN_ROOM") {
+                refreshFrnRoomStatus?.invoke()
+            }
+            if (currentPage == "FRN_PARTICIPANTS") {
+                refreshFrnParticipantsView?.invoke()
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            gatewayService = null
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        gatewayBound = bindService(
+            Intent(this, GatewayService::class.java),
+            gatewayConnection,
+            Context.BIND_AUTO_CREATE
+        )
+    }
+
+    override fun onStop() {
+        if (gatewayBound) {
+            unbindService(gatewayConnection)
+            gatewayBound = false
+        }
+        gatewayService = null
+        super.onStop()
+    }
+
+
+    private val bg = Color.rgb(17, 23, 34)
+    private val panel = Color.rgb(32, 42, 54)
+    private val accent = Color.rgb(49, 217, 211)
+    private val muted = Color.rgb(181, 194, 207)
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
+
+    private fun rounded(color: Int): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(16).toFloat()
+        }
+
+    private fun label(
+        value: String,
+        size: Float,
+        color: Int,
+        bold: Boolean = false
+    ): TextView = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(color)
+        if (bold) setTypeface(null, Typeface.BOLD)
+    }
+
+    private fun button(value: String, action: () -> Unit): Button =
+        Button(this).apply {
+            text = value
+            textSize = 16f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = rounded(panel)
+            setOnClickListener { action() }
+        }
+
+    private var currentPage = "Start"
+    private var selectedFrnRoom: org.funkgateway.mobile.frn.FrnRoom? = null
+
+    private fun availableFrnRooms(): List<org.funkgateway.mobile.frn.FrnRoom> {
+        val selected = selectedFrnRoom ?: return emptyList()
+        val cached = roomsForSelectedFrnServer()
+
+        val serverNames = if (
+            gatewayService?.getFrnStatus() ==
+                GatewayService.FrnStatus.CONNECTED
+        ) {
+            gatewayService?.getFrnServerRooms().orEmpty()
+        } else {
+            emptyList()
+        }
+
+        if (serverNames.isEmpty()) return cached
+
+        return serverNames.map { name ->
+            cached.firstOrNull { it.room.equals(name, ignoreCase = true) }
+                ?: selected.copy(room = name, clients = 0)
+        }
+    }
+
+    private fun roomsForSelectedFrnServer(): List<org.funkgateway.mobile.frn.FrnRoom> {
+        val selected = selectedFrnRoom ?: return emptyList()
+        return FrnCache.rooms
+            .filter {
+                it.server.equals(selected.server, ignoreCase = true) &&
+                    it.port == selected.port
+            }
+            .distinctBy { it.room.lowercase() }
+            .sortedBy { it.room.lowercase() }
+    }
+
+    private var frnRegistrationInProgress = false
+
+
+    private fun showFrn() {
+        if (FrnCache.lastUpdated == 0L) FrnCache.load(this)
+        currentPage = "FRN"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(12))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("FRN · Server", 23f, Color.WHITE, true))
+
+        val activeRoom = gatewayService?.getConnectedFrnRoom()
+        val activeState = gatewayService?.getFrnStatus()
+        val activeBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = rounded(panel)
+        }
+
+        activeBox.addView(label(
+            "FRN-Verbindung",
+            15f, Color.WHITE, true
+        ))
+
+        val activeDescription = when (activeState) {
+            GatewayService.FrnStatus.CONNECTED ->
+                if (activeRoom != null) {
+                    "${activeRoom.server}:${activeRoom.port} · ${activeRoom.room}"
+                } else {
+                    "Verbunden · Raumdaten nicht verfügbar"
+                }
+            GatewayService.FrnStatus.CONNECTING ->
+                "Verbindungsaufbau läuft ..."
+            else ->
+                "Keine aktive FRN-Verbindung"
+        }
+
+        activeBox.addView(label(
+            activeDescription,
+            14f, muted
+        ).apply {
+            setPadding(0, dp(8), 0, dp(12))
+        })
+
+        val disconnectActive = button("Aktive FRN-Verbindung trennen") {
+            gatewayService?.disconnectFrn()
+            showFrn()
+        }
+        disconnectActive.isEnabled =
+            activeState == GatewayService.FrnStatus.CONNECTED ||
+            activeState == GatewayService.FrnStatus.CONNECTING
+        activeBox.addView(disconnectActive)
+
+        root.addView(activeBox, LinearLayout.LayoutParams(
+            -1, -2
+        ).apply {
+            topMargin = dp(12)
+            bottomMargin = dp(12)
+        })
+
+
+        root.addView(label(
+            "FRN-SystemManager auswählen",
+            16f, Color.WHITE, true
+        ).apply {
+            setPadding(0, dp(18), 0, dp(8))
+        })
+        val options = listOf(
+            "Alle SystemManager",
+            "DE Original",
+            "DE Alternativ",
+            "Russland"
+        )
+
+        val selector = Spinner(this)
+        selector.adapter = ArrayAdapter(
+            this,
+            R.layout.frn_spinner_item,
+            options
+        )
+        (selector.adapter as ArrayAdapter<*>).setDropDownViewResource(R.layout.frn_spinner_item)
+        selector.minimumHeight = dp(52)
+        val spinnerFrame = android.widget.FrameLayout(this)
+
+        spinnerFrame.addView(
+            selector,
+            android.widget.FrameLayout.LayoutParams(-1, -1)
+        )
+
+        val dropdownArrow = android.widget.ImageView(this).apply {
+            setImageResource(R.drawable.frn_dropdown_arrow)
+            contentDescription = "SystemManager auswählen"
+            isClickable = false
+            isFocusable = false
+        }
+
+        spinnerFrame.addView(
+            dropdownArrow,
+            android.widget.FrameLayout.LayoutParams(
+                dp(32),
+                dp(32),
+                Gravity.END or Gravity.CENTER_VERTICAL
+            ).apply {
+                rightMargin = dp(8)
+            }
+        )
+
+        root.addView(
+            spinnerFrame,
+            LinearLayout.LayoutParams(-1, dp(52))
+        )
+
+        val status = label(
+            "Noch keine Serverliste geladen",
+            14f,
+            muted
+        ).apply {
+            setPadding(0, dp(12), 0, dp(12))
+        }
+        root.addView(status)
+
+        val scroll = ScrollView(this)
+        val results = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        fun selectedManagerFilter(): String = when (selector.selectedItemPosition) {
+            1 -> "de_orig"
+            2 -> "de_alt"
+            3 -> "ru"
+            else -> ""
+        }
+        var favoritesOnly = false
+        scroll.addView(results)
+
+        selector.setSelection(FrnCache.selectedManager)
+
+        if (FrnCache.lastUpdated > 0L) {
+            status.text = org.funkgateway.mobile.frn.FrnStats.summary(FrnCache.rooms) + " · gespeichert"
+
+            org.funkgateway.mobile.frn.FrnServerListView.populate(this, results, FrnCache.rooms, "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+        }
+
+        val searchField = android.widget.EditText(this).apply {
+            hint = "Server oder Raum suchen …"
+            setSingleLine(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(muted)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = rounded(panel)
+        }
+        val searchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        searchRow.addView(
+            searchField,
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        val clearSearch = android.widget.TextView(this).apply {
+            text = "✕"
+            textSize = 24f
+            setTextColor(Color.WHITE)
+            gravity = android.view.Gravity.CENTER
+            contentDescription = "Suche löschen"
+            setOnClickListener { searchField.text.clear() }
+        }
+        searchRow.addView(
+            clearSearch,
+            LinearLayout.LayoutParams(dp(48), dp(52))
+        )
+        root.addView(searchRow)
+
+        fun showFavoriteSelection() {
+            org.funkgateway.mobile.frn.FrnServerListView.populate(
+                this@MainActivity,
+                results,
+                FrnCache.rooms,
+                searchField.text.toString(),
+                selectedManagerFilter(),
+                onRoomClick = { room -> showFrnRoom(room) },
+                favoritesOnly = favoritesOnly
+            )
+        }
+
+        val favoritesRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val allServersButton = button("Alle Server") {
+            favoritesOnly = false
+            showFavoriteSelection()
+        }
+
+        val favoriteServersButton = button("★ Favoriten") {
+            favoritesOnly = true
+            showFavoriteSelection()
+        }
+
+        fun refreshFavoriteButtons() {
+            allServersButton.setTextColor(
+                if (favoritesOnly) muted else accent
+            )
+            favoriteServersButton.setTextColor(
+                if (favoritesOnly) accent else muted
+            )
+        }
+
+        favoritesRow.addView(
+            allServersButton,
+            LinearLayout.LayoutParams(0, dp(44), 1f)
+        )
+        favoritesRow.addView(
+            favoriteServersButton,
+            LinearLayout.LayoutParams(0, dp(44), 1f)
+        )
+
+        allServersButton.setOnClickListener {
+            favoritesOnly = false
+            showFavoriteSelection()
+            refreshFavoriteButtons()
+        }
+
+        favoriteServersButton.setOnClickListener {
+            favoritesOnly = true
+            showFavoriteSelection()
+            refreshFavoriteButtons()
+        }
+
+        root.addView(favoritesRow)
+        refreshFavoriteButtons()
+
+
+        clearSearch.visibility = android.view.View.GONE
+        searchField.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                clearSearch.visibility = if (s.isNullOrEmpty()) android.view.View.GONE else android.view.View.VISIBLE
+                org.funkgateway.mobile.frn.FrnServerListView.populate(
+                    this@MainActivity, results, FrnCache.rooms, s?.toString() ?: "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+        selector.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                FrnCache.selectedManager = position
+                FrnCache.save(this@MainActivity)
+                org.funkgateway.mobile.frn.FrnServerListView.populate(
+                    this@MainActivity, results, FrnCache.rooms,
+                    searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+            }
+        }
+        val refresh = button("Serverliste aktualisieren") {
+            results.removeAllViews()
+            status.text = "Lade FRN-SystemManager …"
+
+            val selected = selector.selectedItemPosition
+            FrnCache.selectedManager = selected
+
+            val managers = when (selected) {
+                1 -> listOf(FrnSystemManager.managers[0])
+                2 -> listOf(FrnSystemManager.managers[1])
+                3 -> listOf(FrnSystemManager.managers[2])
+                else -> FrnSystemManager.managers
+            }
+
+            Thread {
+                val rows = mutableListOf<
+                    org.funkgateway.mobile.frn.FrnRoom
+                >()
+                val errors = mutableListOf<String>()
+
+                for (manager in managers) {
+                    try {
+                        rows.addAll(FrnSystemManager.load(manager))
+                    } catch (e: Exception) {
+                        errors.add(
+                            manager.name + ": " +
+                            (e.message ?: "Verbindungsfehler")
+                        )
+                    }
+                }
+
+                runOnUiThread {
+                    val successfulManagers = managers.map { it.id }
+                        .filter { id ->
+                            errors.none { error ->
+                                managers.any { it.id == id && error.startsWith(it.name + ":") }
+                            }
+                        }.toSet()
+
+                    if (successfulManagers.isNotEmpty()) {
+                        FrnCache.rooms = FrnCache.rooms.filter {
+                            it.manager !in successfulManagers
+                        } + rows
+                        FrnCache.lastUpdated = System.currentTimeMillis()
+                        FrnCache.save(this@MainActivity)
+                    }
+                    if (currentPage == "FRN") {
+                        status.text =
+                            org.funkgateway.mobile.frn.FrnStats.summary(FrnCache.rooms) +
+                            if (errors.isNotEmpty()) {
+                                "\n" + errors.joinToString("\n")
+                            } else ""
+
+                        org.funkgateway.mobile.frn.FrnServerListView.populate(this@MainActivity, results, FrnCache.rooms, searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+                    }
+                }
+            }.start()
+        }
+
+        root.addView(
+            refresh,
+            LinearLayout.LayoutParams(-1, dp(60)).apply {
+                topMargin = dp(12)
+            }
+        )
+
+        root.addView(
+            scroll,
+            LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(12) }
+        )
+
+
+
+        showGatewayScreen(root)
+    }
+
+    private fun showFrnRooms() {
+        val selected = selectedFrnRoom ?: run {
+            showFrn()
+            return
+        }
+
+        currentPage = "FRN_ROOMS"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(root)
+        }
+
+        root.addView(label("FRN · Räume", 24f, Color.WHITE, true))
+        root.addView(label(
+            "${selected.server}:${selected.port}",
+            15f,
+            muted
+        ))
+
+        val rooms = availableFrnRooms()
+        root.addView(label(
+            "${rooms.size} bekannte Räume",
+            16f,
+            Color.WHITE
+        ))
+
+        if (rooms.isEmpty()) {
+            root.addView(label(
+                "Keine Raumliste im Cache. Bitte Serverliste aktualisieren.",
+                15f,
+                muted
+            ))
+        }
+
+        for (room in rooms) {
+            val isSelected = room.room == selected.room
+
+            root.addView(button(
+                "${if (isSelected) "✓ " else ""}" +
+                    "${room.room.ifBlank { "(kein Raum)" }}" +
+                    " · ${room.clients} Teilnehmer"
+            ) {
+                if (isSelected) {
+                    showFrnRoom(room)
+                } else if (
+                    gatewayService?.getFrnStatus() ==
+                    GatewayService.FrnStatus.DISCONNECTED
+                ) {
+                    showFrnRoom(room)
+                } else {
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("Raumwechsel")
+                        .setMessage(
+                            "Der automatische Raumwechsel wird noch ergänzt. " +
+                                "Die bestehende FRN-Verbindung bleibt unverändert."
+                        )
+                        .setPositiveButton("OK", null)
+                        .show()
+                }
+            })
+        }
+
+        root.addView(button("← Zurück zum FRN-Raum") {
+            showFrnRoom(selected)
+        })
+
+        showGatewayScreen(scroll)
+    }
+
+    private fun showFrnParticipants() {
+        currentPage = "FRN_PARTICIPANTS"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(20))
+        }
+
+        root.addView(label("FRN · Teilnehmer", 24f, Color.WHITE, true))
+
+        val connectionStatus = label("", 15f, muted).apply {
+            setPadding(0, dp(12), 0, dp(16))
+        }
+        root.addView(connectionStatus)
+
+        val participantsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        root.addView(participantsContainer)
+
+        fun refreshParticipantsView() {
+            val service = gatewayService
+            val connected = service?.getFrnStatus() ==
+                GatewayService.FrnStatus.CONNECTED
+
+            val room = service?.getConnectedFrnRoom()
+            connectionStatus.text = if (connected && room != null) {
+                "Verbunden: ${room.server} · ${room.room}"
+            } else {
+                "Keine aktive FRN-Verbindung."
+            }
+
+            participantsContainer.removeAllViews()
+
+            val snapshot = if (connected) {
+                service?.getFrnParticipants()
+            } else {
+                null
+            }
+            val entries = snapshot?.entries.orEmpty()
+
+            if (entries.isEmpty()) {
+                participantsContainer.addView(label(
+                    "Noch keine Teilnehmerdaten empfangen.",
+                    16f, muted
+                ))
+            }
+
+            entries.forEachIndexed { index, entry ->
+                val match = Regex(
+                    "<ON>(.*?)</ON>",
+                    RegexOption.DOT_MATCHES_ALL
+                ).find(entry)
+
+                val name = android.text.Html.fromHtml(
+                    match?.groupValues?.get(1) ?: "Teilnehmer #${index + 1}",
+                    android.text.Html.FROM_HTML_MODE_LEGACY
+                ).toString().trim()
+
+                val speaking = snapshot?.activeIndex == index + 1
+                val color = if (speaking) {
+                    Color.rgb(239, 68, 68)
+                } else {
+                    Color.rgb(34, 197, 94)
+                }
+
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(4), 0, dp(4))
+                }
+
+                row.addView(android.widget.ImageView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        dp(24), dp(36)
+                    ).apply {
+                        marginEnd = dp(12)
+                    }
+                    setImageDrawable(HandheldRadioDrawable(color))
+                })
+
+                row.addView(label(
+                    name.ifEmpty { "Teilnehmer #${index + 1}" },
+                    16f,
+                    Color.WHITE
+                ))
+
+                participantsContainer.addView(row)
+            }
+        }
+
+        refreshFrnParticipantsView = { refreshParticipantsView() }
+        refreshParticipantsView()
+
+        showGatewayScreen(ScrollView(this).apply {
+            isFillViewport = true
+            addView(root)
+        })
+    }
+
+    private fun showFrnRoom(room: org.funkgateway.mobile.frn.FrnRoom) {
+        selectedFrnRoom = room
+        currentPage = "FRN_ROOM"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(root)
+        }
+
+        root.addView(label("FRN · Verbindung", 24f, Color.WHITE, true))
+        root.addView(label("Server: ${room.server}", 16f, Color.WHITE))
+        root.addView(label("Port: ${room.port}", 16f, Color.WHITE))
+        root.addView(label("Raum: ${room.room}", 18f, Color.WHITE))
+        root.addView(label("Teilnehmer: ${room.clients}", 16f, muted))
+
+        val status = label("Noch nicht verbunden", 16f, muted)
+        root.addView(status)
+
+        root.addView(label("Teilnehmer im Raum", 19f, Color.WHITE, true))
+
+        val participantsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        root.addView(participantsContainer)
+
+        val participantsLabel = label(
+            "Noch keine Teilnehmerdaten empfangen.",
+            15f,
+            Color.WHITE
+        )
+        participantsContainer.addView(participantsLabel)
+
+        fun frnParticipantName(entry: String, index: Int): String {
+            val match = Regex("<ON>(.*?)</ON>", RegexOption.DOT_MATCHES_ALL)
+                .find(entry)
+            return match?.groupValues?.get(1)
+                ?.replace("&lt;", "<")
+                ?.replace("&gt;", ">")
+                ?.replace("&quot;", "\\\"")
+                ?.replace("&amp;", "&")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: "Teilnehmer #$index"
+        }
+
+        val participantIcons = mutableListOf<android.widget.ImageView>()
+        var displayedParticipants: List<String> = emptyList()
+        var displayedSpeaker: Int? = null
+
+        fun refreshParticipants() {
+            val snapshot = gatewayService?.getFrnParticipants()
+            val entries = snapshot?.entries ?: emptyList()
+
+            if (entries != displayedParticipants) {
+                displayedParticipants = entries.toList()
+                participantIcons.clear()
+                participantsContainer.removeAllViews()
+                participantsContainer.addView(participantsLabel)
+
+                entries.forEachIndexed { index, entry ->
+                    val participantRow = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = android.view.Gravity.CENTER_VERTICAL
+                        setPadding(0, dp(3), 0, dp(3))
+                    }
+
+                    val radioIcon = android.widget.ImageView(this).apply {
+                        layoutParams = LinearLayout.LayoutParams(
+                            dp(24), dp(36)
+                        ).apply {
+                            marginEnd = dp(12)
+                        }
+                        setImageDrawable(
+                            HandheldRadioDrawable(Color.rgb(34, 197, 94))
+                        )
+                    }
+
+                    participantIcons.add(radioIcon)
+                    participantRow.addView(radioIcon)
+                    participantRow.addView(
+                        label(
+                            frnParticipantName(entry, index + 1),
+                            16f,
+                            Color.WHITE
+                        )
+                    )
+                    participantsContainer.addView(participantRow)
+                }
+                displayedSpeaker = null
+            }
+
+            participantsLabel.visibility =
+                if (entries.isEmpty()) {
+                    android.view.View.VISIBLE
+                } else {
+                    android.view.View.GONE
+                }
+
+            if (entries.isEmpty()) {
+                participantsLabel.text =
+                    if (snapshot == null) {
+                        "Gateway-Dienst noch nicht bereit."
+                    } else {
+                        "Noch keine Teilnehmerdaten empfangen."
+                    }
+            }
+
+            val speaker = snapshot?.activeIndex
+                ?.takeIf { it in 1..entries.size }
+
+            if (speaker != displayedSpeaker || entries.isEmpty()) {
+                participantIcons.forEachIndexed { index, icon ->
+                    val color = if (speaker == index + 1) {
+                        Color.rgb(239, 68, 68)
+                    } else {
+                        Color.rgb(34, 197, 94)
+                    }
+                    icon.setImageDrawable(HandheldRadioDrawable(color))
+                }
+                displayedSpeaker = speaker
+            }
+        }
+
+        lateinit var connectButton: Button
+        lateinit var disconnectButton: Button
+
+        fun updateButtons() {
+            val state = gatewayService?.getFrnStatus()
+            connectButton.isEnabled =
+                state == GatewayService.FrnStatus.DISCONNECTED
+            disconnectButton.isEnabled =
+                state == GatewayService.FrnStatus.CONNECTED ||
+                state == GatewayService.FrnStatus.CONNECTING
+        }
+
+        connectButton = button("Mit FRN verbinden") {
+            val service = gatewayService
+            if (service == null) {
+                status.text = "Gateway-Dienst noch nicht bereit."
+            } else {
+                try {
+                    val saved = org.funkgateway.mobile.frn.FrnSettingsStore.load(this)
+                    if (saved.email.isBlank() || saved.password.isBlank() ||
+                        saved.callsign.isBlank()) {
+                        status.text = "Bitte zuerst die FRN-Einstellungen ausfüllen."
+                    } else {
+                        val config = org.funkgateway.mobile.frn.FrnLoginConfig(
+                            room = room,
+                            email = saved.email,
+                            password = saved.password,
+                            callsign = saved.callsign,
+                            description = saved.description,
+                            country = saved.country,
+                            city = saved.city,
+                            vx = saved.vx,
+                            clientType = saved.clientType,
+                            bandChannel = saved.bandChannel
+                        )
+                        val startIntent = Intent(
+                            this,
+                            GatewayService::class.java
+                        ).apply {
+                            action = GatewayService.ACTION_START
+                        }
+                        startForegroundService(startIntent)
+
+                        service.connectFrn(
+                            config = config,
+                            onEvent = { event ->
+                                if (currentPage == "FRN_ROOM" &&
+                                    (event is org.funkgateway.mobile.frn.FrnEvent.ClientList ||
+                                     event is org.funkgateway.mobile.frn.FrnEvent.Audio ||
+                                     event is org.funkgateway.mobile.frn.FrnEvent.Idle)
+                                ) {
+                                    refreshParticipants()
+                                }
+                                if (currentPage == "FRN_PARTICIPANTS" &&
+                                    (event is org.funkgateway.mobile.frn.FrnEvent.ClientList ||
+                                     event is org.funkgateway.mobile.frn.FrnEvent.Audio ||
+                                     event is org.funkgateway.mobile.frn.FrnEvent.Idle)
+                                ) {
+                                    refreshFrnParticipantsView?.invoke()
+                                }
+                            },
+                            onError = { error ->
+                                if (currentPage == "FRN_ROOM") {
+                                    status.text = "FRN-Fehler: ${error.message ?: "Unbekannter Fehler"}"
+                                    updateButtons()
+                                }
+                            },
+                            onConnected = {
+                                if (currentPage == "FRN_ROOM") {
+                                    status.text = "Mit FRN verbunden."
+                                    updateButtons()
+                                }
+                            },
+                            onDisconnected = {
+                                if (currentPage == "FRN_ROOM") {
+                                    if (!status.text.toString().startsWith("FRN-Fehler:")) {
+                                        status.text = "FRN-Verbindung beendet."
+                                    }
+                                    updateButtons()
+                                }
+                            }
+                        )
+                        status.text = "FRN-Verbindung wird aufgebaut ..."
+                        updateButtons()
+                    }
+                } catch (e: Exception) {
+                    status.text = "FRN: ${e.message ?: "Verbindung nicht möglich"}"
+                    updateButtons()
+                }
+            }
+        }
+        root.addView(connectButton)
+
+        disconnectButton = button("Trennen") {
+            gatewayService?.disconnectFrn()
+            status.text = "FRN-Verbindung getrennt."
+            updateButtons()
+            refreshParticipants()
+        }
+        root.addView(disconnectButton)
+        refreshFrnRoomStatus = {
+            if (currentPage == "FRN_ROOM") {
+                when (gatewayService?.getFrnStatus()) {
+                    GatewayService.FrnStatus.CONNECTED ->
+                        status.text = "FRN ist bereits verbunden."
+                    GatewayService.FrnStatus.CONNECTING ->
+                        status.text = "FRN-Verbindung wird aufgebaut ..."
+                    GatewayService.FrnStatus.DISCONNECTED ->
+                        status.text = "Noch nicht verbunden."
+                    null ->
+                        status.text = "Gateway-Dienst wird vorbereitet."
+                }
+                updateButtons()
+                refreshParticipants()
+            }
+        }
+        when (gatewayService?.getFrnStatus()) {
+            GatewayService.FrnStatus.CONNECTED ->
+                status.text = "FRN ist bereits verbunden."
+            GatewayService.FrnStatus.CONNECTING ->
+                status.text = "FRN-Verbindung wird aufgebaut ..."
+            GatewayService.FrnStatus.DISCONNECTED ->
+                status.text = "Noch nicht verbunden."
+            null ->
+                status.text = "Gateway-Dienst wird vorbereitet."
+        }
+        updateButtons()
+        refreshParticipants()
+
+        root.addView(button("Räume auf diesem Server") {
+            showFrnRooms()
+        })
+
+        root.addView(button("⚙ FRN-Einstellungen") {
+            showFrnSettings()
+        })
+        root.addView(button("Noch kein FRN-Konto? Jetzt registrieren") {
+            showFrnRegistration(room)
+        })
+
+        root.addView(button("← Zurück zur Serverliste") {
+            showFrn()
+        })
+
+        showGatewayScreen(scroll)
+    }
+
+    private fun showFrnRegistration(room: org.funkgateway.mobile.frn.FrnRoom? = null) {
+        currentPage = "FRN_REGISTRATION"
+
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(bg)
+            isFillViewport = true
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(24))
+        }
+        scroll.addView(root)
+
+        root.addView(label("FRN · Registrierung", 24f, Color.WHITE, true))
+        root.addView(label(
+            "Neues FRN-Konto anlegen und Passwort per E-Mail anfordern.",
+            15f, muted
+        ))
+
+        fun addDropdown(spinner: Spinner) {
+            val frame = android.widget.FrameLayout(this)
+
+            frame.addView(
+                spinner,
+                android.widget.FrameLayout.LayoutParams(-1, -1)
+            )
+
+            val arrow = android.widget.ImageView(this).apply {
+                setImageResource(R.drawable.frn_dropdown_arrow)
+                contentDescription = "Auswahl öffnen"
+                isClickable = false
+                isFocusable = false
+            }
+
+            frame.addView(
+                arrow,
+                android.widget.FrameLayout.LayoutParams(
+                    dp(32), dp(32),
+                    Gravity.END or Gravity.CENTER_VERTICAL
+                ).apply {
+                    rightMargin = dp(8)
+                }
+            )
+
+            root.addView(
+                frame,
+                LinearLayout.LayoutParams(-1, dp(48))
+            )
+        }
+        root.addView(label("FRN-SystemManager", 16f, Color.WHITE, true))
+        val manager = Spinner(this)
+        val managerEntries = org.funkgateway.mobile.frn.FrnSystemManager.managers
+        val managers = managerEntries.map { it.name }
+        manager.adapter = object : ArrayAdapter<String>(
+            this,
+            android.R.layout.simple_spinner_item,
+            managers
+        ) {
+            override fun getView(
+                position: Int,
+                convertView: View?,
+                parent: android.view.ViewGroup
+            ): View = super.getView(position, convertView, parent).apply {
+                (this as TextView).setTextColor(Color.WHITE)
+            }
+        }
+        manager.setBackgroundColor(panel)
+        addDropdown(manager)
+
+        fun field(title: String, hint: String): android.widget.EditText {
+            root.addView(label(title, 16f, Color.WHITE, true))
+            return android.widget.EditText(this).apply {
+                setTextColor(Color.WHITE)
+                setHintTextColor(muted)
+                setHint(hint)
+                setSingleLine(true)
+                root.addView(this)
+            }
+        }
+
+        val email = field("E-Mail-Adresse", "name@beispiel.de")
+        email.inputType = android.text.InputType.TYPE_CLASS_TEXT or
+            android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+
+        val username = field("Benutzername / Rufzeichen", "Dein FRN-Name")
+        root.addView(label("Land", 16f, Color.WHITE, true))
+
+        val countries = java.util.Locale.getISOCountries()
+            .map { code ->
+                val locale = java.util.Locale("", code)
+                locale.getDisplayCountry(java.util.Locale.GERMAN) to
+                    locale.getDisplayCountry(java.util.Locale.ENGLISH)
+            }
+            .distinctBy { it.first }
+            .sortedWith(
+                compareBy(java.text.Collator.getInstance(java.util.Locale.GERMAN)) {
+                    it.first
+                }
+            )
+
+        val countryNames = countries.map { it.first }
+
+        val country = Spinner(this)
+        val countryAdapter = object : ArrayAdapter<String>(
+            this,
+            android.R.layout.simple_spinner_item,
+            countryNames
+        ) {
+            override fun getView(
+                position: Int,
+                convertView: View?,
+                parent: android.view.ViewGroup
+            ): View = super.getView(position, convertView, parent).apply {
+                (this as TextView).setTextColor(Color.WHITE)
+            }
+
+            override fun getDropDownView(
+                position: Int,
+                convertView: View?,
+                parent: android.view.ViewGroup
+            ): View = super.getDropDownView(position, convertView, parent).apply {
+                (this as TextView).setTextColor(Color.BLACK)
+                setBackgroundColor(Color.WHITE)
+            }
+        }
+        countryAdapter.setDropDownViewResource(
+            android.R.layout.simple_spinner_dropdown_item
+        )
+        country.adapter = countryAdapter
+        country.setBackgroundColor(panel)
+        country.setSelection(countryNames.indexOf("Deutschland").coerceAtLeast(0))
+        addDropdown(country)
+        val city = field("Ort", "Dein Wohnort")
+        val description = field("Beschreibung", "Zum Beispiel: FunkGateway Mobile")
+
+        root.addView(label(
+            "Die Registrierung ist derzeit nur bei DE Original freigeschaltet. " +
+            "Bitte verwende für den ersten Test ein neues FRN-Konto.",
+            14f, muted
+        ))
+
+        root.addView(android.view.View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, dp(12))
+        })
+        root.addView(button("FRN-Passwort anfordern") {
+            val mail = email.text.toString().trim()
+            val name = username.text.toString().trim()
+            val place = city.text.toString().trim()
+            val info = description.text.toString().trim()
+
+            when {
+                !android.util.Patterns.EMAIL_ADDRESS.matcher(mail).matches() ->
+                    email.error = "Bitte eine gültige E-Mail-Adresse eingeben."
+
+                name.isBlank() ->
+                    username.error = "Bitte einen Benutzernamen eingeben."
+
+                place.isBlank() ->
+                    city.error = "Bitte einen Ort eingeben."
+
+                else -> {
+                    val selectedManager = managerEntries[manager.selectedItemPosition]
+                    val selectedCountry = countries[country.selectedItemPosition].second
+
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("FRN-Registrierung prüfen")
+                        .setMessage(
+                            "SystemManager: ${selectedManager.name}\n" +
+                            "Benutzername: $name\n" +
+                            "E-Mail: $mail\n" +
+                            "Land: $selectedCountry\n" +
+                            "Ort: $place\n" +
+                            "Beschreibung: $info\n\n" +
+                            "Bitte prüfe deine Angaben vor dem Absenden."
+                        )
+                        .setPositiveButton("Weiter") { _, _ ->
+                            android.app.AlertDialog.Builder(this)
+                                .setTitle("Datenschutz und Registrierung")
+                                .setMessage(
+                                    "Deine E-Mail-Adresse, dein Benutzername, " +
+                                    "dein Land, dein Ort und deine Beschreibung " +
+                                    "werden bei einer Registrierung über das " +
+                                    "klassische FRN-Protokoll unverschlüsselt " +
+                                    "an den ausgewählten SystemManager übertragen.\n\n" +
+                                    "Mit \"Jetzt registrieren\" werden diese Daten " +
+                                    "tatsächlich an DE Original gesendet."
+                                )
+                                .setNegativeButton("Abbrechen", null)
+                                .setPositiveButton("Jetzt registrieren") { _, _ ->
+                                    if (frnRegistrationInProgress) {
+                                        android.widget.Toast.makeText(
+                                            this,
+                                            "Eine Registrierung läuft bereits.",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    } else if (selectedManager.id != "de_orig") {
+                                        android.app.AlertDialog.Builder(this)
+                                            .setTitle("Noch nicht freigeschaltet")
+                                            .setMessage(
+                                                "Die Registrierung ist derzeit nur bei DE Original möglich."
+                                            )
+                                            .setPositiveButton("OK", null)
+                                            .show()
+                                    } else {
+                                        frnRegistrationInProgress = true
+
+                                        val progress = android.app.AlertDialog.Builder(this)
+                                            .setTitle("FRN-Registrierung")
+                                            .setMessage("Anfrage wird an DE Original gesendet …")
+                                            .setCancelable(false)
+                                            .create()
+                                        progress.show()
+
+                                        val request = org.funkgateway.mobile.frn.FrnRegistration.Request(
+                                            email = mail,
+                                            username = name,
+                                            country = selectedCountry,
+                                            city = place,
+                                            description = info
+                                        )
+
+                                        Thread {
+                                            val result = org.funkgateway.mobile.frn.FrnRegistration.register(
+                                                selectedManager,
+                                                request
+                                            )
+
+                                            runOnUiThread {
+                                                frnRegistrationInProgress = false
+                                                progress.dismiss()
+
+                                                val message = when (result) {
+                                                    is org.funkgateway.mobile.frn.FrnRegistration.Result.Accepted ->
+                                                        "Der SystemManager hat die Registrierung angenommen. Bitte prüfe dein E-Mail-Postfach."
+
+                                                    is org.funkgateway.mobile.frn.FrnRegistration.Result.AlreadyRegistered ->
+                                                        "Dieses FRN-Konto ist bereits registriert."
+
+                                                    is org.funkgateway.mobile.frn.FrnRegistration.Result.Error ->
+                                                        result.message
+                                                }
+
+                                                android.app.AlertDialog.Builder(this)
+                                                    .setTitle("FRN-Registrierung")
+                                                    .setMessage(message)
+                                                    .setPositiveButton("OK", null)
+                                                    .show()
+                                            }
+                                        }.start()
+                                    }
+                                }
+                                .show()
+                        }
+                        .setNegativeButton("Abbrechen", null)
+                        .show()
+                }
+            }
+        })
+
+        root.addView(android.view.View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, dp(12))
+        })
+        root.addView(button("← Zurück") {
+            if (room != null) showFrnRoom(room) else showFrn()
+        })
+
+        showGatewayScreen(scroll)
+    }
+
+    private fun showPage(name: String) {
+        currentPage = name
+
+        if (name == "Mehr") {
+            val content = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(20), dp(24), dp(20), dp(24))
+            }
+
+            content.addView(label("Mehr", 26f, Color.WHITE, true))
+            content.addView(label(
+                "Weitere Funktionen und Informationen",
+                15f, muted
+            ).apply {
+                setPadding(0, dp(8), 0, dp(24))
+            })
+
+            val entries = listOf(
+                "⚙  Einstellungen" to "Einstellungen",
+                "🦜  Papageien" to "Papageien",
+                "🔗  Verlinkung" to "Verlinkung",
+                "❔  Hilfe" to "Hilfe",
+                "ℹ  Über FunkGateway Mobile" to "Über FunkGateway Mobile"
+            )
+
+            entries.forEach { (title, destination) ->
+                content.addView(button(title) {
+                    if (destination == "Einstellungen") {
+                        showSettings()
+                    } else {
+                        showPage(destination)
+                    }
+                })
+            }
+
+            showGatewayScreen(
+                ScrollView(this).apply {
+                    isFillViewport = true
+                    addView(content)
+                }
+            )
+            return
+        }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label(name, 26f, Color.WHITE, true))
+        root.addView(label(
+            "Dieser Bereich wird in einer der nächsten Versionen eingerichtet.",
+            16f, muted
+        ).apply {
+            setPadding(0, dp(20), 0, dp(28))
+        })
+
+        root.addView(button("← Zurück zur Übersicht") {
+            showHome()
+        }, LinearLayout.LayoutParams(-1, dp(64)))
+
+        showGatewayScreen(root)
+    }
+
+    private fun showFrnSettings() {
+        currentPage = "FRN-Einstellungen"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+        root.addView(label("📻 FRN-Einstellungen", 25f, Color.WHITE, true))
+        root.addView(label("Anmeldung und Protokoll", 15f, muted))
+
+        root.addView(button("Neues FRN-Konto registrieren") {
+            showFrnRegistration()
+        }.apply {
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        })
+
+        val saved = try {
+            org.funkgateway.mobile.frn.FrnSettingsStore.load(this)
+        } catch (e: Exception) {
+            org.funkgateway.mobile.frn.FrnSettings()
+        }
+
+        fun field(title: String, value: String, secret: Boolean = false):
+            android.widget.EditText {
+            root.addView(label(title, 14f, muted).apply {
+                setPadding(0, dp(12), 0, dp(4))
+            })
+            return android.widget.EditText(this).apply {
+                setSingleLine(true)
+                setTextColor(Color.WHITE)
+                setHintTextColor(muted)
+                background = rounded(panel)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                if (secret) {
+                    inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                        android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                }
+                setText(value)
+                root.addView(this, LinearLayout.LayoutParams(-1, dp(54)))
+            }
+        }
+
+        val email = field("E-Mail-Adresse", saved.email)
+        val password = field("Passwort", saved.password, true)
+
+        root.addView(android.widget.CheckBox(this).apply {
+            text = "Passwort anzeigen"
+            setTextColor(muted)
+            isChecked = false
+            setOnCheckedChangeListener { _, checked ->
+                password.inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                    if (checked) {
+                        android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                    } else {
+                        android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    }
+                password.setSelection(password.text.length)
+            }
+        })
+
+        val callsign = field("Rufzeichen / Benutzername", saved.callsign)
+        val description = field("Beschreibung", saved.description)
+        val country = field("Land", saved.country)
+        val city = field("Stadt", saved.city)
+        val vx = field("VX · Protokollkennung", saved.vx)
+        val clientType = field("CL · Clienttyp", saved.clientType)
+        val bandChannel = field("BC · Band / Kanal", saved.bandChannel)
+
+        val status = label("", 14f, accent).apply {
+            setPadding(0, dp(12), 0, dp(12))
+        }
+        root.addView(status)
+
+        root.addView(button("Einstellungen speichern") {
+            val settings = org.funkgateway.mobile.frn.FrnSettings(
+                email = email.text.toString().trim(),
+                password = password.text.toString(),
+                callsign = callsign.text.toString().trim(),
+                description = description.text.toString().trim(),
+                country = country.text.toString().trim(),
+                city = city.text.toString().trim(),
+                vx = vx.text.toString().trim(),
+                clientType = clientType.text.toString().trim(),
+                bandChannel = bandChannel.text.toString().trim()
+            )
+            if (settings.email.isBlank() || settings.callsign.isBlank() ||
+                settings.vx.isBlank()) {
+                status.text = "Bitte E-Mail, Rufzeichen und VX angeben."
+            } else {
+                try {
+                    org.funkgateway.mobile.frn.FrnSettingsStore.save(this, settings)
+                    status.text = "FRN-Einstellungen gespeichert."
+                } catch (e: Exception) {
+                    status.text = "Speichern fehlgeschlagen: " +
+                        (e.message ?: "Unbekannter Fehler")
+                }
+            }
+        })
+
+        root.addView(button("← Zurück zu Einstellungen") {
+            showSettings()
+        })
+        showGatewayScreen(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun showSettings() {
+        currentPage = "Einstellungen"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+        root.addView(label("⚙ Einstellungen", 26f, Color.WHITE, true))
+        root.addView(label("Connect · Verbindungen", 19f, accent, true).apply {
+            setPadding(0, dp(24), 0, dp(12))
+        })
+        root.addView(button("📻 FRN · Anmeldung und Protokoll") {
+            showFrnSettings()
+        })
+        root.addView(button("🎧 Mumble · Verbindung") {
+            showPage("Mumble-Einstellungen")
+        })
+        root.addView(button("Zello · Verbindung (später)") {
+            showPage("Zello-Einstellungen")
+        })
+        root.addView(label("Weitere Einstellungen", 19f, accent, true).apply {
+            setPadding(0, dp(24), 0, dp(12))
+        })
+        for (name in listOf("Audio & PTT", "Schutzfunktionen", "Darstellung")) {
+            root.addView(button(name) { showPage(name) })
+        }
+        root.addView(button("← Zurück zur Übersicht") { showHome() })
+        showGatewayScreen(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun showFrnChat() {
+        currentPage = "FRN_CHAT"
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+        }
+        content.addView(label("FRN · Chat", 24f, Color.WHITE, true))
+        content.addView(label(
+            "Raumchat und private Nachrichten werden hier integriert.",
+            16f, muted
+        ).apply {
+            setPadding(0, dp(16), 0, dp(16))
+        })
+        showGatewayScreen(ScrollView(this).apply {
+            addView(content)
+        })
+    }
+
+    private fun showGatewayScreen(content: android.view.View) {
+        val frame = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+
+        val heading = label(
+            "FunkGateway Mobile",
+            18f,
+            Color.WHITE,
+            true
+        ).apply {
+            setPadding(dp(16), dp(10), dp(16), dp(8))
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        header.addView(
+            heading,
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+
+        val audioIndicators = label(
+            "🎙  🔊",
+            20f,
+            muted
+        ).apply {
+            setPadding(dp(4), dp(8), dp(16), dp(8))
+            contentDescription =
+                "Globale Mikrofon- und Lautsprechersteuerung in Vorbereitung"
+        }
+
+        header.addView(audioIndicators)
+        frame.addView(header)
+
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), 0, dp(8), dp(8))
+        }
+
+        val integrations = listOf(
+            "Start", "FRN", "Mumble", "Zello", "Mehr"
+        )
+
+        integrations.forEach { integration ->
+            val tab = button(integration) {
+                when (integration) {
+                    "Start" -> showHome()
+                    "FRN" -> showFrn()
+                    "Mumble" -> showPage("Mumble")
+                    "Zello" -> showPage("Zello")
+                    else -> showPage("Mehr")
+                }
+            }.apply {
+                textSize = 12f
+                setPadding(dp(2), 0, dp(2), 0)
+            }
+
+            val activeIntegration = when (currentPage) {
+                "Start" -> "Start"
+                "FRN", "FRN_ROOMS", "FRN_ROOM", "FRN_REGISTRATION",
+                "FRN-Einstellungen", "FRN_CHAT", "FRN_PARTICIPANTS" -> "FRN"
+                "Mumble" -> "Mumble"
+                "Zello" -> "Zello"
+                else -> "Mehr"
+            }
+
+            if (integration == activeIntegration) {
+                tab.setTextColor(accent)
+            }
+
+            tabs.addView(
+                tab,
+                LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                    setMargins(dp(2), 0, dp(2), 0)
+                }
+            )
+        }
+
+        frame.addView(tabs)
+
+        val frnPages = setOf(
+            "FRN", "FRN_ROOMS", "FRN_ROOM",
+            "FRN_REGISTRATION", "FRN-Einstellungen", "FRN_CHAT", "FRN_PARTICIPANTS"
+        )
+
+        if (currentPage in frnPages) {
+            val subTabs = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(8), 0, dp(8), dp(8))
+            }
+
+            val sections = listOf(
+                "Verbind." to "FRN-Einstellungen",
+                "Server" to "FRN",
+                "Räume" to "FRN_ROOMS",
+                "Teiln." to "FRN_PARTICIPANTS",
+                "Chat" to "FRN_CHAT"
+            )
+
+            sections.forEach { (title, page) ->
+                val tab = button(title) {
+                    when (page) {
+                        "FRN-Einstellungen" -> showFrnSettings()
+                        "FRN_CHAT" -> showFrnChat()
+                        "FRN" -> showFrn()
+                        "FRN_ROOMS" -> showFrnRooms()
+                        "FRN_PARTICIPANTS" -> showFrnParticipants()
+                        else -> showPage("FRN Audio & PTT")
+                    }
+                }.apply {
+                    textSize = 10f
+                    setPadding(dp(1), 0, dp(1), 0)
+                    if (currentPage == page) {
+                        setTextColor(accent)
+                    }
+                }
+
+                subTabs.addView(
+                    tab,
+                    LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                        setMargins(dp(1), 0, dp(1), 0)
+                    }
+                )
+            }
+
+            frame.addView(subTabs)
+        }
+
+        frame.addView(
+            content,
+            LinearLayout.LayoutParams(-1, 0, 1f)
+        )
+
+        setContentView(frame)
+    }
+
+    private fun showHome() {
+        currentPage = "Start"
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(30), dp(20), dp(24))
+        }
+
+        content.addView(label(
+            "Willkommen bei FunkGateway Mobile!",
+            24f, Color.WHITE, true
+        ))
+
+        content.addView(label(
+            "Deine mobile Zentrale für Funk und Sprachkommunikation.",
+            16f, accent
+        ).apply {
+            setPadding(0, dp(12), 0, dp(28))
+        })
+
+        content.addView(label(
+            "Was ist FunkGateway Mobile?",
+            20f, Color.WHITE, true
+        ))
+
+        content.addView(label(
+            "FunkGateway Mobile ist die Android-Erweiterung unseres " +
+            "FunkGateway-Projekts. Verschiedene Kommunikationsdienste " +
+            "sollen hier über eine gemeinsame Oberfläche bedient werden.",
+            16f, muted
+        ).apply {
+            setPadding(0, dp(12), 0, dp(28))
+        })
+
+        content.addView(label(
+            "Unsere Kommunikationsdienste",
+            20f, Color.WHITE, true
+        ))
+
+        listOf(
+            "📻  FRN – bereits integriert",
+            "🎧  Mumble – in Vorbereitung",
+            "💬  Zello – in Vorbereitung",
+            "🦜  Papageien und Verlinkung – geplant"
+        ).forEach { entry ->
+            content.addView(label(entry, 16f, Color.WHITE).apply {
+                setPadding(0, dp(14), 0, dp(8))
+            })
+        }
+
+        content.addView(label(
+            "Wähle oben einen Kommunikationsdienst aus, um loszulegen.",
+            15f, accent
+        ).apply {
+            setPadding(0, dp(30), 0, dp(14))
+        })
+
+        content.addView(label(
+            "FunkGateway Mobile · Gemeinsam verbunden",
+            13f, muted
+        ))
+
+        showGatewayScreen(
+            ScrollView(this).apply {
+                isFillViewport = true
+                addView(content)
+            }
+        )
+    }
+
+    @Deprecated("Back navigation for the current Activity")
+    override fun onBackPressed() {
+        if (currentPage != "Start") {
+            showHome()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = bg
+        window.navigationBarColor = bg
+        showHome()
+    }
+}
