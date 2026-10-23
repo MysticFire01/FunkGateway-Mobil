@@ -280,7 +280,7 @@ class MainActivity : Activity() {
         if (FrnCache.lastUpdated > 0L) {
             status.text = org.funkgateway.mobile.frn.FrnStats.summary(FrnCache.rooms) + " · gespeichert"
 
-            org.funkgateway.mobile.frn.FrnServerListView.populate(this, results, FrnCache.rooms, "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+            org.funkgateway.mobile.frn.FrnServerListView.populate(this, results, FrnCache.rooms, "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
         }
 
         val searchField = android.widget.EditText(this).apply {
@@ -320,7 +320,7 @@ class MainActivity : Activity() {
                 FrnCache.rooms,
                 searchField.text.toString(),
                 selectedManagerFilter(),
-                onRoomClick = { room -> showFrnRoom(room) },
+                onRoomClick = { room -> showFrnRoomSelection(room) },
                 favoritesOnly = favoritesOnly
             )
         }
@@ -380,7 +380,7 @@ class MainActivity : Activity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                 clearSearch.visibility = if (s.isNullOrEmpty()) android.view.View.GONE else android.view.View.VISIBLE
                 org.funkgateway.mobile.frn.FrnServerListView.populate(
-                    this@MainActivity, results, FrnCache.rooms, s?.toString() ?: "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+                    this@MainActivity, results, FrnCache.rooms, s?.toString() ?: "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
             }
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
@@ -391,7 +391,7 @@ class MainActivity : Activity() {
                 FrnCache.save(this@MainActivity)
                 org.funkgateway.mobile.frn.FrnServerListView.populate(
                     this@MainActivity, results, FrnCache.rooms,
-                    searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+                    searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
             }
         }
         val refresh = button("Serverliste aktualisieren") {
@@ -447,7 +447,7 @@ class MainActivity : Activity() {
                                 "\n" + errors.joinToString("\n")
                             } else ""
 
-                        org.funkgateway.mobile.frn.FrnServerListView.populate(this@MainActivity, results, FrnCache.rooms, searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoom(room) }, favoritesOnly = favoritesOnly)
+                        org.funkgateway.mobile.frn.FrnServerListView.populate(this@MainActivity, results, FrnCache.rooms, searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
                     }
                 }
             }.start()
@@ -577,6 +577,21 @@ class MainActivity : Activity() {
         showGatewayScreen(scroll)
     }
 
+    private fun handleFrnUiEvent(
+        event: org.funkgateway.mobile.frn.FrnEvent
+    ) {
+        when (event) {
+            is org.funkgateway.mobile.frn.FrnEvent.ClientList,
+            is org.funkgateway.mobile.frn.FrnEvent.Audio,
+            is org.funkgateway.mobile.frn.FrnEvent.Idle -> {
+                if (currentPage == "FRN_PARTICIPANTS") {
+                    refreshFrnParticipantsView?.invoke()
+                }
+            }
+            else -> Unit
+        }
+    }
+
     private fun showFrnParticipants() {
         currentPage = "FRN_PARTICIPANTS"
 
@@ -603,10 +618,13 @@ class MainActivity : Activity() {
                 GatewayService.FrnStatus.CONNECTED
 
             val room = service?.getConnectedFrnRoom()
-            connectionStatus.text = if (connected && room != null) {
-                "Verbunden: ${room.server} · ${room.room}"
-            } else {
-                "Keine aktive FRN-Verbindung."
+            connectionStatus.text = when {
+                connected && room != null ->
+                    "Verbunden: ${room.server} · ${room.room}"
+                service?.getFrnStatus() == GatewayService.FrnStatus.CONNECTING ->
+                    "FRN-Verbindung wird aufgebaut …"
+                else ->
+                    "Keine aktive FRN-Verbindung."
             }
 
             participantsContainer.removeAllViews()
@@ -677,6 +695,172 @@ class MainActivity : Activity() {
         })
     }
 
+    private fun connectFrnFromSelection(
+        room: org.funkgateway.mobile.frn.FrnRoom
+    ) {
+        val service = gatewayService
+        if (service == null) {
+            android.widget.Toast.makeText(
+                this, "Gateway-Dienst noch nicht bereit.",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        if (service.getFrnStatus() != GatewayService.FrnStatus.DISCONNECTED) {
+            android.widget.Toast.makeText(
+                this, "FRN ist bereits verbunden oder verbindet gerade.",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        try {
+            val saved = org.funkgateway.mobile.frn.FrnSettingsStore.load(this)
+            if (saved.email.isBlank() || saved.password.isBlank() ||
+                saved.callsign.isBlank()
+            ) {
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("FRN-Anmeldung fehlt")
+                    .setMessage("Bitte zuerst die FRN-Einstellungen ausfüllen.")
+                    .setPositiveButton("Einstellungen") { _, _ ->
+                        showFrnSettings()
+                    }
+                    .setNegativeButton("Abbrechen", null)
+                    .show()
+                return
+            }
+
+            val config = org.funkgateway.mobile.frn.FrnLoginConfig(
+                room = room,
+                email = saved.email,
+                password = saved.password,
+                callsign = saved.callsign,
+                description = saved.description,
+                country = saved.country,
+                city = saved.city,
+                vx = saved.vx,
+                clientType = saved.clientType,
+                bandChannel = saved.bandChannel
+            )
+
+            val startIntent = Intent(
+                this, GatewayService::class.java
+            ).apply {
+                action = GatewayService.ACTION_START
+            }
+            startForegroundService(startIntent)
+
+            service.connectFrn(
+                config = config,
+                onEvent = { event ->
+                    handleFrnUiEvent(event)
+                },
+                onError = { error ->
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("FRN-Verbindungsfehler")
+                        .setMessage(
+                            error.message ?: "Verbindung nicht möglich."
+                        )
+                        .setPositiveButton("OK", null)
+                        .show()
+                    if (currentPage == "FRN_PARTICIPANTS") {
+                        refreshFrnParticipantsView?.invoke()
+                    }
+                },
+                onConnected = {
+                    if (currentPage == "FRN_PARTICIPANTS") {
+                        refreshFrnParticipantsView?.invoke()
+                    }
+                },
+                onDisconnected = {
+                    if (currentPage == "FRN_PARTICIPANTS") {
+                        refreshFrnParticipantsView?.invoke()
+                    }
+                }
+            )
+
+            showFrnParticipants()
+        } catch (e: Exception) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("FRN-Verbindung")
+                .setMessage(e.message ?: "Verbindung nicht möglich.")
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+
+    private fun showFrnRoomSelection(
+        room: org.funkgateway.mobile.frn.FrnRoom
+    ) {
+        val service = gatewayService
+        val state = service?.getFrnStatus()
+        val active = service?.getConnectedFrnRoom()
+
+        val sameRoom = active != null &&
+            active.server.equals(room.server, ignoreCase = true) &&
+            active.port == room.port &&
+            active.room.equals(room.room, ignoreCase = true)
+
+        val selectedText =
+            "${room.server}:${room.port}\\nRaum: ${room.room}"
+
+        val builder = android.app.AlertDialog.Builder(this)
+            .setTitle("FRN · Raum auswählen")
+            .setNegativeButton("Abbrechen", null)
+
+        when {
+            service == null -> {
+                builder.setMessage(
+                    "$selectedText\\n\\nGateway-Dienst noch nicht bereit."
+                )
+                builder.setPositiveButton("OK", null)
+            }
+
+            state == GatewayService.FrnStatus.DISCONNECTED -> {
+                builder.setMessage(
+                    "$selectedText\\n\\nKeine aktive Verbindung."
+                )
+                builder.setPositiveButton("Verbinden") { _, _ ->
+                    connectFrnFromSelection(room)
+                }
+            }
+
+            state == GatewayService.FrnStatus.CONNECTING -> {
+                builder.setMessage(
+                    "$selectedText\\n\\nEine FRN-Verbindung wird gerade aufgebaut."
+                )
+                builder.setPositiveButton("OK", null)
+            }
+
+            sameRoom -> {
+                builder.setMessage(
+                    "$selectedText\\n\\nDu bist bereits mit diesem Raum verbunden."
+                )
+                builder.setPositiveButton("Teilnehmer ansehen") { _, _ ->
+                    showFrnParticipants()
+                }
+            }
+
+            else -> {
+                val activeText = if (active == null) {
+                    "Verbindungsdaten werden geladen."
+                } else {
+                    "${active.server}:${active.port} / ${active.room}"
+                }
+                builder.setMessage(
+                    "Ausgewählt:\\n$selectedText\\n\\n" +
+                    "Aktiv verbunden:\\n$activeText\\n\\n" +
+                    "Die bestehende Verbindung bleibt unverändert. " +
+                    "Trennen ist im Server-Tab möglich."
+                )
+                builder.setPositiveButton("OK", null)
+            }
+        }
+
+        builder.show()
+    }
+
     private fun showFrnRoom(room: org.funkgateway.mobile.frn.FrnRoom) {
         selectedFrnRoom = room
         currentPage = "FRN_ROOM"
@@ -701,12 +885,10 @@ class MainActivity : Activity() {
         val status = label("Noch nicht verbunden", 16f, muted)
         root.addView(status)
 
-        root.addView(label("Teilnehmer im Raum", 19f, Color.WHITE, true))
 
         val participantsContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        root.addView(participantsContainer)
 
         val participantsLabel = label(
             "Noch keine Teilnehmerdaten empfangen.",
@@ -859,13 +1041,7 @@ class MainActivity : Activity() {
                                 ) {
                                     refreshParticipants()
                                 }
-                                if (currentPage == "FRN_PARTICIPANTS" &&
-                                    (event is org.funkgateway.mobile.frn.FrnEvent.ClientList ||
-                                     event is org.funkgateway.mobile.frn.FrnEvent.Audio ||
-                                     event is org.funkgateway.mobile.frn.FrnEvent.Idle)
-                                ) {
-                                    refreshFrnParticipantsView?.invoke()
-                                }
+                                handleFrnUiEvent(event)
                             },
                             onError = { error ->
                                 if (currentPage == "FRN_ROOM") {
