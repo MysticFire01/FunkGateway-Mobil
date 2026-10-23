@@ -543,30 +543,18 @@ class MainActivity : Activity() {
         }
 
         for (room in rooms) {
-            val isSelected = room.room == selected.room
+            val isSelected =
+                gatewayService?.getFrnStatus() == GatewayService.FrnStatus.CONNECTED &&
+                activeRoom.server.equals(room.server, ignoreCase = true) &&
+                activeRoom.port == room.port &&
+                activeRoom.room.equals(room.room, ignoreCase = true)
 
             root.addView(button(
                 "${if (isSelected) "✓ " else ""}" +
                     "${room.room.ifBlank { "(kein Raum)" }}" +
                     " · ${room.clients} Teilnehmer"
             ) {
-                if (isSelected) {
-                    showFrnRoom(room)
-                } else if (
-                    gatewayService?.getFrnStatus() ==
-                    GatewayService.FrnStatus.DISCONNECTED
-                ) {
-                    showFrnRoom(room)
-                } else {
-                    android.app.AlertDialog.Builder(this)
-                        .setTitle("Raumwechsel")
-                        .setMessage(
-                            "Der automatische Raumwechsel wird noch ergänzt. " +
-                                "Die bestehende FRN-Verbindung bleibt unverändert."
-                        )
-                        .setPositiveButton("OK", null)
-                        .show()
-                }
+                showFrnRoomSelection(room)
             })
         }
 
@@ -769,6 +757,7 @@ class MainActivity : Activity() {
                     }
                 },
                 onConnected = {
+                    selectedFrnRoom = service.getConnectedFrnRoom()
                     if (currentPage == "FRN_PARTICIPANTS") {
                         refreshFrnParticipantsView?.invoke()
                     }
@@ -848,13 +837,35 @@ class MainActivity : Activity() {
                 } else {
                     "${active.server}:${active.port} / ${active.room}"
                 }
+
+                builder.setTitle("FRN · Raumwechsel")
                 builder.setMessage(
-                    "Ausgewählt:\\n$selectedText\\n\\n" +
-                    "Aktiv verbunden:\\n$activeText\\n\\n" +
-                    "Die bestehende Verbindung bleibt unverändert. " +
-                    "Trennen ist im Server-Tab möglich."
+                    "Aktuell verbunden:\n$activeText\n\n" +
+                    "Gewählter Raum:\n${room.server}:${room.port} / ${room.room}\n\n" +
+                    "Möchtest du die bestehende Verbindung trennen " +
+                    "und in den neuen Raum wechseln?"
                 )
-                builder.setPositiveButton("OK", null)
+                builder.setPositiveButton("Raum wechseln") { _, _ ->
+                    val currentService = gatewayService
+                    val latest = currentService?.getConnectedFrnRoom()
+                    val unchanged = active != null && latest != null &&
+                        latest.server.equals(active.server, ignoreCase = true) &&
+                        latest.port == active.port &&
+                        latest.room.equals(active.room, ignoreCase = true)
+
+                    if (currentService?.getFrnStatus() !=
+                        GatewayService.FrnStatus.CONNECTED || !unchanged
+                    ) {
+                        android.widget.Toast.makeText(
+                            this,
+                            "Verbindung hat sich geändert. Bitte erneut auswählen.",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    } else {
+                        currentService.disconnectFrn()
+                        connectFrnFromSelection(room)
+                    }
+                }
             }
         }
 
