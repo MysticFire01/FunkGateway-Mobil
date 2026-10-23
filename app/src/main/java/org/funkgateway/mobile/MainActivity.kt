@@ -981,7 +981,10 @@ class MainActivity : Activity() {
         root.addView(label("Server: ${room.server}", 16f, Color.WHITE))
         root.addView(label("Port: ${room.port}", 16f, Color.WHITE))
         root.addView(label("Raum: ${room.room}", 18f, Color.WHITE))
-        root.addView(label("Teilnehmer: ${room.clients}", 16f, muted))
+        val participantCountLabel = label(
+            "Teilnehmer: unbekannt", 16f, muted
+        )
+        root.addView(participantCountLabel)
 
         val status = label("Noch nicht verbunden", 16f, muted)
         root.addView(status)
@@ -1018,6 +1021,14 @@ class MainActivity : Activity() {
         fun refreshParticipants() {
             val snapshot = gatewayService?.getFrnParticipants()
             val entries = snapshot?.entries ?: emptyList()
+            val connected = gatewayService?.getFrnStatus() ==
+                GatewayService.FrnStatus.CONNECTED
+            participantCountLabel.text =
+                if (connected && entries.isNotEmpty()) {
+                    "Teilnehmer: ${entries.size}"
+                } else {
+                    "Teilnehmer: unbekannt"
+                }
 
             if (entries != displayedParticipants) {
                 displayedParticipants = entries.toList()
