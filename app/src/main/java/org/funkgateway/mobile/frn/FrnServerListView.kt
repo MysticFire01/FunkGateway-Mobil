@@ -8,6 +8,61 @@ import android.widget.TextView
 
 object FrnServerListView {
 
+    fun updateLiveCounts(
+        container: LinearLayout,
+        activeRoom: FrnRoom?,
+        liveClientCount: Int?
+    ) {
+        // Ohne aktive Verbindung auf die SystemManager-Zahlen zurückfallen.
+        // Keine alten Live-Zahlen in der Anzeige stehen lassen.
+
+        fun count(room: FrnRoom): Int {
+            val active =
+                activeRoom != null && liveClientCount != null &&
+                room.server.equals(activeRoom.server, ignoreCase = true) &&
+                room.port == activeRoom.port &&
+                room.room.equals(activeRoom.room, ignoreCase = true)
+            return if (active) liveClientCount ?: room.clients else room.clients
+        }
+
+        for (i in 0 until container.childCount) {
+            val section = container.getChildAt(i) as? LinearLayout
+                ?: continue
+            val headerRow = section.getChildAt(0) as? LinearLayout
+                ?: continue
+            val header = headerRow.getChildAt(0) as? TextView
+                ?: continue
+            val rooms = (header.tag as? List<*>)
+                ?.filterIsInstance<FrnRoom>()
+                ?: continue
+
+            val headerText = header.text.toString()
+            val suffix = Regex(" · [0-9]+ Teilnehmer$")
+            if (suffix.containsMatchIn(headerText)) {
+                header.text = headerText.replace(
+                    suffix,
+                    " · ${rooms.sumOf { count(it) }} Teilnehmer"
+                )
+            }
+
+            val details = section.getChildAt(1) as? LinearLayout
+                ?: continue
+            for (j in 0 until details.childCount) {
+                val entry = details.getChildAt(j) as? TextView
+                    ?: continue
+                val room = entry.tag as? FrnRoom ?: continue
+                val entryText = entry.text.toString()
+                if (suffix.containsMatchIn(entryText)) {
+                    entry.text = entryText.replace(
+                        suffix,
+                        " · ${count(room)} Teilnehmer"
+                    )
+                }
+            }
+        }
+    }
+
+
     fun populate(
         context: Context,
         container: LinearLayout,
@@ -15,9 +70,25 @@ object FrnServerListView {
         search: String = "",
         managerFilter: String = "",
         onRoomClick: ((FrnRoom) -> Unit)? = null,
-        favoritesOnly: Boolean = false
+        favoritesOnly: Boolean = false,
+        activeRoom: FrnRoom? = null,
+        liveClientCount: Int? = null
     ) {
         container.removeAllViews()
+
+        fun displayedCount(room: FrnRoom): Int {
+            val isActive = activeRoom != null &&
+                room.server.equals(activeRoom.server, ignoreCase = true) &&
+                room.port == activeRoom.port &&
+                room.room.equals(activeRoom.room, ignoreCase = true)
+
+            return if (isActive && liveClientCount != null) {
+                liveClientCount
+            } else {
+                room.clients
+            }
+        }
+
 
         val query = search.trim()
         val groups = FrnGroups.group(rooms).filter { group ->
@@ -61,9 +132,10 @@ object FrnServerListView {
             }
 
             val header = TextView(context).apply {
+                tag = group.rooms
                 text = "${if (search.isNotBlank() && group.rooms.any { it.room.contains(search.trim(), ignoreCase = true) }) "▼" else "▶"} ${group.server}:${group.port}\n" +
                     "${group.roomCount} ${if (group.roomCount == 1) "Raum" else "Räume"} · " +
-                    "${group.clientCount} Teilnehmer"
+                    "${group.rooms.sumOf { displayedCount(it) }} Teilnehmer"
                 textSize = 14f
                 setTextColor(Color.WHITE)
                 setPadding(0, dp(6), 0, dp(6))
@@ -81,8 +153,9 @@ object FrnServerListView {
 
             for (room in group.rooms) {
                 val entry = TextView(context).apply {
+                    tag = room
                     text = "  ${room.room.ifBlank { "(kein Raum)" }}" +
-                        " · ${room.clients} Teilnehmer"
+                        " · ${displayedCount(room)} Teilnehmer"
                     textSize = 13f
                     setTextColor(Color.LTGRAY)
                     setPadding(dp(8), dp(8), 0, dp(8))

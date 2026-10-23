@@ -26,6 +26,7 @@ class MainActivity : Activity() {
     private var gatewayBound = false
     private var refreshFrnRoomStatus: (() -> Unit)? = null
     private var refreshFrnParticipantsView: (() -> Unit)? = null
+    private var refreshFrnServerCounts: (() -> Unit)? = null
 
     private val gatewayConnection = object : ServiceConnection {
         override fun onServiceConnected(
@@ -118,12 +119,21 @@ class MainActivity : Activity() {
             emptyList()
         }
 
-        if (serverNames.isEmpty()) return cached
+        val additional = serverNames
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
+            .filterNot { name ->
+                cached.any {
+                    it.room.equals(name, ignoreCase = true)
+                }
+            }
+            .map { name ->
+                selected.copy(room = name, clients = 0)
+            }
 
-        return serverNames.map { name ->
-            cached.firstOrNull { it.room.equals(name, ignoreCase = true) }
-                ?: selected.copy(room = name, clients = 0)
-        }
+        return (cached + additional)
+            .sortedBy { it.room.lowercase() }
     }
 
     private fun roomsForSelectedFrnServer(): List<org.funkgateway.mobile.frn.FrnRoom> {
@@ -266,6 +276,18 @@ class MainActivity : Activity() {
         val results = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
+        refreshFrnServerCounts = {
+            if (currentPage == "FRN") {
+                val connected = gatewayService?.getFrnStatus() ==
+                    GatewayService.FrnStatus.CONNECTED
+                org.funkgateway.mobile.frn.FrnServerListView.updateLiveCounts(
+                    results,
+                    if (connected) gatewayService?.getConnectedFrnRoom() else null,
+                    if (connected) gatewayService?.getFrnParticipants()
+                        ?.entries?.size?.takeIf { it > 0 } else null
+                )
+            }
+        }
         fun selectedManagerFilter(): String = when (selector.selectedItemPosition) {
             1 -> "de_orig"
             2 -> "de_alt"
@@ -280,7 +302,14 @@ class MainActivity : Activity() {
         if (FrnCache.lastUpdated > 0L) {
             status.text = org.funkgateway.mobile.frn.FrnStats.summary(FrnCache.rooms) + " · gespeichert"
 
-            org.funkgateway.mobile.frn.FrnServerListView.populate(this, results, FrnCache.rooms, "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
+            org.funkgateway.mobile.frn.FrnServerListView.populate(this, results, FrnCache.rooms, "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly,
+                activeRoom = gatewayService?.getConnectedFrnRoom()
+                    ?.takeIf {
+                        gatewayService?.getFrnStatus() ==
+                            GatewayService.FrnStatus.CONNECTED
+                    },
+                liveClientCount = gatewayService?.getFrnParticipants()
+                    ?.entries?.size?.takeIf { it > 0 })
         }
 
         val searchField = android.widget.EditText(this).apply {
@@ -321,7 +350,14 @@ class MainActivity : Activity() {
                 searchField.text.toString(),
                 selectedManagerFilter(),
                 onRoomClick = { room -> showFrnRoomSelection(room) },
-                favoritesOnly = favoritesOnly
+                favoritesOnly = favoritesOnly,
+                activeRoom = gatewayService?.getConnectedFrnRoom()
+                    ?.takeIf {
+                        gatewayService?.getFrnStatus() ==
+                            GatewayService.FrnStatus.CONNECTED
+                    },
+                liveClientCount = gatewayService?.getFrnParticipants()
+                    ?.entries?.size?.takeIf { it > 0 }
             )
         }
 
@@ -380,7 +416,14 @@ class MainActivity : Activity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                 clearSearch.visibility = if (s.isNullOrEmpty()) android.view.View.GONE else android.view.View.VISIBLE
                 org.funkgateway.mobile.frn.FrnServerListView.populate(
-                    this@MainActivity, results, FrnCache.rooms, s?.toString() ?: "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
+                    this@MainActivity, results, FrnCache.rooms, s?.toString() ?: "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly,
+                activeRoom = gatewayService?.getConnectedFrnRoom()
+                    ?.takeIf {
+                        gatewayService?.getFrnStatus() ==
+                            GatewayService.FrnStatus.CONNECTED
+                    },
+                liveClientCount = gatewayService?.getFrnParticipants()
+                    ?.entries?.size?.takeIf { it > 0 })
             }
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
@@ -391,7 +434,14 @@ class MainActivity : Activity() {
                 FrnCache.save(this@MainActivity)
                 org.funkgateway.mobile.frn.FrnServerListView.populate(
                     this@MainActivity, results, FrnCache.rooms,
-                    searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
+                    searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly,
+                activeRoom = gatewayService?.getConnectedFrnRoom()
+                    ?.takeIf {
+                        gatewayService?.getFrnStatus() ==
+                            GatewayService.FrnStatus.CONNECTED
+                    },
+                liveClientCount = gatewayService?.getFrnParticipants()
+                    ?.entries?.size?.takeIf { it > 0 })
             }
         }
         val refresh = button("Serverliste aktualisieren") {
@@ -447,7 +497,14 @@ class MainActivity : Activity() {
                                 "\n" + errors.joinToString("\n")
                             } else ""
 
-                        org.funkgateway.mobile.frn.FrnServerListView.populate(this@MainActivity, results, FrnCache.rooms, searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly)
+                        org.funkgateway.mobile.frn.FrnServerListView.populate(this@MainActivity, results, FrnCache.rooms, searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly,
+                activeRoom = gatewayService?.getConnectedFrnRoom()
+                    ?.takeIf {
+                        gatewayService?.getFrnStatus() ==
+                            GatewayService.FrnStatus.CONNECTED
+                    },
+                liveClientCount = gatewayService?.getFrnParticipants()
+                    ?.entries?.size?.takeIf { it > 0 })
                     }
                 }
             }.start()
@@ -549,10 +606,27 @@ class MainActivity : Activity() {
                 activeRoom.port == room.port &&
                 activeRoom.room.equals(room.room, ignoreCase = true)
 
+            val managerCountKnown = FrnCache.rooms.any {
+                it.server.equals(room.server, ignoreCase = true) &&
+                    it.port == room.port &&
+                    it.room.equals(room.room, ignoreCase = true)
+            }
+            val liveCount = if (isSelected) {
+                gatewayService?.getFrnParticipants()?.entries?.size
+                    ?.takeIf { it > 0 }
+            } else {
+                null
+            }
+            val countText = when {
+                liveCount != null -> "$liveCount Teilnehmer"
+                isSelected -> "Teilnehmerzahl unbekannt"
+                managerCountKnown -> "${room.clients} Teilnehmer"
+                else -> "Teilnehmerzahl unbekannt"
+            }
             root.addView(button(
                 "${if (isSelected) "✓ " else ""}" +
                     "${room.room.ifBlank { "(kein Raum)" }}" +
-                    " · ${room.clients} Teilnehmer"
+                    " · $countText"
             ) {
                 showFrnRoomSelection(room)
             })
@@ -565,11 +639,25 @@ class MainActivity : Activity() {
         showGatewayScreen(scroll)
     }
 
+    private fun refreshFrnOccupancyUi() {
+        when (currentPage) {
+            "FRN" -> refreshFrnServerCounts?.invoke()
+            "FRN_ROOMS" -> showFrnRooms()
+        }
+    }
+
     private fun handleFrnUiEvent(
         event: org.funkgateway.mobile.frn.FrnEvent
     ) {
         when (event) {
-            is org.funkgateway.mobile.frn.FrnEvent.ClientList,
+            is org.funkgateway.mobile.frn.FrnEvent.ClientList -> {
+                when (currentPage) {
+                    "FRN" -> refreshFrnServerCounts?.invoke()
+                    "FRN_ROOMS" -> showFrnRooms()
+                    "FRN_PARTICIPANTS" ->
+                        refreshFrnParticipantsView?.invoke()
+                }
+            }
             is org.funkgateway.mobile.frn.FrnEvent.Audio,
             is org.funkgateway.mobile.frn.FrnEvent.Idle -> {
                 if (currentPage == "FRN_PARTICIPANTS") {
@@ -758,11 +846,13 @@ class MainActivity : Activity() {
                 },
                 onConnected = {
                     selectedFrnRoom = service.getConnectedFrnRoom()
+                    refreshFrnOccupancyUi()
                     if (currentPage == "FRN_PARTICIPANTS") {
                         refreshFrnParticipantsView?.invoke()
                     }
                 },
                 onDisconnected = {
+                    refreshFrnOccupancyUi()
                     if (currentPage == "FRN_PARTICIPANTS") {
                         refreshFrnParticipantsView?.invoke()
                     }
@@ -1061,12 +1151,14 @@ class MainActivity : Activity() {
                                 }
                             },
                             onConnected = {
+                                refreshFrnOccupancyUi()
                                 if (currentPage == "FRN_ROOM") {
                                     status.text = "Mit FRN verbunden."
                                     updateButtons()
                                 }
                             },
                             onDisconnected = {
+                                refreshFrnOccupancyUi()
                                 if (currentPage == "FRN_ROOM") {
                                     if (!status.text.toString().startsWith("FRN-Fehler:")) {
                                         status.text = "FRN-Verbindung beendet."
