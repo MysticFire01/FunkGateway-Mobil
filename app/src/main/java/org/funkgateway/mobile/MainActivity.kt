@@ -50,6 +50,8 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        frnActivityActive = true
+        startFrnRefreshTimer()
         gatewayBound = bindService(
             Intent(this, GatewayService::class.java),
             gatewayConnection,
@@ -58,6 +60,8 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        frnActivityActive = false
+        stopFrnRefreshTimer()
         if (gatewayBound) {
             unbindService(gatewayConnection)
             gatewayBound = false
@@ -147,8 +151,88 @@ class MainActivity : Activity() {
             .sortedBy { it.room.lowercase() }
     }
 
+    private val frnRefreshHandler =
+        android.os.Handler(android.os.Looper.getMainLooper())
+    private var frnRefreshTask: Runnable? = null
+    private var frnRefreshButton: Button? = null
+    private var frnRefreshResults: LinearLayout? = null
+    private var refreshFrnCachedList: (() -> Unit)? = null
+    private var frnActivityActive = false
+
+    private fun stopFrnRefreshTimer() {
+        frnRefreshTask?.let {
+            frnRefreshHandler.removeCallbacks(it)
+        }
+        frnRefreshTask = null
+    }
+
+    private fun startFrnRefreshTimer() {
+        stopFrnRefreshTimer()
+        if (!frnActivityActive) return
+
+        val task = object : Runnable {
+            override fun run() {
+                if (!frnActivityActive) {
+                    stopFrnRefreshTimer()
+                    return
+                }
+
+                // Gemeinsame, abgesicherte Hintergrundabfrage.
+                // Unabhängig vom gerade geöffneten FRN-Tab.
+                refreshFrnCacheOnStartup()
+
+                frnRefreshHandler.postDelayed(this, 300_000L)
+            }
+        }
+
+        frnRefreshTask = task
+        frnRefreshHandler.postDelayed(task, 300_000L)
+    }
+
+    private var frnManagerFailureCount = 0
+    private var frnManagerPauseUntil = 0L
+
+    private fun frnAutomaticRefreshAllowed(): Boolean {
+        return android.os.SystemClock.elapsedRealtime() >=
+            frnManagerPauseUntil
+    }
+
+    private fun recordFrnManagerRefreshResult(success: Boolean) {
+        if (success) {
+            frnManagerFailureCount = 0
+            frnManagerPauseUntil = 0L
+        } else {
+            frnManagerFailureCount++
+            if (frnManagerFailureCount >= 3) {
+                frnManagerPauseUntil =
+                    android.os.SystemClock.elapsedRealtime() + 900_000L
+                frnManagerFailureCount = 0
+                android.util.Log.w(
+                    "FunkGateway",
+                    "FRN-SystemManager: 15 Minuten Schutzpause."
+                )
+            }
+        }
+    }
+
+    private val frnManagerRefreshBusy =
+        java.util.concurrent.atomic.AtomicBoolean(false)
     private var frnRegistrationInProgress = false
 
+
+    private fun frnCacheStatusText(): String {
+        val summary = org.funkgateway.mobile.frn.FrnStats.summary(
+            FrnCache.rooms
+        )
+        if (FrnCache.lastUpdated <= 0L) return summary
+
+        val time = java.text.SimpleDateFormat(
+            "HH:mm",
+            java.util.Locale.getDefault()
+        ).format(java.util.Date(FrnCache.lastUpdated))
+
+        return "$summary · Aktualisiert um $time Uhr"
+    }
 
     private fun showFrn() {
         if (FrnCache.lastUpdated == 0L) FrnCache.load(this)
@@ -300,7 +384,7 @@ class MainActivity : Activity() {
         selector.setSelection(FrnCache.selectedManager)
 
         if (FrnCache.lastUpdated > 0L) {
-            status.text = org.funkgateway.mobile.frn.FrnStats.summary(FrnCache.rooms) + " · gespeichert"
+            status.text = frnCacheStatusText()
 
             org.funkgateway.mobile.frn.FrnServerListView.populate(this, results, FrnCache.rooms, "", selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly,
                 activeRoom = gatewayService?.getConnectedFrnRoom()
@@ -445,7 +529,14 @@ class MainActivity : Activity() {
             }
         }
         val refresh = button("Serverliste aktualisieren") {
-            results.removeAllViews()
+            if (!frnManagerRefreshBusy.compareAndSet(false, true)) {
+                android.widget.Toast.makeText(
+                    this,
+                    "FRN-Serverliste wird bereits aktualisiert.",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+                return@button
+            }
             status.text = "Lade FRN-SystemManager …"
 
             val selected = selector.selectedItemPosition
@@ -459,6 +550,7 @@ class MainActivity : Activity() {
             }
 
             Thread {
+                try {
                 val rows = mutableListOf<
                     org.funkgateway.mobile.frn.FrnRoom
                 >()
@@ -476,12 +568,16 @@ class MainActivity : Activity() {
                 }
 
                 runOnUiThread {
+                    try {
                     val successfulManagers = managers.map { it.id }
                         .filter { id ->
                             errors.none { error ->
                                 managers.any { it.id == id && error.startsWith(it.name + ":") }
                             }
                         }.toSet()
+                    recordFrnManagerRefreshResult(
+                        successfulManagers.isNotEmpty()
+                    )
 
                     if (successfulManagers.isNotEmpty()) {
                         FrnCache.rooms = FrnCache.rooms.filter {
@@ -490,13 +586,16 @@ class MainActivity : Activity() {
                         FrnCache.lastUpdated = System.currentTimeMillis()
                         FrnCache.save(this@MainActivity)
                     }
-                    if (currentPage == "FRN") {
+                    if (frnActivityActive &&
+                        currentPage == "FRN" &&
+                        frnRefreshResults === results) {
                         status.text =
-                            org.funkgateway.mobile.frn.FrnStats.summary(FrnCache.rooms) +
+                            frnCacheStatusText() +
                             if (errors.isNotEmpty()) {
                                 "\n" + errors.joinToString("\n")
                             } else ""
 
+                        val previousScrollY = scroll.scrollY
                         org.funkgateway.mobile.frn.FrnServerListView.populate(this@MainActivity, results, FrnCache.rooms, searchField.text.toString(), selectedManagerFilter(), onRoomClick = { room -> showFrnRoomSelection(room) }, favoritesOnly = favoritesOnly,
                 activeRoom = gatewayService?.getConnectedFrnRoom()
                     ?.takeIf {
@@ -505,7 +604,22 @@ class MainActivity : Activity() {
                     },
                 liveClientCount = gatewayService?.getFrnParticipants()
                     ?.entries?.size?.takeIf { it > 0 })
+                        scroll.post {
+                            if (frnActivityActive &&
+                                currentPage == "FRN" &&
+                                frnRefreshResults === results
+                            ) {
+                                scroll.scrollTo(0, previousScrollY)
+                            }
+                        }
                     }
+                    } finally {
+                        frnManagerRefreshBusy.set(false)
+                    }
+                }
+                } catch (e: Exception) {
+                    frnManagerRefreshBusy.set(false)
+                    android.util.Log.e("FunkGateway", "FRN-Aktualisierung fehlgeschlagen", e)
                 }
             }.start()
         }
@@ -523,6 +637,43 @@ class MainActivity : Activity() {
         )
 
 
+
+        refreshFrnCachedList = {
+            if (frnActivityActive &&
+                currentPage == "FRN" &&
+                frnRefreshResults === results
+            ) {
+                val previousScrollY = scroll.scrollY
+                status.text =
+                    frnCacheStatusText()
+                org.funkgateway.mobile.frn.FrnServerListView.populate(
+                    this@MainActivity,
+                    results,
+                    FrnCache.rooms,
+                    searchField.text.toString(),
+                    selectedManagerFilter(),
+                    onRoomClick = { room -> showFrnRoomSelection(room) },
+                    favoritesOnly = favoritesOnly,
+                    activeRoom = gatewayService?.getConnectedFrnRoom()
+                        ?.takeIf {
+                            gatewayService?.getFrnStatus() ==
+                                GatewayService.FrnStatus.CONNECTED
+                        },
+                    liveClientCount = gatewayService?.getFrnParticipants()
+                        ?.entries?.size?.takeIf { it > 0 }
+                )
+                scroll.post {
+                    if (frnActivityActive &&
+                        currentPage == "FRN" &&
+                        frnRefreshResults === results
+                    ) {
+                        scroll.scrollTo(0, previousScrollY)
+                    }
+                }
+            }
+        }
+        frnRefreshButton = refresh
+        frnRefreshResults = results
 
         showGatewayScreen(root)
     }
@@ -2134,10 +2285,68 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun refreshFrnCacheOnStartup() {
+        // Gespeicherte Daten zuerst verfügbar machen.
+        if (FrnCache.lastUpdated == 0L) {
+            FrnCache.load(this)
+        }
+
+        // Netzwerkabfragen niemals auf dem UI-Thread ausführen.
+        if (!frnAutomaticRefreshAllowed()) return
+        if (!frnManagerRefreshBusy.compareAndSet(false, true)) return
+
+        Thread {
+            try {
+            val rows = mutableListOf<org.funkgateway.mobile.frn.FrnRoom>()
+            val successfulManagers = mutableSetOf<String>()
+
+            for (manager in FrnSystemManager.managers) {
+                try {
+                    val loaded = FrnSystemManager.load(manager)
+                    rows.addAll(loaded)
+                    successfulManagers.add(manager.id)
+                } catch (e: Exception) {
+                    android.util.Log.w(
+                        "FunkGateway",
+                        "FRN-SystemManager ${manager.name}: " +
+                            (e.message ?: "Abfrage fehlgeschlagen")
+                    )
+                }
+            }
+
+            runOnUiThread {
+                try {
+                if (successfulManagers.isNotEmpty()) {
+                    FrnCache.rooms = FrnCache.rooms.filter {
+                        it.manager !in successfulManagers
+                    } + rows
+                    FrnCache.lastUpdated = System.currentTimeMillis()
+                    FrnCache.save(this@MainActivity)
+                    android.util.Log.i(
+                        "FunkGateway",
+                        "FRN-SystemManager-Cache aktualisiert."
+                    )
+                    refreshFrnCachedList?.invoke()
+                }
+                recordFrnManagerRefreshResult(
+                    successfulManagers.isNotEmpty()
+                )
+                } finally {
+                    frnManagerRefreshBusy.set(false)
+                }
+            }
+            } catch (e: Exception) {
+                frnManagerRefreshBusy.set(false)
+                android.util.Log.e("FunkGateway", "FRN-Aktualisierung fehlgeschlagen", e)
+            }
+        }.start()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = bg
         window.navigationBarColor = bg
         showHome()
+        refreshFrnCacheOnStartup()
     }
 }

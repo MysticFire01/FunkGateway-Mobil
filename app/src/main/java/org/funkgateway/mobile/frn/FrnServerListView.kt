@@ -74,6 +74,26 @@ object FrnServerListView {
         activeRoom: FrnRoom? = null,
         liveClientCount: Int? = null
     ) {
+        val expandedGroups = mutableSetOf<String>()
+        for (index in 0 until container.childCount) {
+            val section = container.getChildAt(index) as? LinearLayout
+                ?: continue
+            val headerRow = section.getChildAt(0) as? LinearLayout
+                ?: continue
+            val header = headerRow.getChildAt(0) as? TextView
+                ?: continue
+            val oldRooms = (header.tag as? List<*>)
+                ?.filterIsInstance<FrnRoom>().orEmpty()
+            val details = section.getChildAt(1) as? LinearLayout
+                ?: continue
+            val first = oldRooms.firstOrNull() ?: continue
+            if (details.visibility == View.VISIBLE) {
+                expandedGroups.add(
+                    "${first.manager}|${first.server.lowercase()}|${first.port}"
+                )
+            }
+        }
+        val hadPreviousGroups = container.childCount > 0
         container.removeAllViews()
 
         fun displayedCount(room: FrnRoom): Int {
@@ -149,6 +169,10 @@ object FrnServerListView {
                         it.room.contains(search.trim(), ignoreCase = true)
                     }
                 ) View.VISIBLE else View.GONE
+                val groupKey = "${group.manager}|${group.server.lowercase()}|${group.port}"
+                if (hadPreviousGroups && groupKey in expandedGroups) {
+                    visibility = View.VISIBLE
+                }
             }
 
             for (room in group.rooms) {
