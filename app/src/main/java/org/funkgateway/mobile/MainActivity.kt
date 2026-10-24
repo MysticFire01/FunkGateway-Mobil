@@ -938,11 +938,13 @@ class MainActivity : Activity() {
                     android.text.Html.FROM_HTML_MODE_LEGACY
                 ).toString().trim()
 
+                val ownName = org.funkgateway.mobile.frn.FrnSettingsStore.load(this).callsign.trim()
+                val ownTransmitting = ownName.isNotEmpty() && name.equals(ownName, ignoreCase = true) && service?.getPttState() == GatewayService.PttState.TRANSMITTING
                 val speaking = snapshot?.activeIndex == index + 1
-                val color = if (speaking) {
-                    Color.rgb(239, 68, 68)
-                } else {
-                    Color.rgb(34, 197, 94)
+                val color = when {
+                    ownTransmitting -> Color.rgb(255, 165, 0)
+                    speaking -> Color.rgb(239, 68, 68)
+                    else -> Color.rgb(34, 197, 94)
                 }
 
                 val row = LinearLayout(this).apply {
@@ -2580,6 +2582,7 @@ class MainActivity : Activity() {
             override fun run() {
                 if (!frame.isAttachedToWindow || !frnActivityActive) return
                 updatePttTarget()
+                if (currentPage == "FRN_PARTICIPANTS") refreshFrnParticipantsView?.invoke()
                 pttStatusHandler.postDelayed(this, 250L)
             }
         }
