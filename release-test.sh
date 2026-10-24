@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 
 cd "$(dirname "$0")"
+MODE="${1:-check}"
+if [[ "$MODE" != "check" && "$MODE" != "publish" ]]; then
+    echo "Verwendung: ./release-test.sh [check|publish]"
+    exit 1
+fi
 
 REPO="MysticFire01/FunkGateway-Mobil"
 APK="app/build/outputs/apk/debug/app-debug.apk"
@@ -62,4 +67,59 @@ echo "Geplantes GitHub-Prerelease: $TAG"
 echo "Repository: $REPO"
 echo "APK: $APK"
 echo
-echo "TESTMODUS: Es wurde nichts veröffentlicht."
+if [[ "$MODE" == "check" ]]; then
+    echo "TESTMODUS: Es wurde nichts veröffentlicht."
+    exit 0
+fi
+
+echo "=== Veröffentlichungsprüfung ==="
+
+[[ "$(git branch --show-current)" == "test" ]] || {
+    echo "Abbruch: Nur Branch test darf Prereleases veröffentlichen."
+    exit 1
+}
+
+[[ -z "$(git status --porcelain -- . ':(exclude)release.sh')" ]] || {
+    echo "Abbruch: Testzweig enthält ungesicherte Änderungen."
+    exit 1
+}
+
+SHA=$(git rev-parse HEAD)
+REMOTE_SHA=$(git ls-remote origin refs/heads/test | cut -f1)
+
+[[ -n "$REMOTE_SHA" && "$SHA" == "$REMOTE_SHA" ]] || {
+    echo "Abbruch: Testzweig ist nicht mit GitHub synchron."
+    exit 1
+}
+
+[[ "$CODE" -gt 1006 ]] || {
+    echo "Abbruch: Erst ab Version 0.1.7 veröffentlichen."
+    exit 1
+}
+
+if [[ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]]; then
+    echo "Abbruch: Git-Tag existiert bereits."
+    exit 1
+fi
+
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    echo "Abbruch: GitHub-Release existiert bereits."
+    exit 1
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+cp "$APK" "$TMP/FunkGateway-Mobile.apk"
+
+echo "=== GitHub-Prerelease $TAG ==="
+
+gh release create "$TAG" "$TMP/FunkGateway-Mobile.apk" \
+    --repo "$REPO" \
+    --target "$SHA" \
+    --prerelease \
+    --title "FunkGateway Mobile $VERSION – Testversion" \
+    --notes "Interne Testversion von FunkGateway Mobile. Nicht als stabile Version freigegeben."
+
+echo "OK: GitHub-Prerelease veröffentlicht."
+echo "https://github.com/$REPO/releases/tag/$TAG"
