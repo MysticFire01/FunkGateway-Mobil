@@ -69,6 +69,7 @@ class MainActivity : Activity() {
     }
     private var gatewayBound = false
     private var refreshPttBar: (() -> Unit)? = null
+    private var refreshGlobalAudioControls: (() -> Unit)? = null
     private var refreshFrnRoomStatus: (() -> Unit)? = null
     private var refreshFrnParticipantsView: (() -> Unit)? = null
     private var refreshFrnServerCounts: (() -> Unit)? = null
@@ -81,6 +82,7 @@ class MainActivity : Activity() {
             gatewayService =
                 (binder as? GatewayService.LocalBinder)?.getService()
             refreshPttBar?.invoke()
+            refreshGlobalAudioControls?.invoke()
             if (currentPage == "FRN_ROOM") {
                 refreshFrnRoomStatus?.invoke()
             }
@@ -92,6 +94,7 @@ class MainActivity : Activity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             gatewayService = null
             refreshPttBar?.invoke()
+            refreshGlobalAudioControls?.invoke()
         }
     }
 
@@ -345,19 +348,29 @@ class MainActivity : Activity() {
             activeState == GatewayService.FrnStatus.CONNECTING
         activeBox.addView(disconnectActive)
 
-        root.addView(activeBox, LinearLayout.LayoutParams(
-            -1, -2
-        ).apply {
-            topMargin = dp(12)
-            bottomMargin = dp(12)
-        })
+        if (activeState == null ||
+            activeState == GatewayService.FrnStatus.DISCONNECTED) {
+            root.addView(label(
+                "FRN: Nicht verbunden",
+                13f, muted
+            ).apply {
+                setPadding(0, dp(6), 0, dp(2))
+            })
+        } else {
+            root.addView(activeBox, LinearLayout.LayoutParams(
+                -1, -2
+            ).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(6)
+            })
+        }
 
 
         root.addView(label(
             "FRN-SystemManager auswählen",
             16f, Color.WHITE, true
         ).apply {
-            setPadding(0, dp(18), 0, dp(8))
+            setPadding(0, dp(8), 0, dp(4))
         })
         val options = listOf(
             "Alle SystemManager",
@@ -373,7 +386,7 @@ class MainActivity : Activity() {
             options
         )
         (selector.adapter as ArrayAdapter<*>).setDropDownViewResource(R.layout.frn_spinner_item)
-        selector.minimumHeight = dp(52)
+        selector.minimumHeight = dp(44)
         val spinnerFrame = android.widget.FrameLayout(this)
 
         spinnerFrame.addView(
@@ -683,8 +696,8 @@ class MainActivity : Activity() {
 
         root.addView(
             refresh,
-            LinearLayout.LayoutParams(-1, dp(60)).apply {
-                topMargin = dp(12)
+            LinearLayout.LayoutParams(-1, dp(44)).apply {
+                topMargin = dp(6)
             }
         )
 
@@ -919,6 +932,17 @@ class MainActivity : Activity() {
                 null
             }
             val entries = snapshot?.entries.orEmpty()
+            val ownFrnName = service?.getConnectedFrnCallsign().orEmpty()
+            val pttState = service?.getPttState()
+            val serverNames = entries.mapNotNull { entry ->
+                Regex("<ON>(.*?)</ON>", RegexOption.DOT_MATCHES_ALL)
+                    .find(entry)?.groupValues?.get(1)
+            }
+            participantsContainer.addView(label(
+                "Diagnose: PTT=$pttState | Eigener Name='$ownFrnName' | " +
+                    "Teilnehmer=${serverNames.joinToString(" / ")}",
+                12f, muted
+            ))
 
             if (entries.isEmpty()) {
                 participantsContainer.addView(label(
@@ -962,11 +986,30 @@ class MainActivity : Activity() {
                     setImageDrawable(HandheldRadioDrawable(color))
                 })
 
-                row.addView(label(
+                val description = Regex(
+                    "<DS>(.*?)</DS>",
+                    RegexOption.DOT_MATCHES_ALL
+                ).find(entry)?.groupValues?.get(1).orEmpty()
+
+                val details = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+                details.addView(label(
                     name.ifEmpty { "Teilnehmer #${index + 1}" },
                     16f,
                     Color.WHITE
                 ))
+                if (description.isNotBlank()) {
+                    details.addView(label(
+                        android.text.Html.fromHtml(
+                            description,
+                            android.text.Html.FROM_HTML_MODE_LEGACY
+                        ).toString().trim(),
+                        13f,
+                        muted
+                    ))
+                }
+                row.addView(details)
 
                 participantsContainer.addView(row)
             }
@@ -2321,17 +2364,97 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(0, -2, 1f)
         )
 
-        val audioIndicators = label(
-            "🎙  🔊",
-            20f,
-            muted
-        ).apply {
-            setPadding(dp(4), dp(8), dp(16), dp(8))
-            contentDescription =
-                "Globale Mikrofon- und Lautsprechersteuerung in Vorbereitung"
+        val audioControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
 
-        header.addView(audioIndicators)
+        fun audioIcon(microphone: Boolean): android.widget.ImageButton =
+            android.widget.ImageButton(this).apply {
+                setBackgroundColor(Color.TRANSPARENT)
+                scaleType = android.widget.ImageView.ScaleType.CENTER_INSIDE
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setImageDrawable(object : android.graphics.drawable.Drawable() {
+                    private val pen = android.graphics.Paint(
+                        android.graphics.Paint.ANTI_ALIAS_FLAG
+                    ).apply {
+                        style = android.graphics.Paint.Style.STROKE
+                        strokeWidth = 2.4f
+                        strokeCap = android.graphics.Paint.Cap.ROUND
+                        strokeJoin = android.graphics.Paint.Join.ROUND
+                    }
+                    override fun draw(canvas: android.graphics.Canvas) {
+                        val b = bounds
+                        canvas.save()
+                        canvas.translate(b.left.toFloat(), b.top.toFloat())
+                        canvas.scale(b.width() / 24f, b.height() / 24f)
+                        pen.color = (callback as? android.view.View)
+                            ?.tag as? Int ?: Color.GREEN
+                        if (microphone) {
+                            canvas.drawRoundRect(9f, 2f, 15f, 15f, 3f, 3f, pen)
+                            canvas.drawArc(6f, 7f, 18f, 19f, 0f, 180f, false, pen)
+                            canvas.drawLine(12f, 19f, 12f, 22f, pen)
+                            canvas.drawLine(8f, 22f, 16f, 22f, pen)
+                        } else {
+                            val path = android.graphics.Path().apply {
+                                moveTo(3f, 9f)
+                                lineTo(7f, 9f)
+                                lineTo(12f, 5f)
+                                lineTo(12f, 19f)
+                                lineTo(7f, 15f)
+                                lineTo(3f, 15f)
+                                close()
+                            }
+                            canvas.drawPath(path, pen)
+                            canvas.drawArc(12f, 5f, 22f, 19f, -65f, 130f, false, pen)
+                        }
+                        if ((callback as? android.view.View)?.isSelected == true) {
+                            canvas.drawLine(3f, 3f, 21f, 21f, pen)
+                        }
+                        canvas.restore()
+                    }
+                    override fun setAlpha(alpha: Int) { pen.alpha = alpha }
+                    override fun setColorFilter(
+                        filter: android.graphics.ColorFilter?
+                    ) { pen.colorFilter = filter }
+                    override fun getOpacity() =
+                        android.graphics.PixelFormat.TRANSLUCENT
+                })
+            }
+
+        val micButton = audioIcon(true)
+        val speakerButton = audioIcon(false)
+
+        fun refreshAudioControls() {
+            val micMuted = gatewayService?.isGlobalMuted() == true
+            val deafened = gatewayService?.isGlobalDeafened() == true
+            micButton.isEnabled = gatewayService != null
+            speakerButton.isEnabled = gatewayService != null
+            micButton.isSelected = micMuted
+            speakerButton.isSelected = deafened
+            micButton.tag = if (micMuted) Color.RED else Color.GREEN
+            speakerButton.tag = if (deafened) Color.RED else Color.GREEN
+            micButton.drawable?.invalidateSelf()
+            speakerButton.drawable?.invalidateSelf()
+            micButton.contentDescription =
+                if (micMuted) "Mikrofon einschalten" else "Mikrofon stummschalten"
+            speakerButton.contentDescription =
+                if (deafened) "Lautsprecher einschalten" else "Lautsprecher stummschalten"
+        }
+
+        micButton.setOnClickListener {
+            gatewayService?.let { it.setGlobalMuted(!it.isGlobalMuted()) }
+            refreshAudioControls()
+        }
+        speakerButton.setOnClickListener {
+            gatewayService?.let { it.setGlobalDeafened(!it.isGlobalDeafened()) }
+            refreshAudioControls()
+        }
+        audioControls.addView(micButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+        audioControls.addView(speakerButton, LinearLayout.LayoutParams(dp(44), dp(44)))
+        header.addView(audioControls)
+        refreshGlobalAudioControls = ::refreshAudioControls
+        refreshAudioControls()
         frame.addView(header)
 
         val tabs = LinearLayout(this).apply {

@@ -21,6 +21,14 @@ class PcmAudioPlayer(
 ) : Closeable {
 
     private val running = AtomicBoolean(false)
+    private val deafened = AtomicBoolean(false)
+    @Volatile private var activeTrack: AudioTrack? = null
+
+    fun setDeafened(value: Boolean) {
+        deafened.set(value)
+        if (value) packets.clear()
+        activeTrack?.setVolume(if (value) 0f else 1f)
+    }
     private val packets = LinkedBlockingDeque<ByteArray>(6)
     private var worker: Thread? = null
 
@@ -64,6 +72,8 @@ class PcmAudioPlayer(
                     "AudioTrack konnte nicht initialisiert werden."
                 }
 
+                activeTrack = track
+                track.setVolume(if (deafened.get()) 0f else 1f)
                 track.play()
 
                 while (running.get()) {
@@ -98,6 +108,7 @@ class PcmAudioPlayer(
             } catch (e: Exception) {
                 Log.e("FunkGateway", "PCM-Audioausgabe", e)
             } finally {
+                activeTrack = null
                 packets.clear()
                 try {
                     track?.pause()

@@ -15,6 +15,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 class FrnAudioReceiver : Closeable {
 
     private val running = AtomicBoolean(true)
+    private val deafened = AtomicBoolean(false)
+
+    fun setDeafened(value: Boolean) {
+        deafened.set(value)
+        player.setDeafened(value)
+        if (value) {
+            packets.clear()
+            player.clear()
+        }
+    }
     private val packets = LinkedBlockingDeque<ByteArray>(4)
     private val player = PcmAudioPlayer(GsmWav49Codec.SAMPLE_RATE)
 
@@ -33,10 +43,11 @@ class FrnAudioReceiver : Closeable {
                 } ?: continue
 
                 if (!running.get()) break
+                if (deafened.get()) continue
 
                 try {
                     val pcm = codec.decode(packet)
-                    if (running.get()) {
+                    if (running.get() && !deafened.get()) {
                         player.enqueue(pcm)
                     }
                 } catch (e: Exception) {
@@ -66,7 +77,7 @@ class FrnAudioReceiver : Closeable {
      * Nicht blockierende Übergabe vom FRN-Netzwerkthread.
      */
     fun receive(packet: ByteArray) {
-        if (!running.get()) return
+        if (!running.get() || deafened.get()) return
         if (packet.size != GsmWav49Codec.PACKET_BYTES) return
 
         val copy = packet.copyOf()

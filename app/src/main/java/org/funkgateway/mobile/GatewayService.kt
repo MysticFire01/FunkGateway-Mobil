@@ -154,6 +154,27 @@ class GatewayService : Service() {
         TRANSMITTING
     }
 
+    private var globalMuted = false
+    private var globalDeafened = false
+
+    @Synchronized
+    fun isGlobalMuted(): Boolean = globalMuted
+
+    @Synchronized
+    fun isGlobalDeafened(): Boolean = globalDeafened
+
+    @Synchronized
+    fun setGlobalMuted(value: Boolean) {
+        globalMuted = value
+        if (value && pttState != PttState.IDLE) stopPtt()
+    }
+
+    @Synchronized
+    fun setGlobalDeafened(value: Boolean) {
+        globalDeafened = value
+        frnAudio?.setDeafened(value)
+    }
+
     private var pttState = PttState.IDLE
     private var frnAudioSender: FrnAudioSender? = null
     private var pttSessionId = 0L
@@ -252,7 +273,7 @@ class GatewayService : Service() {
 
     @Synchronized
     fun startPtt(): Boolean {
-        if (serviceDestroyed || pttState != PttState.IDLE || pttReleasePending) return false
+        if (globalMuted || serviceDestroyed || pttState != PttState.IDLE || pttReleasePending) return false
         if (selectedPttTarget != PttTarget.FRN) return false
         val connection = frnConnection ?: return false
         if (frnConnecting || frnParticipants.activeIndex != null) {
@@ -453,6 +474,7 @@ class GatewayService : Service() {
                     val activeConnection = connection
 
                     val audioReceiver = FrnAudioReceiver()
+                    audioReceiver.setDeafened(globalDeafened)
 
                     frnAudio = audioReceiver
 
