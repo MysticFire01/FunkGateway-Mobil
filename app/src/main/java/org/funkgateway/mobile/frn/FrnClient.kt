@@ -101,7 +101,7 @@ class FrnConnection private constructor(
         require(packet.size == 325) {
             "FRN-Sendepaket muss genau 325 Byte enthalten."
         }
-        output.write("TX1\\r\\n".toByteArray(Charsets.US_ASCII))
+        output.write("TX1\r\n".toByteArray(Charsets.US_ASCII))
         output.write(packet)
         output.flush()
     }
