@@ -939,7 +939,7 @@ class MainActivity : Activity() {
                 ).toString().trim()
 
                 val ownName = org.funkgateway.mobile.frn.FrnSettingsStore.load(this).callsign.trim()
-                val ownTransmitting = ownName.isNotEmpty() && name.equals(ownName, ignoreCase = true) && service?.getPttState() == GatewayService.PttState.TRANSMITTING
+                val ownTransmitting = ownName.isNotEmpty() && (name.equals(ownName, ignoreCase = true) || name.substringBefore(",").trim().equals(ownName, ignoreCase = true)) && service?.getPttState() == GatewayService.PttState.TRANSMITTING
                 val speaking = snapshot?.activeIndex == index + 1
                 val color = when {
                     ownTransmitting -> Color.rgb(255, 165, 0)
