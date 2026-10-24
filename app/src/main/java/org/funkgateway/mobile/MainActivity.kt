@@ -938,7 +938,7 @@ class MainActivity : Activity() {
                     android.text.Html.FROM_HTML_MODE_LEGACY
                 ).toString().trim()
 
-                val ownName = org.funkgateway.mobile.frn.FrnSettingsStore.load(this).callsign.trim()
+                val ownName = service?.getConnectedFrnCallsign().orEmpty().trim()
                 val ownTransmitting = ownName.isNotEmpty() && (name.equals(ownName, ignoreCase = true) || name.substringBefore(",").trim().equals(ownName, ignoreCase = true)) && service?.getPttState() == GatewayService.PttState.TRANSMITTING
                 val speaking = snapshot?.activeIndex == index + 1
                 val color = when {
@@ -2580,7 +2580,11 @@ class MainActivity : Activity() {
         val pttStatusHandler = android.os.Handler(android.os.Looper.getMainLooper())
         val pttStatusTask = object : Runnable {
             override fun run() {
-                if (!frame.isAttachedToWindow || !frnActivityActive) return
+                if (!frame.isAttachedToWindow) return
+                if (!frnActivityActive) {
+                    pttStatusHandler.postDelayed(this, 250L)
+                    return
+                }
                 updatePttTarget()
                 if (currentPage == "FRN_PARTICIPANTS") refreshFrnParticipantsView?.invoke()
                 pttStatusHandler.postDelayed(this, 250L)

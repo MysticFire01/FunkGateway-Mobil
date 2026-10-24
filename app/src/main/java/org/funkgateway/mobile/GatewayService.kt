@@ -133,6 +133,10 @@ class GatewayService : Service() {
         frnParticipants.copy(entries = frnParticipants.entries.toList())
 
     private var connectedFrnRoom: org.funkgateway.mobile.frn.FrnRoom? = null
+    private var connectedFrnCallsign: String? = null
+
+    @Synchronized
+    fun getConnectedFrnCallsign(): String? = connectedFrnCallsign
 
     @Synchronized
     fun getConnectedFrnRoom(): org.funkgateway.mobile.frn.FrnRoom? =
@@ -547,6 +551,7 @@ class GatewayService : Service() {
                                         selectedPttTarget = null
                                     }
                                     connectedFrnRoom = null
+                                    connectedFrnCallsign = null
                                     frnParticipants = FrnParticipants()
                                     frnServerRooms = emptyList()
                                     frnLastStoppedGeneration = generation
@@ -572,6 +577,7 @@ class GatewayService : Service() {
                     frnConnection = activeConnection
                     frnReceiver = receiver
                     connectedFrnRoom = config.room
+                    connectedFrnCallsign = config.callsign.trim()
                     frnConnecting = false
                     receiver.start()
                     mainHandler.post {
@@ -630,6 +636,7 @@ class GatewayService : Service() {
         frnGeneration++
         frnConnecting = false
         connectedFrnRoom = null
+        connectedFrnCallsign = null
         frnParticipants = FrnParticipants()
         frnServerRooms = emptyList()
 
