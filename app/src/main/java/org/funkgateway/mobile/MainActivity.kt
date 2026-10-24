@@ -1,6 +1,9 @@
 package org.funkgateway.mobile
 
 import android.app.Activity
+import android.Manifest
+import android.content.pm.PackageManager
+import android.widget.Toast
 import android.os.Bundle
 import android.content.ComponentName
 import android.content.Context
@@ -23,7 +26,49 @@ import org.funkgateway.mobile.frn.FrnCache
 
 class MainActivity : Activity() {
     private var gatewayService: GatewayService? = null
+
+    private val microphonePermissionRequest = 1208
+
+    private fun ensureMicrophonePermission(): Boolean {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return true
+        }
+
+        requestPermissions(
+            arrayOf(Manifest.permission.RECORD_AUDIO),
+            microphonePermissionRequest
+        )
+        return false
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(
+            requestCode, permissions, grantResults
+        )
+
+        if (requestCode != microphonePermissionRequest) return
+
+        val granted = grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+
+        Toast.makeText(
+            this,
+            if (granted) {
+                "Mikrofon freigegeben. PTT zum Senden erneut drücken."
+            } else {
+                "Ohne Mikrofonberechtigung ist Senden nicht möglich."
+            },
+            Toast.LENGTH_LONG
+        ).show()
+    }
     private var gatewayBound = false
+    private var refreshPttBar: (() -> Unit)? = null
     private var refreshFrnRoomStatus: (() -> Unit)? = null
     private var refreshFrnParticipantsView: (() -> Unit)? = null
     private var refreshFrnServerCounts: (() -> Unit)? = null
@@ -35,6 +80,7 @@ class MainActivity : Activity() {
         ) {
             gatewayService =
                 (binder as? GatewayService.LocalBinder)?.getService()
+            refreshPttBar?.invoke()
             if (currentPage == "FRN_ROOM") {
                 refreshFrnRoomStatus?.invoke()
             }
@@ -45,6 +91,7 @@ class MainActivity : Activity() {
 
         override fun onServiceDisconnected(name: ComponentName?) {
             gatewayService = null
+            refreshPttBar?.invoke()
         }
     }
 
@@ -60,6 +107,16 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        // Beim Wechsel in den Hintergrund niemals weiter senden.
+        try {
+            gatewayService?.stopPtt()
+        } catch (e: Exception) {
+            android.util.Log.w(
+                "FunkGateway-PTT",
+                "PTT-Abbruch beim Verlassen der App",
+                e
+            )
+        }
         frnActivityActive = false
         stopFrnRefreshTimer()
         if (gatewayBound) {
@@ -1917,7 +1974,13 @@ class MainActivity : Activity() {
             setPadding(0, dp(24), 0, dp(12))
         })
         for (name in listOf("Audio & PTT", "Schutzfunktionen", "Darstellung")) {
-            root.addView(button(name) { showPage(name) })
+            root.addView(button(name) {
+                if (name == "Audio & PTT") {
+                    showAudioPttSettings()
+                } else {
+                    showPage(name)
+                }
+            })
         }
         root.addView(label("Software & Updates", 19f, accent, true).apply {
             setPadding(0, dp(24), 0, dp(12))
@@ -1926,6 +1989,78 @@ class MainActivity : Activity() {
             showSoftwareUpdate()
         })
         root.addView(button("← Zurück zur Übersicht") { showHome() })
+        showGatewayScreen(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun showAudioPttSettings() {
+        currentPage = "Audio & PTT"
+        val prefs = getSharedPreferences("funkgateway_ptt", Context.MODE_PRIVATE)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("🎙 Audio & PTT", 25f, Color.WHITE, true))
+        root.addView(label(
+            "Globale Push-to-Talk-Bedienung",
+            18f, accent, true
+        ).apply {
+            setPadding(0, dp(20), 0, dp(12))
+        })
+
+        val currentMode = prefs.getString("ptt_mode", "HOLD") ?: "HOLD"
+        val status = label(
+            "Aktueller Modus: " +
+                if (currentMode == "LATCH") "Latch" else "Hold",
+            16f, muted
+        )
+        root.addView(status)
+
+        fun selectMode(mode: String) {
+            // Beim Wechsel niemals eine Aussendung fortsetzen.
+            gatewayService?.stopPtt()
+            prefs.edit().putString("ptt_mode", mode).apply()
+            status.text = "Aktueller Modus: " +
+                if (mode == "LATCH") "Latch" else "Hold"
+            Toast.makeText(
+                this,
+                "PTT-Modus gespeichert",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
+        root.addView(button("Hold – gedrückt halten") {
+            selectMode("HOLD")
+        })
+        root.addView(label(
+            "Die Aussendung endet beim Loslassen der PTT-Taste.",
+            14f, muted
+        ).apply {
+            setPadding(0, 0, 0, dp(16))
+        })
+
+        root.addView(button("Latch – ein- und ausschalten") {
+            selectMode("LATCH")
+        })
+        root.addView(label(
+            "Einmal drücken: PTT ein. Erneut drücken: PTT aus.",
+            14f, muted
+        ).apply {
+            setPadding(0, 0, 0, dp(16))
+        })
+
+        root.addView(label(
+            "Standard: Hold. Die PTT-Sendetaste bleibt bis zum " +
+                "Abschluss der Sicherheitsprüfungen deaktiviert.",
+            14f, muted
+        ).apply {
+            setPadding(0, dp(16), 0, dp(16))
+        })
+
+        root.addView(button("← Zurück zu Einstellungen") {
+            showSettings()
+        })
         showGatewayScreen(ScrollView(this).apply { addView(root) })
     }
 
@@ -2296,7 +2431,159 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(-1, 0, 1f)
         )
 
+        val pttBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(10))
+            setBackgroundColor(panel)
+        }
+
+        val targetButton = button("Ziel: keines") {}
+        val pttButton = button("🎙 PTT") {}
+
+        pttButton.isEnabled = false
+        pttButton.alpha = 0.45f
+        pttButton.contentDescription =
+            "Globale PTT: Sendefunktion noch in Vorbereitung"
+
+        fun updatePttTarget() {
+            val service = gatewayService
+            val target = service?.getSelectedPttTarget()
+            val available = service?.getAvailablePttTargets().orEmpty()
+
+            targetButton.text = "Ziel: " + when {
+                target == null -> "keines"
+                target !in available -> "nicht verbunden"
+                else -> target.name
+            }
+            targetButton.isEnabled = service != null
+            val state = service?.getPttState() ?: GatewayService.PttState.IDLE
+            val ready = target != null && target in available
+            pttButton.isEnabled = ready
+            val (status, color) = when {
+                state == GatewayService.PttState.TRANSMITTING -> "🔴 SENDET" to Color.rgb(190, 30, 40)
+                state == GatewayService.PttState.REQUESTING -> "🔴 Warte auf Freigabe" to Color.rgb(165, 45, 45)
+                service?.isPttReleasePending() == true -> "🎙 PTT wird freigegeben" to Color.rgb(110, 120, 135)
+                ready -> "🎙 PTT bereit" to accent
+                else -> "🎙 PTT gesperrt" to Color.rgb(85, 92, 103)
+            }
+            pttButton.text = status
+            pttButton.background = rounded(color)
+            pttButton.alpha = if (pttButton.isEnabled) 1f else 0.65f
+        }
+
+        targetButton.setOnClickListener {
+            val service = gatewayService ?: return@setOnClickListener
+            val available = service.getAvailablePttTargets()
+            val choices = listOf("Keines") + available.map { it.name }
+
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Globales PTT-Sendeziel")
+                .setItems(choices.toTypedArray()) { _, which ->
+                    val target =
+                        if (which == 0) null else available[which - 1]
+                    service.selectPttTarget(target)
+                    updatePttTarget()
+                }
+                .setNegativeButton("Abbrechen", null)
+                .show()
+        }
+
+        // Eine globale PTT, aber niemals mehrere Sendeziele.
+        // HOLD: Drücken = Start, Loslassen = Stopp.
+        // LATCH: Antippen = Umschalten.
+        pttButton.setOnTouchListener { _, event ->
+            val service = gatewayService
+            val prefs = getSharedPreferences(
+                "funkgateway_ptt",
+                Context.MODE_PRIVATE
+            )
+            val latch = prefs.getString("ptt_mode", "HOLD") == "LATCH"
+
+            fun releasePtt() {
+                try {
+                    service?.stopPtt()
+                } catch (e: Exception) {
+                    android.util.Log.e(
+                        "FunkGateway-PTT",
+                        "PTT konnte nicht sauber beendet werden",
+                        e
+                    )
+                }
+            }
+
+            fun requestPtt() {
+                if (service == null) return
+                if (!ensureMicrophonePermission()) return
+                try {
+                    if (!service.startPtt()) {
+                        Toast.makeText(
+                            this,
+                            "PTT momentan nicht sendebereit.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e(
+                        "FunkGateway-PTT",
+                        "PTT-Start fehlgeschlagen",
+                        e
+                    )
+                    Toast.makeText(
+                        this,
+                        "PTT-Start fehlgeschlagen.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+
+            when (event.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    if (!latch) requestPtt()
+                }
+                android.view.MotionEvent.ACTION_UP -> {
+                    if (latch) {
+                        if (service?.getPttState() !=
+                            GatewayService.PttState.IDLE
+                        ) {
+                            releasePtt()
+                        } else {
+                            requestPtt()
+                        }
+                    } else {
+                        releasePtt()
+                    }
+                }
+                android.view.MotionEvent.ACTION_CANCEL -> {
+                    // Auch Latch bei unterbrochener Berührung sicher beenden.
+                    releasePtt()
+                }
+            }
+            true
+        }
+
+        pttBar.addView(
+            targetButton,
+            LinearLayout.LayoutParams(0, dp(54), 2f)
+        )
+        pttBar.addView(
+            pttButton,
+            LinearLayout.LayoutParams(0, dp(54), 1f)
+        )
+
+        frame.addView(pttBar)
+        refreshPttBar = { updatePttTarget() }
+        updatePttTarget()
         setContentView(frame)
+        val pttStatusHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        val pttStatusTask = object : Runnable {
+            override fun run() {
+                if (!frame.isAttachedToWindow || !frnActivityActive) return
+                updatePttTarget()
+                pttStatusHandler.postDelayed(this, 250L)
+            }
+        }
+        pttStatusHandler.postDelayed(pttStatusTask, 250L)
     }
 
     private fun showHome() {

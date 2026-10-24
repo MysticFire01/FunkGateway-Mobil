@@ -17,6 +17,7 @@ import org.funkgateway.mobile.frn.FrnReceiver
 import org.funkgateway.mobile.frn.FrnLoginConfig
 import org.funkgateway.mobile.frn.FrnEvent
 import org.funkgateway.mobile.audio.FrnAudioReceiver
+import org.funkgateway.mobile.audio.FrnAudioSender
 
 class GatewayService : Service() {
     companion object {
@@ -27,9 +28,20 @@ class GatewayService : Service() {
     }
 
     private var foregroundActive = false
+    private var microphoneForegroundActive = false
 
-    private fun startGatewayForeground() {
-        if (foregroundActive) return
+    private fun startGatewayForeground(microphone: Boolean = false) {
+        if (foregroundActive &&
+            microphoneForegroundActive == microphone) return
+
+        if (microphone) {
+            check(
+                checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                "Mikrofonberechtigung fehlt."
+            }
+        }
 
         val manager = getSystemService(NotificationManager::class.java)
 
@@ -61,22 +73,31 @@ class GatewayService : Service() {
             .build()
 
         if (Build.VERSION.SDK_INT >= 34) {
+            val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                (if (microphone)
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                else 0)
+
+            startForeground(NOTIFICATION_ID, notification, types)
+        } else if (Build.VERSION.SDK_INT >= 29 && microphone) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
 
         foregroundActive = true
+        microphoneForegroundActive = microphone
     }
 
     private fun stopGatewayForeground() {
         if (!foregroundActive) return
         stopForeground(STOP_FOREGROUND_REMOVE)
         foregroundActive = false
+        microphoneForegroundActive = false
     }
 
     @Synchronized
@@ -116,6 +137,207 @@ class GatewayService : Service() {
     @Synchronized
     fun getConnectedFrnRoom(): org.funkgateway.mobile.frn.FrnRoom? =
         connectedFrnRoom
+
+    enum class PttTarget {
+        FRN, MUMBLE, ZELLO
+    }
+
+    private var selectedPttTarget: PttTarget? = null
+
+    enum class PttState {
+        IDLE,
+        REQUESTING,
+        TRANSMITTING
+    }
+
+    private var pttState = PttState.IDLE
+    private var frnAudioSender: FrnAudioSender? = null
+    private var pttSessionId = 0L
+    private var pttReleasePending = false
+    private val pttTimeoutMillis = 180_000L
+    private val pttReleaseTimeoutMillis = 5_000L
+    private val pttNetworkExecutor = java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+        java.util.concurrent.ThreadFactory { task ->
+            Thread(task, "FRN-PTT-Network").apply { isDaemon = true }
+        }
+    )
+
+    private fun queuePttNetwork(task: () -> Unit) {
+        try {
+            pttNetworkExecutor.execute(task)
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            android.util.Log.w("FunkGateway-PTT", "Netzwerkauftrag abgewiesen", e)
+        }
+    }
+    private val pendingPttAudio = java.util.concurrent.atomic.AtomicInteger(0)
+    private fun queuePttAudio(task: () -> Unit) {
+        if (pendingPttAudio.incrementAndGet() > 3) {
+            pendingPttAudio.decrementAndGet()
+            return
+        }
+        try {
+            pttNetworkExecutor.execute {
+                try { task() } finally { pendingPttAudio.decrementAndGet() }
+            }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            pendingPttAudio.decrementAndGet()
+            android.util.Log.w("FunkGateway-PTT", "Audiopaket abgewiesen", e)
+        }
+    }
+    @Synchronized
+    private fun isPttSessionValid(
+        session: Long,
+        connection: FrnConnection
+    ): Boolean =
+        !serviceDestroyed &&
+        session == pttSessionId &&
+        frnConnection === connection &&
+        selectedPttTarget == PttTarget.FRN &&
+        pttState != PttState.IDLE
+
+    @Synchronized
+    fun getPttState(): PttState = pttState
+
+    @Synchronized
+    fun isPttReleasePending(): Boolean = pttReleasePending
+
+    @Synchronized
+    private fun resetPttState() {
+        pttState = PttState.IDLE
+        pttSessionId++
+        val sender = frnAudioSender
+        frnAudioSender = null
+        sender?.close()
+        if (microphoneForegroundActive && foregroundActive) {
+            try {
+                startGatewayForeground(false)
+            } catch (e: Exception) {
+                android.util.Log.e(
+                    "FunkGateway-PTT",
+                    "Rückkehr zum Empfangsmodus fehlgeschlagen",
+                    e
+                )
+            }
+        }
+    }
+
+
+    @Synchronized
+    fun getAvailablePttTargets(): List<PttTarget> =
+        buildList {
+            if (frnConnection != null && !frnConnecting) {
+                add(PttTarget.FRN)
+            }
+        }
+
+    @Synchronized
+    fun getSelectedPttTarget(): PttTarget? =
+        selectedPttTarget
+
+    @Synchronized
+    fun selectPttTarget(target: PttTarget?): Boolean {
+        if (pttState != PttState.IDLE) return false
+        if (target != null && target !in getAvailablePttTargets()) {
+            return false
+        }
+        selectedPttTarget = target
+        return true
+    }
+
+    @Synchronized
+    fun startPtt(): Boolean {
+        if (serviceDestroyed || pttState != PttState.IDLE || pttReleasePending) return false
+        if (selectedPttTarget != PttTarget.FRN) return false
+        val connection = frnConnection ?: return false
+        if (frnConnecting || frnParticipants.activeIndex != null) {
+            return false
+        }
+        // Mikrofonmodus aktivieren, bevor TX0 angefordert wird.
+        try {
+            startGatewayForeground(true)
+        } catch (e: Exception) {
+            android.util.Log.e(
+                "FunkGateway-PTT",
+                "Mikrofon-Vordergrunddienst konnte nicht starten",
+                e
+            )
+            return false
+        }
+
+        pttState = PttState.REQUESTING
+        val session = ++pttSessionId
+        try {
+            queuePttNetwork {
+                if (isPttSessionValid(session, connection)) {
+                    try {
+                        connection.send("TX0")
+                    } catch (e: Exception) {
+                        android.util.Log.e("FunkGateway-PTT", "TX0 fehlgeschlagen", e)
+                        mainHandler.post {
+                            if (isPttSessionValid(session, connection)) stopPtt()
+                        }
+                    }
+                }
+            }
+            mainHandler.postDelayed({
+                synchronized(this) {
+                    if (session == pttSessionId &&
+                        pttState != PttState.IDLE
+                    ) {
+                        android.util.Log.w(
+                            "FunkGateway-PTT",
+                            "FRN-Sendezeitlimit erreicht: 180 Sekunden"
+                        )
+                        stopPtt()
+                    }
+                }
+            }, pttTimeoutMillis)
+        } catch (e: Exception) {
+            resetPttState()
+            throw e
+        }
+        return true
+    }
+
+    @Synchronized
+    fun stopPtt() {
+        if (pttState == PttState.IDLE) return
+        val connection = if (pttState != PttState.IDLE && selectedPttTarget == PttTarget.FRN) frnConnection else null
+        if (connection != null) pttReleasePending = true
+        resetPttState()
+        val releaseSession = pttSessionId
+        if (connection != null) {
+            mainHandler.postDelayed({
+                synchronized(this) {
+                    if (frnConnection === connection && pttReleasePending && pttSessionId == releaseSession) {
+                        android.util.Log.e("FunkGateway-PTT", "RX0-Zeitlimit überschritten – FRN wird getrennt")
+                        disconnectFrn()
+                    }
+                }
+            }, pttReleaseTimeoutMillis)
+        }
+        if (connection != null) {
+            queuePttNetwork {
+                try {
+                    connection.send("RX0")
+                    synchronized(this) {
+                        if (frnConnection === connection) {
+                            pttReleasePending = false
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("FunkGateway-PTT", "FRN RX0 konnte nicht gesendet werden", e)
+                    mainHandler.post {
+                        synchronized(this) {
+                            if (frnConnection === connection) disconnectFrn()
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private var frnConnection: FrnConnection? = null
     private var frnReceiver: FrnReceiver? = null
@@ -233,6 +455,65 @@ class GatewayService : Service() {
                     val receiver = FrnReceiver(
                         activeConnection,
                         onEvent = { event ->
+                            if (event is FrnEvent.TxGranted) {
+                                synchronized(this) {
+                                    if (!serviceDestroyed &&
+                                        generation == frnGeneration &&
+                                        frnConnection === activeConnection &&
+                                        selectedPttTarget == PttTarget.FRN &&
+                                        pttState == PttState.REQUESTING
+                                    ) {
+                                        pttState = PttState.TRANSMITTING
+                                        val audioSession = pttSessionId
+                                        val sender = FrnAudioSender(
+                                            this,
+                                            onPacket = { packet ->
+                                                if (isPttSessionValid(audioSession, activeConnection)) {
+                                                    queuePttAudio {
+                                                        if (isPttSessionValid(audioSession, activeConnection)) {
+                                                            try {
+                                                                activeConnection.sendAudioPacket(packet)
+                                                            } catch (e: Exception) {
+                                                                android.util.Log.e("FunkGateway-PTT", "TX1 fehlgeschlagen", e)
+                                                                mainHandler.post {
+                                                                    if (isPttSessionValid(audioSession, activeConnection)) stopPtt()
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            
+                                            onError = { error ->
+                                                android.util.Log.e(
+                                                    "FunkGateway-PTT",
+                                                    "FRN-Mikrofonfehler",
+                                                    error
+                                                )
+                                                synchronized(this) {
+                                                    if (generation == frnGeneration &&
+                                                        frnConnection === activeConnection &&
+                                                        audioSession == pttSessionId
+                                                    ) {
+                                                        stopPtt()
+                                                    }
+                                                }
+                                            }
+                                        )
+                                        frnAudioSender = sender
+                                        try {
+                                            sender.start()
+                                        } catch (e: Exception) {
+                                            stopPtt()
+                                            android.util.Log.e(
+                                                "FunkGateway-PTT",
+                                                "Mikrofonstart fehlgeschlagen",
+                                                e
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                             if (event is FrnEvent.Audio) {
                                 synchronized(this) {
                                     if (!serviceDestroyed &&
@@ -260,6 +541,11 @@ class GatewayService : Service() {
                                     frnReceiver = null
                                     frnConnection = null
                                     frnConnecting = false
+                                    resetPttState()
+                                    pttReleasePending = false
+                                    if (selectedPttTarget == PttTarget.FRN) {
+                                        selectedPttTarget = null
+                                    }
                                     connectedFrnRoom = null
                                     frnParticipants = FrnParticipants()
                                     frnServerRooms = emptyList()
@@ -333,6 +619,11 @@ class GatewayService : Service() {
 
     @Synchronized
     fun disconnectFrn() {
+        resetPttState()
+        pttReleasePending = false
+        if (selectedPttTarget == PttTarget.FRN) {
+            selectedPttTarget = null
+        }
         frnAudio?.close()
         frnAudio = null
         frnLastStoppedGeneration = -1
@@ -381,6 +672,7 @@ class GatewayService : Service() {
         synchronized(this) {
             serviceDestroyed = true
             disconnectFrn()
+            pttNetworkExecutor.shutdownNow()
         }
         super.onDestroy()
     }

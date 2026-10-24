@@ -93,6 +93,19 @@ class FrnConnection private constructor(
         output.flush()
     }
 
+    @Synchronized
+    fun sendAudioPacket(packet: ByteArray) {
+        check(!socket.isClosed) {
+            "FRN-Verbindung ist geschlossen."
+        }
+        require(packet.size == 325) {
+            "FRN-Sendepaket muss genau 325 Byte enthalten."
+        }
+        output.write("TX1\\r\\n".toByteArray(Charsets.US_ASCII))
+        output.write(packet)
+        output.flush()
+    }
+
     fun receive(): ByteArray {
         if (pending.isNotEmpty()) {
             return ByteArray(pending.size) {
