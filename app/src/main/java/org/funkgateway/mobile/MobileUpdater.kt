@@ -18,14 +18,19 @@ object MobileUpdater {
     private const val RELEASE_API =
         "https://api.github.com/repos/MysticFire01/FunkGateway-Mobil/releases/latest"
 
+    private const val RELEASES_API =
+        "https://api.github.com/repos/MysticFire01/FunkGateway-Mobil/releases?per_page=30"
+
     fun check(
         context: Context,
+        testChannel: Boolean = false,
         callback: (Result<MobileUpdateInfo?>) -> Unit
     ) {
         val appContext = context.applicationContext
         Thread {
             val result = runCatching {
-                val connection = URL(RELEASE_API)
+                val apiUrl = if (testChannel) RELEASES_API else RELEASE_API
+                val connection = URL(apiUrl)
                     .openConnection() as HttpURLConnection
 
                 try {
@@ -42,11 +47,30 @@ object MobileUpdater {
                         error("GitHub HTTP ${connection.responseCode}")
                     }
 
-                    val json = JSONObject(
-                        connection.inputStream.bufferedReader().use {
-                            it.readText()
-                        }
-                    )
+                    val response = connection.inputStream
+                        .bufferedReader().use { it.readText() }
+
+                    val json = if (testChannel) {
+                        val releases = org.json.JSONArray(response)
+                        val candidates = (0 until releases.length())
+                            .map { releases.getJSONObject(it) }
+                            .filter {
+                                it.optBoolean("prerelease") &&
+                                !it.optBoolean("draft") &&
+                                Regex("v[0-9]+[.][0-9]+[.][0-9]+")
+                                    .matches(it.optString("tag_name"))
+                            }
+                        candidates.maxByOrNull {
+                            val parts = it.getString("tag_name")
+                                .removePrefix("v")
+                                .split(".")
+                                .map(String::toLong)
+                            parts[0] * 1000000L +
+                                parts[1] * 1000L + parts[2]
+                        } ?: return@runCatching null
+                    } else {
+                        JSONObject(response)
+                    }
 
                     val tag = json.getString("tag_name")
                     val code = tag.removePrefix("v")

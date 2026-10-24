@@ -1713,6 +1713,10 @@ class MainActivity : Activity() {
             setBackgroundColor(bg)
         }
 
+        if (name == "Über FunkGateway Mobile") {
+            showAboutMobile()
+            return
+        }
         root.addView(label(name, 26f, Color.WHITE, true))
         root.addView(label(
             "Dieser Bereich wird in einer der nächsten Versionen eingerichtet.",
@@ -1726,6 +1730,62 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(-1, dp(64)))
 
         showGatewayScreen(root)
+    }
+
+    private fun showAboutMobile() {
+        currentPage = "Über FunkGateway Mobile"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+        val version = packageManager.getPackageInfo(packageName, 0)
+            .versionName ?: "Unbekannt"
+
+        root.addView(label("Über FunkGateway Mobile", 24f, Color.WHITE, true))
+        root.addView(label("Version: $version", 16f, muted))
+        root.addView(label(
+            "FunkGateway Mobile – Funk und Sprachkommunikation.",
+            16f, muted
+        ))
+        root.addView(button("Open-Source-Lizenzen") {
+            showMobileLicenses()
+        })
+        root.addView(button("← Zurück zu Mehr") {
+            showPage("Mehr")
+        })
+        showGatewayScreen(ScrollView(this).apply {
+            addView(root)
+        })
+    }
+
+    private fun showMobileLicenses() {
+        currentPage = "Open-Source-Lizenzen"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+        root.addView(label("Open-Source-Lizenzen", 24f, Color.WHITE, true))
+        root.addView(label(
+            "libgsm – Jutta Degener und Carsten Bormann",
+            17f, Color.WHITE, true
+        ))
+        val licenseText = try {
+            assets.open("licenses/libgsm.txt").bufferedReader().use {
+                it.readText()
+            }
+        } catch (e: Exception) {
+            "Lizenztext konnte nicht geladen werden: " +
+                (e.message ?: "Unbekannter Fehler")
+        }
+        root.addView(label(licenseText, 14f, muted))
+        root.addView(button("← Zurück zu Über FunkGateway") {
+            showAboutMobile()
+        })
+        showGatewayScreen(ScrollView(this).apply {
+            addView(root)
+        })
     }
 
     private fun showFrnSettings() {
@@ -1901,10 +1961,35 @@ class MainActivity : Activity() {
         }
         root.addView(changelog)
 
+        var testChannel = false
+        var updateRequestId = 0
+        lateinit var installButton: android.widget.Button
+        lateinit var channelButton: android.widget.Button
         var availableUpdate: MobileUpdateInfo? = null
         var downloading = false
 
-        val installButton = button("Update herunterladen und installieren") {
+        channelButton = button("Update-Kanal: Stabil") {
+            if (downloading) {
+                status.text = "Bitte laufenden Download abschließen."
+                return@button
+            }
+
+            updateRequestId++
+            testChannel = !testChannel
+            channelButton.text = if (testChannel) {
+                "Update-Kanal: Test"
+            } else {
+                "Update-Kanal: Stabil"
+            }
+            availableUpdate = null
+            installButton.visibility = View.GONE
+
+            status.text = "Bitte erneut nach Updates suchen."
+            changelog.text = ""
+        }
+        root.addView(channelButton)
+
+        installButton = button("Update herunterladen und installieren") {
             val update = availableUpdate
 
             if (update == null || downloading) {
@@ -2011,11 +2096,19 @@ class MainActivity : Activity() {
             }
             availableUpdate = null
             installButton.visibility = View.GONE
-            status.text = "Prüfe GitHub Releases ..."
+            val requestedChannel = testChannel
+            val requestId = ++updateRequestId
+            status.text = if (requestedChannel) {
+                "Prüfe GitHub-Testversionen ..."
+            } else {
+                "Prüfe GitHub-Releases ..."
+            }
             changelog.text = ""
-
-            MobileUpdater.check(this) { result ->
-                if (currentPage != "Software-Update") return@check
+            MobileUpdater.check(this, testChannel = requestedChannel) { result ->
+                if (currentPage != "Software-Update" ||
+                    requestId != updateRequestId ||
+                    testChannel != requestedChannel
+                ) return@check
 
                 result.fold(
                     onSuccess = { update ->

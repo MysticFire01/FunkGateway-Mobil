@@ -6,13 +6,21 @@ plugins {
 android {
     namespace = "org.funkgateway.mobile"
     compileSdk = 35
+    ndkVersion = "27.2.12479018"
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
     defaultConfig {
         applicationId = "org.funkgateway.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1005
-        versionName = "0.1.5"
+        versionCode = 1006
+        versionName = "0.1.6"
     }
 
     compileOptions {

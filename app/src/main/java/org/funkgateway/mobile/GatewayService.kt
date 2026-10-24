@@ -16,6 +16,7 @@ import org.funkgateway.mobile.frn.FrnConnection
 import org.funkgateway.mobile.frn.FrnReceiver
 import org.funkgateway.mobile.frn.FrnLoginConfig
 import org.funkgateway.mobile.frn.FrnEvent
+import org.funkgateway.mobile.audio.FrnAudioReceiver
 
 class GatewayService : Service() {
     companion object {
@@ -118,6 +119,7 @@ class GatewayService : Service() {
 
     private var frnConnection: FrnConnection? = null
     private var frnReceiver: FrnReceiver? = null
+    private var frnAudio: FrnAudioReceiver? = null
 
     private var frnGeneration = 0
     private var frnLastStoppedGeneration = -1
@@ -224,16 +226,34 @@ class GatewayService : Service() {
 
                     val activeConnection = connection
 
+                    val audioReceiver = FrnAudioReceiver()
+
+                    frnAudio = audioReceiver
+
                     val receiver = FrnReceiver(
                         activeConnection,
                         onEvent = { event ->
+                            if (event is FrnEvent.Audio) {
+                                synchronized(this) {
+                                    if (!serviceDestroyed &&
+                                        generation == frnGeneration &&
+                                        frnAudio === audioReceiver
+                                    ) {
+                                        audioReceiver.receive(event.packet)
+                                    }
+                                }
+                            }
                             dispatchFrnEvent(generation, event, onEvent)
                         },
                         onError = { error ->
                             dispatchFrnError(generation, error, onError)
                         },
                         onStopped = {
+                            audioReceiver.close()
                             synchronized(this) {
+                                if (frnAudio === audioReceiver) {
+                                    frnAudio = null
+                                }
                                 if (generation == frnGeneration &&
                                     frnConnection === activeConnection
                                 ) {
@@ -313,6 +333,8 @@ class GatewayService : Service() {
 
     @Synchronized
     fun disconnectFrn() {
+        frnAudio?.close()
+        frnAudio = null
         frnLastStoppedGeneration = -1
         frnGeneration++
         frnConnecting = false
