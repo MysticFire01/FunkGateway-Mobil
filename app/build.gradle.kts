@@ -19,8 +19,8 @@ android {
         applicationId = "org.funkgateway.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1013
-        versionName = "0.1.13"
+        versionCode = 1014
+        versionName = "0.1.14"
     }
 
     compileOptions {
@@ -36,4 +36,5 @@ android {
 dependencies {
     implementation("androidx.core:core:1.15.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
