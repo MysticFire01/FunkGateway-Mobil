@@ -27,6 +27,15 @@ class GatewayService : Service() {
         private const val NOTIFICATION_ID = 1001
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        val prefs = getSharedPreferences(
+            "funkgateway_audio",
+            MODE_PRIVATE
+        )
+        setFrnVolume(prefs.getInt("frn_volume", 100))
+    }
+
     private var foregroundActive = false
     private var microphoneForegroundActive = false
 
@@ -156,6 +165,16 @@ class GatewayService : Service() {
 
     private var globalMuted = false
     private var globalDeafened = false
+    private var frnVolume = 100
+
+    @Synchronized
+    fun getFrnVolume(): Int = frnVolume
+
+    @Synchronized
+    fun setFrnVolume(value: Int) {
+        frnVolume = value.coerceIn(0, 100)
+        frnAudio?.setVolume(frnVolume / 100f)
+    }
 
     @Synchronized
     fun isGlobalMuted(): Boolean = globalMuted
@@ -374,6 +393,135 @@ class GatewayService : Service() {
     private var serviceDestroyed = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private val groupInvitationRetryTask = object : Runnable {
+        override fun run() {
+            if (serviceDestroyed) return
+
+            val connectedRoom = getConnectedFrnRoom()
+            if (connectedRoom != null) {
+                val invitations =
+                    org.funkgateway.mobile.frn.FrnAcceptedGroupInvitations
+                        .takeDueRetries()
+
+                invitations.forEach { invitation ->
+                    if (
+                        invitation.server.equals(
+                            connectedRoom.server, ignoreCase = true
+                        ) &&
+                        invitation.room.equals(
+                            connectedRoom.room, ignoreCase = true
+                        )
+                    ) {
+                        val currentRoom = getConnectedFrnRoom()
+                        if (
+                            currentRoom != null &&
+                            currentRoom.server.equals(
+                                invitation.server, ignoreCase = true
+                            ) &&
+                            currentRoom.room.equals(
+                                invitation.room, ignoreCase = true
+                            ) &&
+                            org.funkgateway.mobile.frn.FrnAcceptedGroupInvitations
+                                .markRetryStarted(invitation.invitationId)
+                        ) {
+                            val response =
+                                org.funkgateway.mobile.frn.FrnGroupInvitationResponseParser
+                                    .encode(
+                                        org.funkgateway.mobile.frn.FrnGroupResponseType.ACCEPT,
+                                        invitation.invitationId,
+                                        invitation.groupId
+                                    )
+
+                            sendFrnGroupControlMessageAsync(
+                                invitation.senderId,
+                                response,
+                                invitation.server,
+                                invitation.room
+                            ) { sent, error ->
+                                if (!sent) {
+                                    android.util.Log.w(
+                                        "FunkGateway-Groups",
+                                        "ACCEPT-Wiederholung fehlgeschlagen: " +
+                                            (error ?: "Unbekannter Fehler")
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (connectedRoom != null) {
+                val ownId =
+                    org.funkgateway.mobile.frn.FrnGatewayIdentity.getId(
+                        this@GatewayService
+                    )
+
+                val retries =
+                    org.funkgateway.mobile.frn.FrnGroupInvitationTracker
+                        .takeDueConfirmRetries()
+
+                retries.forEach { invitation ->
+                    val group =
+                        org.funkgateway.mobile.frn.FrnChatGroups.get(
+                            invitation.groupId
+                        )
+                    val currentRoom = getConnectedFrnRoom()
+
+                    if (
+                        group != null &&
+                        group.active &&
+                        group.server.equals(
+                            invitation.server, ignoreCase = true
+                        ) &&
+                        group.room.equals(
+                            invitation.room, ignoreCase = true
+                        ) &&
+                        org.funkgateway.mobile.frn.FrnChatGroups.isHost(
+                            group.id, ownId
+                        ) &&
+                        currentRoom != null &&
+                        currentRoom.server.equals(
+                            invitation.server, ignoreCase = true
+                        ) &&
+                        currentRoom.room.equals(
+                            invitation.room, ignoreCase = true
+                        ) &&
+                        org.funkgateway.mobile.frn.FrnGroupInvitationTracker
+                            .markConfirmRetryStarted(invitation.invitationId)
+                    ) {
+                        val response =
+                            org.funkgateway.mobile.frn.FrnGroupInvitationResponseParser
+                                .encode(
+                                    org.funkgateway.mobile.frn.FrnGroupResponseType.CONFIRM,
+                                    invitation.invitationId,
+                                    invitation.groupId
+                                )
+
+                        sendFrnGroupControlMessageAsync(
+                            invitation.recipientId,
+                            response,
+                            invitation.server,
+                            invitation.room
+                        ) { sent, error ->
+                            if (!sent) {
+                                android.util.Log.w(
+                                    "FunkGateway-Groups",
+                                    "CONFIRM-Wiederholung fehlgeschlagen: " +
+                                        (error ?: "Unbekannter Fehler")
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!serviceDestroyed) {
+                mainHandler.postDelayed(this, 5_000L)
+            }
+        }
+    }
+
     private fun dispatchFrnEvent(
         generation: Int,
         event: FrnEvent,
@@ -420,7 +568,63 @@ class GatewayService : Service() {
                         else -> Unit
                     }
                 }
+                if (event is FrnEvent.TextMessage) {
+                    relayFrnGroupMessages(event)
+                }
                 callback(event)
+            }
+        }
+    }
+
+    private fun relayFrnGroupMessages(event: FrnEvent.TextMessage) {
+        val room = getConnectedFrnRoom() ?: return
+        val clients = getFrnParticipants().entries
+
+        val messages =
+            org.funkgateway.mobile.frn.FrnChatParser.parse(
+                event.entries, clients
+            )
+
+        messages.forEach { message ->
+            val reply =
+                org.funkgateway.mobile.frn.FrnGroupMessageParser.recognize(
+                    message, room.server, room.room
+                ) ?: return@forEach
+
+            val group =
+                org.funkgateway.mobile.frn.FrnChatGroups.get(
+                    reply.groupId
+                ) ?: return@forEach
+
+            val ownInstallationId =
+                org.funkgateway.mobile.frn.FrnGatewayIdentity.getId(this)
+            if (!org.funkgateway.mobile.frn.FrnChatGroups.isHost(
+                    group.id, ownInstallationId
+                )
+            ) return@forEach
+
+            org.funkgateway.mobile.frn.FrnGroupChatStore.add(
+                groupId = reply.groupId,
+                sender = reply.sender,
+                senderId = reply.senderId,
+                message = reply.text,
+                outgoing = false
+            )
+
+            val recipients = group.participants.keys.filterNot {
+                it.equals(reply.senderId, ignoreCase = true)
+            }
+
+            if (recipients.isEmpty()) return@forEach
+
+            val forwarded =
+                "[${group.shortCode}] ${reply.sender}: ${reply.text}"
+
+            sendFrnGroupMessageAsync(recipients, forwarded) { sent, total ->
+                android.util.Log.d(
+                    "FRN-Group",
+                    "Gruppenantwort weitergegeben: $sent/$total"
+                )
             }
         }
     }
@@ -436,7 +640,14 @@ class GatewayService : Service() {
                     (generation == frnGeneration ||
                      generation == frnLastStoppedGeneration)
             }
-            if (current) callback(error)
+            if (current) {
+                GatewayLog.add(
+                    "FRN",
+                    error.message ?: error.javaClass.simpleName,
+                    "ERROR"
+                )
+                callback(error)
+            }
         }
     }
 
@@ -458,6 +669,7 @@ class GatewayService : Service() {
         frnParticipants = FrnParticipants()
         frnServerRooms = emptyList()
         val generation = ++frnGeneration
+        GatewayLog.add("FRN", "Verbindungsaufbau gestartet.")
 
         Thread({
             var connection: FrnConnection? = null
@@ -475,6 +687,7 @@ class GatewayService : Service() {
 
                     val audioReceiver = FrnAudioReceiver()
                     audioReceiver.setDeafened(globalDeafened)
+                    audioReceiver.setVolume(frnVolume / 100f)
 
                     frnAudio = audioReceiver
 
@@ -566,12 +779,11 @@ class GatewayService : Service() {
                                 ) {
                                     frnReceiver = null
                                     frnConnection = null
+                                    org.funkgateway.mobile.frn.FrnGroupMemberSyncBuffer.clear()
                                     frnConnecting = false
                                     resetPttState()
                                     pttReleasePending = false
-                                    if (selectedPttTarget == PttTarget.FRN) {
-                                        selectedPttTarget = null
-                                    }
+
                                     connectedFrnRoom = null
                                     connectedFrnCallsign = null
                                     frnParticipants = FrnParticipants()
@@ -584,6 +796,11 @@ class GatewayService : Service() {
                                                 frnLastStoppedGeneration == generation
                                         }
                                         if (current) {
+                                            GatewayLog.add(
+                                                "FRN",
+                                                "Verbindung zum Server beendet.",
+                                                "WARN"
+                                            )
                                             try {
                                                 onDisconnected()
                                             } finally {
@@ -608,7 +825,10 @@ class GatewayService : Service() {
                                 generation == frnGeneration &&
                                 frnConnection === activeConnection
                         }
-                        if (current) onConnected()
+                        if (current) {
+                            GatewayLog.add("FRN", "Verbindung hergestellt.")
+                            onConnected()
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -646,12 +866,281 @@ class GatewayService : Service() {
         }
 
     @Synchronized
+    fun sendFrnTextMessage(recipientId: String, text: String): Boolean {
+        val connection = frnConnection ?: return false
+        val recipient = recipientId.trim()
+        val message = text.trim()
+
+        require(recipient.isNotEmpty() && recipient.length <= 128) {
+            "Ungültiger FRN-Empfänger."
+        }
+        require(recipient.none { it == '<' || it == '>' ||
+            it == '\r' || it == '\n' || it == '\u0000' }) {
+            "Ungültige Zeichen in der Empfänger-ID."
+        }
+        require(message.isNotEmpty() && message.length <= 500) {
+            "Nachricht muss zwischen 1 und 500 Zeichen enthalten."
+        }
+        require(message.none { it == '\r' || it == '\n' ||
+            it == '\u0000' }) {
+            "Zeilenumbrüche sind nicht erlaubt."
+        }
+
+        fun escape(value: String): String =
+            value.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#39;")
+
+        connection.send(
+            "TM:<ID>${escape(recipient)}</ID>" +
+                "<MS>${escape(message)}</MS>"
+        )
+        return true
+    }
+
+    fun sendFrnGroupControlMessageAsync(
+        recipientId: String,
+        text: String,
+        expectedServer: String,
+        expectedRoom: String,
+        callback: (Boolean, String?) -> Unit
+    ) {
+        val expectedConnection: FrnConnection?
+        synchronized(this) {
+            val room = connectedFrnRoom
+            expectedConnection = if (
+                room != null &&
+                room.server.equals(expectedServer, ignoreCase = true) &&
+                room.room.equals(expectedRoom, ignoreCase = true)
+            ) frnConnection else null
+        }
+
+        if (expectedConnection == null) {
+            mainHandler.post {
+                callback(false, "Ursprüngliche FRN-Verbindung nicht verfügbar.")
+            }
+            return
+        }
+
+        Thread({
+            try {
+                val sent = synchronized(this) {
+                    val room = connectedFrnRoom
+                    if (
+                        !serviceDestroyed &&
+                        frnConnection === expectedConnection &&
+                        room != null &&
+                        room.server.equals(expectedServer, ignoreCase = true) &&
+                        room.room.equals(expectedRoom, ignoreCase = true)
+                    ) {
+                        sendFrnTextMessage(recipientId, text)
+                    } else {
+                        false
+                    }
+                }
+                mainHandler.post {
+                    callback(
+                        sent,
+                        if (sent) null else "FRN-Verbindung inzwischen geändert."
+                    )
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    callback(
+                        false,
+                        e.message ?: e.javaClass.simpleName
+                    )
+                }
+            }
+        }, "FRN-Group-Control-TX").start()
+    }
+
+    fun sendFrnMemberSyncAsync(
+        groupId: String,
+        installationId: String
+    ) {
+        val group = org.funkgateway.mobile.frn.FrnChatGroups.get(groupId)
+            ?: return
+        if (!org.funkgateway.mobile.frn.FrnChatGroups.isHost(
+                groupId, installationId
+            )
+        ) return
+
+        val messages =
+            org.funkgateway.mobile.frn.FrnChatGroups.createMemberSyncMessages(
+                groupId, installationId
+            )
+        val recipients =
+            org.funkgateway.mobile.frn.FrnChatGroups.getGatewaySyncRecipients(
+                groupId, installationId
+            )
+
+        if (messages.isEmpty() || recipients.isEmpty()) return
+
+        val server = group.server
+        val roomName = group.room
+
+        val expectedConnection = synchronized(this) {
+            val room = connectedFrnRoom
+            if (!serviceDestroyed &&
+                room != null &&
+                room.server.equals(server, ignoreCase = true) &&
+                room.room.equals(roomName, ignoreCase = true)
+            ) frnConnection else null
+        } ?: return
+
+        Thread({
+            for (recipientId in recipients) {
+                for (message in messages) {
+                    val sent = try {
+                        synchronized(this) {
+                            val room = connectedFrnRoom
+                            if (!serviceDestroyed &&
+                                frnConnection === expectedConnection &&
+                                room != null &&
+                                room.server.equals(server, ignoreCase = true) &&
+                                room.room.equals(roomName, ignoreCase = true)
+                            ) {
+                                sendFrnTextMessage(recipientId, message)
+                            } else {
+                                false
+                            }
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.w(
+                            "FunkGateway-Chat",
+                            "MEMBER-Versand fehlgeschlagen",
+                            e
+                        )
+                        false
+                    }
+
+                    if (!sent) {
+                        android.util.Log.w(
+                            "FunkGateway-Chat",
+                            "Mitglieder-Synchronisation abgebrochen."
+                        )
+                        return@Thread
+                    }
+                }
+            }
+        }, "FRN-Member-Sync-TX").start()
+    }
+
+    fun sendFrnGroupMessageAsync(
+        recipientIds: List<String>,
+        text: String,
+        callback: (Int, Int) -> Unit
+    ) {
+        val targets = recipientIds.distinct().filter { it.isNotBlank() }
+
+        Thread({
+            var successful = 0
+
+            targets.forEach { id ->
+                try {
+                    val result = sendFrnTextMessage(id, text)
+                    if (result) successful++
+                } catch (e: Exception) {
+                    android.util.Log.w(
+                        "FunkGateway-Chat",
+                        "Gruppennachricht an $id fehlgeschlagen",
+                        e
+                    )
+                }
+            }
+
+            mainHandler.post {
+                callback(successful, targets.size)
+            }
+        }, "FRN-Group-Chat-TX").start()
+    }
+
+    fun sendFrnGroupInvitationAsync(
+        invitation: org.funkgateway.mobile.frn.FrnGroupInvitation,
+        callback: (Boolean, String?) -> Unit
+    ) {
+        val text = try {
+            org.funkgateway.mobile.frn.FrnGroupInvitationParser
+                .encode(invitation)
+        } catch (e: IllegalArgumentException) {
+            mainHandler.post {
+                callback(false, "Ungültige Gruppeneinladung.")
+            }
+            return
+        }
+
+        if (text.length > 500 || invitation.senderId.isBlank()) {
+            mainHandler.post {
+                callback(false, "Einladung ist zu lang oder Empfänger fehlt.")
+            }
+            return
+        }
+
+        val tracker = org.funkgateway.mobile.frn.FrnGroupInvitationTracker
+        val pending = org.funkgateway.mobile.frn.FrnPendingGroupInvitation(
+            invitationId = invitation.invitationId,
+            groupId = invitation.groupId,
+            recipientId = invitation.senderId,
+            server = invitation.server,
+            room = invitation.room
+        )
+
+        if (!tracker.register(pending)) {
+            mainHandler.post {
+                callback(false, "Einladung konnte nicht vorgemerkt werden.")
+            }
+            return
+        }
+
+        sendFrnTextMessageAsync(invitation.senderId, text) { sent, error ->
+            if (!sent) {
+                tracker.complete(invitation.invitationId)
+            }
+            callback(sent, error)
+        }
+    }
+
+    fun sendFrnTextMessageAsync(
+        recipientId: String,
+        text: String,
+        callback: (Boolean, String?) -> Unit
+    ) {
+        Thread({
+            try {
+                val sent = sendFrnTextMessage(recipientId, text)
+                mainHandler.post {
+                    callback(
+                        sent,
+                        if (sent) null else "FRN ist nicht verbunden."
+                    )
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    callback(
+                        false,
+                        e.message?.takeIf { it.isNotBlank() }
+                            ?: e.javaClass.simpleName
+                    )
+                }
+            }
+        }, "FRN-Chat-TX").start()
+    }
+
+    @Synchronized
     fun disconnectFrn() {
+        org.funkgateway.mobile.frn.FrnGroupMemberSyncBuffer.clear()
+        if (frnConnection != null || frnConnecting) {
+            GatewayLog.add(
+                "FRN",
+                "Verbindung manuell getrennt."
+            )
+        }
         resetPttState()
         pttReleasePending = false
-        if (selectedPttTarget == PttTarget.FRN) {
-            selectedPttTarget = null
-        }
+
         frnAudio?.close()
         frnAudio = null
         frnLastStoppedGeneration = -1
@@ -686,6 +1175,8 @@ class GatewayService : Service() {
         flags: Int,
         startId: Int
     ): Int {
+        mainHandler.removeCallbacks(groupInvitationRetryTask)
+        mainHandler.postDelayed(groupInvitationRetryTask, 5_000L)
         when (intent?.action) {
             ACTION_START -> startGatewayForeground()
             ACTION_STOP -> {
@@ -700,6 +1191,7 @@ class GatewayService : Service() {
     override fun onDestroy() {
         synchronized(this) {
             serviceDestroyed = true
+            mainHandler.removeCallbacks(groupInvitationRetryTask)
             disconnectFrn()
             pttNetworkExecutor.shutdownNow()
         }

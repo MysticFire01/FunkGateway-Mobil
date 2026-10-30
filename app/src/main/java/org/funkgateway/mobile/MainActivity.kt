@@ -100,6 +100,8 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        org.funkgateway.mobile.frn.FrnChatStore.initialize(this)
+        org.funkgateway.mobile.frn.FrnChatParser.initialize(this)
         frnActivityActive = true
         startFrnRefreshTimer()
         gatewayBound = bindService(
@@ -166,6 +168,16 @@ class MainActivity : Activity() {
             background = rounded(panel)
             setOnClickListener { action() }
         }
+
+    private var selectedFrnChatId: String? = null
+    private val frnOpenChatContacts =
+        linkedMapOf<String, String>()
+    private val frnClosedChatIds = mutableSetOf<String>()
+    private val frnHiddenGroupIds = mutableSetOf<String>()
+
+    private val frnUnreadChats = mutableMapOf<String, Int>()
+    private val frnPrivateDialogs =
+        mutableMapOf<String, android.app.Dialog>()
 
     private var currentPage = "Start"
     private var selectedFrnRoom: org.funkgateway.mobile.frn.FrnRoom? = null
@@ -867,10 +879,660 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun fillFrnChatBubbles(
+        container: LinearLayout,
+        entries: List<org.funkgateway.mobile.frn.FrnChatStore.Entry>
+    ) {
+        container.removeAllViews()
+        entries.forEach { entry ->
+            container.addView(
+                org.funkgateway.mobile.frn.FrnChatBubble.create(
+                    this, entry
+                )
+            )
+        }
+    }
+
     private fun handleFrnUiEvent(
-        event: org.funkgateway.mobile.frn.FrnEvent
+        event: org.funkgateway.mobile.frn.FrnEvent,
+        service: GatewayService
     ) {
         when (event) {
+            is org.funkgateway.mobile.frn.FrnEvent.TextMessage -> {
+                val clients = service
+                    ?.getFrnParticipants()?.entries.orEmpty()
+                val messages =
+                    org.funkgateway.mobile.frn.FrnChatParser.parse(
+                        event.entries, clients
+                    )
+                messages.forEach { message ->
+                    val currentRoom = service.getConnectedFrnRoom()
+                    val groupReply = currentRoom?.let { room ->
+                        org.funkgateway.mobile.frn.FrnGroupMessageParser.recognize(
+                            message,
+                            room.server,
+                            room.room
+                        )
+                    }
+
+                    if (groupReply != null) {
+                        // Speicherung und Weiterleitung erfolgen im GatewayService.
+                        return@forEach
+                    }
+
+                    val groupResponse =
+                        org.funkgateway.mobile.frn.FrnGroupInvitationResponseParser.parse(
+                            message
+                        )
+                    if (groupResponse != null) {
+                        val room = service.getConnectedFrnRoom()
+                        val responseType = groupResponse.type
+
+                        if (room != null &&
+                            responseType ==
+                                org.funkgateway.mobile.frn.FrnGroupResponseType.ACK
+                        ) {
+                            val group =
+                                org.funkgateway.mobile.frn.FrnChatGroups.get(
+                                    groupResponse.groupId
+                                )
+                            val ownId =
+                                org.funkgateway.mobile.frn.FrnGatewayIdentity.getId(this)
+
+                            if (group != null &&
+                                group.active &&
+                                group.server.equals(room.server, ignoreCase = true) &&
+                                group.room.equals(room.room, ignoreCase = true) &&
+                                org.funkgateway.mobile.frn.FrnChatGroups.isHost(
+                                    group.id, ownId
+                                )
+                            ) {
+                                val confirmed =
+                                    org.funkgateway.mobile.frn.FrnGroupInvitationTracker.markConfirmed(
+                                        groupResponse.invitationId,
+                                        groupResponse.groupId,
+                                        groupResponse.senderId,
+                                        room.server,
+                                        room.room
+                                    )
+
+                                if (confirmed) {
+                                    val added =
+                                        org.funkgateway.mobile.frn.FrnChatGroups.addConfirmedMember(
+                                            group.id,
+                                            ownId,
+                                            groupResponse.senderId,
+                                            message.sender
+                                        )
+
+                                    val memberReady = added ||
+                                        org.funkgateway.mobile.frn.FrnChatGroups.hasConfirmedMember(
+                                            group.id,
+                                            ownId,
+                                            groupResponse.senderId
+                                        )
+                                    if (memberReady) {
+                                        val groupSaved =
+                                            saveFrnGroupsOrWarn()
+
+                                        if (!groupSaved) {
+                                            android.util.Log.w(
+                                                "FunkGateway-Groups",
+                                                "Bestätigtes Gruppenmitglied konnte nicht dauerhaft gespeichert werden."
+                                            )
+                                            org.funkgateway.mobile.frn.FrnGroupInvitationTracker.rollbackConfirmation(
+                                                groupResponse.invitationId,
+                                                groupResponse.groupId,
+                                                groupResponse.senderId,
+                                                room.server,
+                                                room.room
+                                            )
+                                            return@forEach
+                                        }
+
+                                        org.funkgateway.mobile.frn.FrnGroupInvitationTracker.complete(
+                                            groupResponse.invitationId
+                                        )
+
+                                        service.sendFrnMemberSyncAsync(
+                                            group.id,
+                                            ownId
+                                        )
+
+                                        android.widget.Toast.makeText(
+                                            this,
+                                            "${message.sender} ist Gruppe ${group.shortCode} beigetreten.",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+
+                                        android.util.Log.i(
+                                            "FunkGateway-Chat",
+                                            "Gruppenmitglied bestätigt: ${message.sender}"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (room != null &&
+                            responseType ==
+                                org.funkgateway.mobile.frn.FrnGroupResponseType.CONFIRM
+                        ) {
+                            val accepted =
+                                org.funkgateway.mobile.frn.FrnAcceptedGroupInvitations.find(
+                                    groupResponse.invitationId,
+                                    groupResponse.groupId,
+                                    groupResponse.senderId,
+                                    room.server,
+                                    room.room
+                                )
+
+                            if (accepted != null) {
+                                val existing =
+                                    org.funkgateway.mobile.frn.FrnChatGroups.get(
+                                        accepted.groupId
+                                    )
+
+                                val joined = if (
+                                    existing != null &&
+                                    existing.active &&
+                                    existing.hostId == accepted.hostId &&
+                                    existing.server.equals(
+                                        accepted.server, ignoreCase = true
+                                    ) &&
+                                    existing.room.equals(
+                                        accepted.room, ignoreCase = true
+                                    ) &&
+                                    existing.shortCode == accepted.shortCode
+                                ) {
+                                    existing
+                                } else if (existing == null) {
+                                    org.funkgateway.mobile.frn.FrnChatGroups.joinInvitation(
+                                        accepted
+                                    )
+                                } else {
+                                    null
+                                }
+
+                                if (joined != null) {
+                                    val groupSaved =
+                                        saveFrnGroupsOrWarn()
+
+                                    if (!groupSaved) {
+                                        android.util.Log.w(
+                                            "FunkGateway-Groups",
+                                            "Angenommene Gruppe konnte nicht dauerhaft gespeichert werden."
+                                        )
+                                        return@forEach
+                                    }
+
+                                    org.funkgateway.mobile.frn.FrnAcceptedGroupInvitations
+                                        .markConfirmed(accepted.invitationId)
+                                    val acknowledgment =
+                                        org.funkgateway.mobile.frn.FrnGroupInvitationResponseParser.encode(
+                                            org.funkgateway.mobile.frn.FrnGroupResponseType.ACK,
+                                            accepted.invitationId,
+                                            accepted.groupId
+                                        )
+
+                                    service.sendFrnTextMessageAsync(
+                                        accepted.senderId,
+                                        acknowledgment
+                                    ) { sent, error ->
+                                        if (sent) {
+                                            // Einladung für mögliche CONFIRM-Wiederholungen
+                                            // bis zum Ablauf der Gültigkeit aufbewahren.
+                                            android.widget.Toast.makeText(
+                                                this,
+                                                "Gruppe ${joined.shortCode} beigetreten.",
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                        } else {
+                                            android.widget.Toast.makeText(
+                                                this,
+                                                "Gruppenbestätigung fehlgeschlagen: " +
+                                                    (error ?: "Unbekannter Fehler"),
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (room != null &&
+                            (responseType == org.funkgateway.mobile.frn.FrnGroupResponseType.ACCEPT ||
+                             responseType == org.funkgateway.mobile.frn.FrnGroupResponseType.DECLINE)
+                        ) {
+                            val pending =
+                                org.funkgateway.mobile.frn.FrnGroupInvitationTracker.find(
+                                    groupResponse.invitationId,
+                                    groupResponse.groupId,
+                                    groupResponse.senderId,
+                                    room.server,
+                                    room.room
+                                )
+                            val group =
+                                org.funkgateway.mobile.frn.FrnChatGroups.get(
+                                    groupResponse.groupId
+                                )
+                            val ownId =
+                                org.funkgateway.mobile.frn.FrnGatewayIdentity.getId(this)
+
+                            if (pending != null && group != null &&
+                                org.funkgateway.mobile.frn.FrnChatGroups.isHost(
+                                    group.id, ownId
+                                )
+                            ) {
+                                if (responseType ==
+                                    org.funkgateway.mobile.frn.FrnGroupResponseType.DECLINE &&
+                                    pending.status ==
+                                        org.funkgateway.mobile.frn.FrnInvitationStatus.PENDING
+                                ) {
+                                    org.funkgateway.mobile.frn.FrnGroupInvitationTracker.complete(
+                                        groupResponse.invitationId
+                                    )
+                                    android.widget.Toast.makeText(
+                                        this,
+                                        "${message.sender} hat die Gruppeneinladung abgelehnt.",
+                                        android.widget.Toast.LENGTH_LONG
+                                    ).show()
+                                } else if (
+                                    responseType ==
+                                        org.funkgateway.mobile.frn.FrnGroupResponseType.ACCEPT &&
+                                    (
+                                        org.funkgateway.mobile.frn.FrnGroupInvitationTracker.markAccepted(
+                                            groupResponse.invitationId,
+                                            groupResponse.groupId,
+                                            groupResponse.senderId,
+                                            room.server,
+                                            room.room
+                                        ) ||
+                                        org.funkgateway.mobile.frn.FrnGroupInvitationTracker.isAwaitingAck(
+                                            groupResponse.invitationId,
+                                            groupResponse.groupId,
+                                            groupResponse.senderId,
+                                            room.server,
+                                            room.room
+                                        )
+                                    )
+                                ) {
+                                    val confirmation =
+                                        org.funkgateway.mobile.frn.FrnGroupInvitationResponseParser.encode(
+                                            org.funkgateway.mobile.frn.FrnGroupResponseType.CONFIRM,
+                                            groupResponse.invitationId,
+                                            groupResponse.groupId
+                                        )
+
+                                    service.sendFrnTextMessageAsync(
+                                        groupResponse.senderId,
+                                        confirmation
+                                    ) { sent, error ->
+                                        if (sent) {
+                                            android.util.Log.i(
+                                                "FunkGateway-Chat",
+                                                "Gruppenbestätigung an ${message.sender} gesendet."
+                                            )
+                                        } else {
+                                            android.widget.Toast.makeText(
+                                                this,
+                                                "Bestätigung an ${message.sender} fehlgeschlagen: " +
+                                                    (error ?: "Unbekannter Fehler"),
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return@forEach
+                    }
+
+                    val memberSync =
+                        org.funkgateway.mobile.frn.FrnGroupMemberSyncParser.parse(
+                            message
+                        )
+                    if (memberSync != null) {
+                        val room = service.getConnectedFrnRoom()
+                        val group =
+                            org.funkgateway.mobile.frn.FrnChatGroups.get(
+                                memberSync.groupId
+                            )
+
+                        if (room != null &&
+                            group != null &&
+                            group.active &&
+                            group.hostFrnId.isNotBlank() &&
+                            memberSync.senderId == group.hostFrnId &&
+                            group.server.equals(
+                                room.server, ignoreCase = true
+                            ) &&
+                            group.room.equals(
+                                room.room, ignoreCase = true
+                            ) &&
+                            memberSync.version > group.hostVersion
+                        ) {
+                            val complete =
+                                org.funkgateway.mobile.frn.FrnGroupMemberSyncBuffer.accept(
+                                    memberSync
+                                )
+
+                            if (complete != null) {
+                                val updated =
+                                    org.funkgateway.mobile.frn.FrnChatGroups.applyMemberSync(
+                                        complete
+                                    )
+
+                                if (updated) {
+                                    val groupSaved =
+                                        saveFrnGroupsOrWarn()
+
+                                    if (!groupSaved) {
+                                        android.util.Log.w(
+                                            "FunkGateway-Groups",
+                                            "Synchronisierte Mitgliederliste konnte nicht gespeichert werden."
+                                        )
+                                    }
+
+                                    android.util.Log.i(
+                                        "FunkGateway-Chat",
+                                        "Mitgliederliste für ${group.shortCode} " +
+                                            "auf Version ${complete.version} aktualisiert."
+                                    )
+                                }
+                            }
+                        }
+
+                        return@forEach
+                    }
+
+                    val dissolution =
+                        org.funkgateway.mobile.frn.FrnGroupDissolutionParser.parse(
+                            message
+                        )
+                    if (dissolution != null) {
+                        val room = service.getConnectedFrnRoom()
+                        val group =
+                            org.funkgateway.mobile.frn.FrnChatGroups.get(
+                                dissolution.groupId
+                            )
+
+                        if (room != null &&
+                            group != null &&
+                            group.server.equals(room.server, ignoreCase = true) &&
+                            group.room.equals(room.room, ignoreCase = true)
+                        ) {
+                            val removed =
+                                org.funkgateway.mobile.frn.FrnChatGroups.applyDissolution(
+                                    dissolution
+                                )
+
+                            if (removed) {
+                                saveFrnGroupsOrWarn()
+                                android.util.Log.i(
+                                    "FunkGateway-Groups",
+                                    "Gruppe ${dissolution.groupId} durch Host aufgelöst."
+                                )
+                            }
+                        }
+                        return@forEach
+                    }
+
+                    val hostTransfer =
+                        org.funkgateway.mobile.frn.FrnHostTransferParser.parse(
+                            message
+                        )
+                    if (hostTransfer != null) {
+                        android.util.Log.i(
+                            "FunkGateway-HostTransfer",
+                            "Hostübergabenachricht empfangen: " +
+                                hostTransfer.type.name +
+                                " / Gruppe " + hostTransfer.groupId
+                        )
+                        return@forEach
+                    }
+                    val invitation =
+                        org.funkgateway.mobile.frn.FrnGroupInvitationParser.parse(
+                            message
+                        )
+                    if (invitation != null) {
+                        val room = service.getConnectedFrnRoom()
+                        if (room != null &&
+                            invitation.server.equals(room.server, ignoreCase = true) &&
+                            invitation.room.equals(room.room, ignoreCase = true)
+                        ) {
+                            android.app.AlertDialog.Builder(this)
+                                .setTitle("👥 FunkGateway-Gruppeneinladung")
+                                .setMessage(
+                                    "${invitation.senderName} lädt dich ein.\\n\\n" +
+                                    "Gruppe: ${invitation.groupName}\\n" +
+                                    "Kennung: ${invitation.shortCode}\\n\\n" +
+                                    "Möchtest du dieser Gruppe beitreten?"
+                                )
+                                .setPositiveButton("Annehmen") { _, _ ->
+                                    val registered =
+                                        org.funkgateway.mobile.frn.FrnAcceptedGroupInvitations.register(
+                                            invitation
+                                        )
+                                    if (!registered) {
+                                        android.widget.Toast.makeText(
+                                            this,
+                                            "Diese Einladung wird bereits bearbeitet.",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                    val response =
+                                        org.funkgateway.mobile.frn.FrnGroupInvitationResponseParser.encode(
+                                            org.funkgateway.mobile.frn.FrnGroupResponseType.ACCEPT,
+                                            invitation.invitationId,
+                                            invitation.groupId
+                                        )
+                                    service.sendFrnTextMessageAsync(
+                                        invitation.senderId,
+                                        response
+                                    ) { sent, error ->
+                                        // Bei einem Sendefehler bleibt die
+                                        // Einladung für einen erneuten Versuch
+                                        // bis zum Ablauf der Gültigkeit erhalten.
+                                        android.widget.Toast.makeText(
+                                            this,
+                                            if (sent)
+                                                "Annahme gesendet. Warte auf Bestätigung."
+                                            else
+                                                "Annahme fehlgeschlagen: ${error ?: "Unbekannter Fehler"}",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                    }
+                                }
+                                .setNegativeButton("Ablehnen") { _, _ ->
+                                    val response =
+                                        org.funkgateway.mobile.frn.FrnGroupInvitationResponseParser.encode(
+                                            org.funkgateway.mobile.frn.FrnGroupResponseType.DECLINE,
+                                            invitation.invitationId,
+                                            invitation.groupId
+                                        )
+                                    service.sendFrnTextMessageAsync(
+                                        invitation.senderId,
+                                        response
+                                    ) { sent, error ->
+                                        android.widget.Toast.makeText(
+                                            this,
+                                            if (sent)
+                                                "Gruppeneinladung abgelehnt."
+                                            else
+                                                "Ablehnung fehlgeschlagen: ${error ?: "Unbekannter Fehler"}",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                }
+                                .show()
+                        }
+                        return@forEach
+                    }
+                    org.funkgateway.mobile.frn.FrnChatStore.add(message)
+                    if (message.privateMessage) {
+                        frnClosedChatIds.remove(message.senderId)
+                        frnOpenChatContacts[message.senderId] = message.sender
+                    }
+                    if (message.privateMessage &&
+                        !(currentPage == "FRN_CHAT" &&
+                          selectedFrnChatId == message.senderId)
+                    ) {
+                        frnUnreadChats[message.senderId] =
+                            (frnUnreadChats[message.senderId] ?: 0) + 1
+                    }
+                    if (message.privateMessage) {
+                        val chatId = message.senderId
+                        val existing = frnPrivateDialogs[chatId]
+                        if (existing?.isShowing == true) {
+                            existing.findViewById<LinearLayout>(
+                                12001
+                            )?.let { container ->
+                                fillFrnChatBubbles(
+                                    container,
+                                    org.funkgateway.mobile.frn.FrnChatStore
+                                        .privateWith(chatId)
+                                )
+                                (container.parent as? ScrollView)?.post {
+                                    (container.parent as? ScrollView)
+                                        ?.fullScroll(View.FOCUS_DOWN)
+                                }
+                            }
+                            return@forEach
+                        }
+                        val dialogContent = LinearLayout(this).apply {
+                            orientation = LinearLayout.VERTICAL
+                            setPadding(dp(22), dp(22), dp(22), dp(16))
+                            addView(label(
+                                "Privatnachricht von ${message.sender}",
+                                20f, accent, true
+                            ))
+                            val messageList = LinearLayout(this@MainActivity).apply {
+                                id = 12001
+                                orientation = LinearLayout.VERTICAL
+                            }
+                            fillFrnChatBubbles(
+                                messageList,
+                                org.funkgateway.mobile.frn.FrnChatStore
+                                    .privateWith(chatId)
+                            )
+                            val messageScroll = ScrollView(this@MainActivity).apply {
+                                addView(messageList)
+                                isFillViewport = true
+                            }
+                            messageScroll.post {
+                                messageScroll.fullScroll(View.FOCUS_DOWN)
+                            }
+                            addView(
+                                messageScroll,
+                                LinearLayout.LayoutParams(
+                                    LinearLayout.LayoutParams.MATCH_PARENT,
+                                    dp(280)
+                                )
+                            )
+
+                            val inputRow = LinearLayout(this@MainActivity).apply {
+                                orientation = LinearLayout.HORIZONTAL
+                                gravity = Gravity.CENTER_VERTICAL
+                            }
+                            val messageInput =
+                                android.widget.EditText(this@MainActivity).apply {
+                                    hint = "Nachricht schreiben ..."
+                                    setHintTextColor(muted)
+                                    setTextColor(Color.WHITE)
+                                    textSize = 15f
+                                    setSingleLine(true)
+                                    filters = arrayOf(
+                                        android.text.InputFilter.LengthFilter(500)
+                                    )
+                                    background = rounded(panel)
+                                    setPadding(
+                                        dp(12), dp(10), dp(12), dp(10)
+                                    )
+                                }
+                            inputRow.addView(
+                                messageInput,
+                                LinearLayout.LayoutParams(0, -2, 1f)
+                            )
+                            inputRow.addView(
+                                button("➤") {
+                                    val text = messageInput.text.toString().trim()
+                                    if (text.isNotEmpty()) {
+                                        val service = gatewayService
+                                        if (service == null) {
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                "FRN ist nicht verbunden.",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        } else {
+                                            service.sendFrnTextMessageAsync(chatId, text) { sent, error ->
+                                                if (sent) {
+                                                    org.funkgateway.mobile.frn.FrnChatStore
+                                                        .addOutgoing(chatId, text, true)
+                                                    fillFrnChatBubbles(
+                                                        messageList,
+                                                        org.funkgateway.mobile.frn.FrnChatStore
+                                                            .privateWith(chatId)
+                                                    )
+                                                    if (messageInput.text.toString() == text) {
+                                                        messageInput.text.clear()
+                                                    }
+                                                    messageScroll.post {
+                                                        messageScroll.fullScroll(
+                                                            View.FOCUS_DOWN
+                                                        )
+                                                    }
+                                                } else {
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        error ?: "Senden fehlgeschlagen.",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                LinearLayout.LayoutParams(
+                                    dp(54), dp(48)
+                                ).apply {
+                                    marginStart = dp(8)
+                                }
+                            )
+                            addView(inputRow, LinearLayout.LayoutParams(
+                                LinearLayout.LayoutParams.MATCH_PARENT,
+                                LinearLayout.LayoutParams.WRAP_CONTENT
+                            ).apply {
+                                topMargin = dp(12)
+                            })
+                        }
+                        val dialog = android.app.AlertDialog.Builder(this)
+                            .setView(dialogContent)
+                            .setPositiveButton("Schließen", null)
+                            .create()
+                        dialog.setOnShowListener {
+                            dialog.window?.setBackgroundDrawable(
+                                android.graphics.drawable.ColorDrawable(
+                                    Color.rgb(31, 42, 56)
+                                )
+                            )
+                            dialog.getButton(
+                                android.app.AlertDialog.BUTTON_POSITIVE
+                            )?.setTextColor(accent)
+                        }
+                        dialog.setOnDismissListener {
+                            frnPrivateDialogs.remove(chatId)
+                        }
+                        frnPrivateDialogs[chatId] = dialog
+                        dialog.show()
+                    }
+                }
+                if (currentPage == "FRN_CHAT") {
+                    showFrnChat()
+                }
+            }
             is org.funkgateway.mobile.frn.FrnEvent.ClientList -> {
                 when (currentPage) {
                     "FRN" -> refreshFrnServerCounts?.invoke()
@@ -938,12 +1600,6 @@ class MainActivity : Activity() {
                 Regex("<ON>(.*?)</ON>", RegexOption.DOT_MATCHES_ALL)
                     .find(entry)?.groupValues?.get(1)
             }
-            participantsContainer.addView(label(
-                "Diagnose: PTT=$pttState | Eigener Name='$ownFrnName' | " +
-                    "Teilnehmer=${serverNames.joinToString(" / ")}",
-                12f, muted
-            ))
-
             if (entries.isEmpty()) {
                 participantsContainer.addView(label(
                     "Noch keine Teilnehmerdaten empfangen.",
@@ -951,7 +1607,17 @@ class MainActivity : Activity() {
                 ))
             }
 
-            entries.forEachIndexed { index, entry ->
+            val sortedEntries = entries.withIndex().sortedWith(
+                compareBy<IndexedValue<String>> {
+                    Regex("<CL>(.*?)</CL>", RegexOption.DOT_MATCHES_ALL)
+                        .find(it.value)?.groupValues?.get(1)
+                        ?.trim()?.toIntOrNull()
+                        ?.takeIf { type -> type in 0..2 } ?: 3
+                }.thenBy { it.index }
+            )
+            sortedEntries.forEach { item ->
+                val index = item.index
+                val entry = item.value
                 val match = Regex(
                     "<ON>(.*?)</ON>",
                     RegexOption.DOT_MATCHES_ALL
@@ -962,8 +1628,20 @@ class MainActivity : Activity() {
                     android.text.Html.FROM_HTML_MODE_LEGACY
                 ).toString().trim()
 
-                val ownName = service?.getConnectedFrnCallsign().orEmpty().trim()
-                val ownTransmitting = ownName.isNotEmpty() && (name.equals(ownName, ignoreCase = true) || name.substringBefore(",").trim().equals(ownName, ignoreCase = true)) && service?.getPttState() == GatewayService.PttState.TRANSMITTING
+                fun normalizeFrnName(value: String): String =
+                    android.text.Html.fromHtml(
+                        value,
+                        android.text.Html.FROM_HTML_MODE_LEGACY
+                    ).toString().replace(
+                        Regex("[\\s\\u00A0]+"), " "
+                    ).trim()
+
+                val ownName = normalizeFrnName(ownFrnName)
+                val participantName = normalizeFrnName(name)
+                val ownTransmitting =
+                    ownName.isNotEmpty() &&
+                    participantName.equals(ownName, ignoreCase = true) &&
+                    pttState == GatewayService.PttState.TRANSMITTING
                 val speaking = snapshot?.activeIndex == index + 1
                 val color = when {
                     ownTransmitting -> Color.rgb(255, 165, 0)
@@ -971,6 +1649,11 @@ class MainActivity : Activity() {
                     else -> Color.rgb(34, 197, 94)
                 }
 
+                val clientType = Regex(
+                    "<CL>(.*?)</CL>",
+                    RegexOption.DOT_MATCHES_ALL
+                ).find(entry)?.groupValues?.get(1)
+                    ?.trim()?.toIntOrNull()
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
@@ -983,7 +1666,12 @@ class MainActivity : Activity() {
                     ).apply {
                         marginEnd = dp(12)
                     }
-                    setImageDrawable(HandheldRadioDrawable(color))
+                    setImageDrawable(
+                        when (clientType) {
+                            0, 2 -> FrnClientTypeDrawable(clientType, color)
+                            else -> HandheldRadioDrawable(color)
+                        }
+                    )
                 })
 
                 val description = Regex(
@@ -999,6 +1687,20 @@ class MainActivity : Activity() {
                     16f,
                     Color.WHITE
                 ))
+                val bandChannel = Regex(
+                    "<BC>(.*?)</BC>",
+                    RegexOption.DOT_MATCHES_ALL
+                ).find(entry)?.groupValues?.get(1).orEmpty()
+                if (bandChannel.isNotBlank()) {
+                    val bcText = android.text.Html.fromHtml(
+                        bandChannel,
+                        android.text.Html.FROM_HTML_MODE_LEGACY
+                    ).toString().trim()
+                    details.addView(label(
+                        "Band/Kanal: $bcText",
+                        13f, accent
+                    ))
+                }
                 if (description.isNotBlank()) {
                     details.addView(label(
                         android.text.Html.fromHtml(
@@ -1045,7 +1747,10 @@ class MainActivity : Activity() {
         }
 
         try {
-            val saved = org.funkgateway.mobile.frn.FrnSettingsStore.load(this)
+            val saved = org.funkgateway.mobile.frn.FrnSettingsStore.loadProfile(
+                this,
+                org.funkgateway.mobile.frn.FrnProfileStore.selectedId(this)
+            )
             if (saved.email.isBlank() || saved.password.isBlank() ||
                 saved.callsign.isBlank()
             ) {
@@ -1083,7 +1788,7 @@ class MainActivity : Activity() {
             service.connectFrn(
                 config = config,
                 onEvent = { event ->
-                    handleFrnUiEvent(event)
+                    handleFrnUiEvent(event, service)
                 },
                 onError = { error ->
                     android.app.AlertDialog.Builder(this)
@@ -1371,7 +2076,10 @@ class MainActivity : Activity() {
                 status.text = "Gateway-Dienst noch nicht bereit."
             } else {
                 try {
-                    val saved = org.funkgateway.mobile.frn.FrnSettingsStore.load(this)
+                    val saved = org.funkgateway.mobile.frn.FrnSettingsStore.loadProfile(
+                this,
+                org.funkgateway.mobile.frn.FrnProfileStore.selectedId(this)
+            )
                     if (saved.email.isBlank() || saved.password.isBlank() ||
                         saved.callsign.isBlank()) {
                         status.text = "Bitte zuerst die FRN-Einstellungen ausfüllen."
@@ -1406,7 +2114,7 @@ class MainActivity : Activity() {
                                 ) {
                                     refreshParticipants()
                                 }
-                                handleFrnUiEvent(event)
+                                handleFrnUiEvent(event, service)
                             },
                             onError = { error ->
                                 if (currentPage == "FRN_ROOM") {
@@ -1765,6 +2473,94 @@ class MainActivity : Activity() {
         showGatewayScreen(scroll)
     }
 
+
+    private fun showLog(source: String = "FRN") {
+        currentPage = "Log"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        root.addView(label("Diagnose & Log", 24f, Color.WHITE, true))
+
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        listOf("FRN", "Mumble", "Zello", "System").forEach { name ->
+            tabs.addView(button(name) {
+                showLog(name)
+            }.apply {
+                textSize = 12f
+                if (name == source) setTextColor(accent)
+            }, LinearLayout.LayoutParams(0, dp(46), 1f))
+        }
+        root.addView(tabs)
+
+        val records = GatewayLog.get(source)
+        root.addView(label(
+            "$source · ${records.size} Einträge",
+            14f, accent
+        ))
+
+        val logScroll = ScrollView(this).apply {
+            isFillViewport = false
+        }
+        val logContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        if (records.isEmpty()) {
+            logContent.addView(label(
+                "Noch keine Diagnosemeldungen vorhanden.",
+                14f, muted
+            ))
+        } else {
+            records.asReversed().forEach { entry ->
+                val color = when (entry.level) {
+                    "ERROR" -> Color.rgb(239, 68, 68)
+                    "WARN" -> Color.rgb(255, 165, 0)
+                    else -> muted
+                }
+                logContent.addView(label(GatewayLog.format(entry), 12f, color))
+            }
+        }
+
+        logScroll.addView(logContent)
+        root.addView(logScroll, LinearLayout.LayoutParams(
+            -1, 0, 1f
+        ))
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        actions.addView(button("Kopieren") {
+            val content = GatewayLog.get(source)
+                .joinToString("\n") { GatewayLog.format(it) }
+            val clipboard = getSystemService(
+                android.content.Context.CLIPBOARD_SERVICE
+            ) as android.content.ClipboardManager
+            clipboard.setPrimaryClip(
+                android.content.ClipData.newPlainText(
+                    "FunkGateway $source Log", content
+                )
+            )
+            android.widget.Toast.makeText(
+                this, "Log kopiert.", android.widget.Toast.LENGTH_SHORT
+            ).show()
+        })
+
+        actions.addView(button("Löschen") {
+            GatewayLog.clear(source)
+            showLog(source)
+        })
+
+        actions.getChildAt(0).layoutParams =
+            LinearLayout.LayoutParams(0, dp(52), 1f)
+        actions.getChildAt(1).layoutParams =
+            LinearLayout.LayoutParams(0, dp(52), 1f)
+        root.addView(actions)
+        showGatewayScreen(root)
+    }
+
     private fun showPage(name: String) {
         currentPage = name
 
@@ -1906,11 +2702,166 @@ class MainActivity : Activity() {
             setPadding(dp(8), dp(8), dp(8), dp(8))
         })
 
+        val profiles = org.funkgateway.mobile.frn.FrnProfileStore.list(this)
+        val selectedProfileId =
+            org.funkgateway.mobile.frn.FrnProfileStore.selectedId(this)
         val saved = try {
-            org.funkgateway.mobile.frn.FrnSettingsStore.load(this)
+            org.funkgateway.mobile.frn.FrnSettingsStore.loadProfile(
+                this, selectedProfileId
+            )
         } catch (e: Exception) {
             org.funkgateway.mobile.frn.FrnSettings()
         }
+
+        root.addView(label("Gespeicherte FRN-Identität", 14f, muted))
+        val profileSelector = android.widget.Spinner(this).apply {
+            val arrow = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.TRANSPARENT)
+            }
+
+            background = rounded(panel)
+            setPopupBackgroundDrawable(rounded(panel))
+            minimumHeight = dp(54)
+            setPadding(dp(8), 0, dp(8), 0)
+            adapter = android.widget.ArrayAdapter(
+                this@MainActivity,
+                R.layout.frn_spinner_item,
+                profiles.map { it.name }
+            )
+            setSelection(
+                profiles.indexOfFirst { it.id == selectedProfileId }
+                    .coerceAtLeast(0)
+            )
+            root.addView(this)
+        }
+        profileSelector.onItemSelectedListener =
+            object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?,
+                    view: android.view.View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    val profile = profiles.getOrNull(position) ?: return
+                    if (profile.id != selectedProfileId) {
+                        org.funkgateway.mobile.frn.FrnProfileStore.select(
+                            this@MainActivity, profile.id
+                        )
+                        showFrnSettings()
+                    }
+                }
+
+                override fun onNothingSelected(
+                    parent: android.widget.AdapterView<*>?
+                ) = Unit
+            }
+
+        root.addView(android.view.View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, dp(8))
+        })
+        root.addView(button("＋ Neue Identität") {
+            val input = android.widget.EditText(this).apply {
+                setSingleLine(true)
+                hint = "Name der Identität"
+            }
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Neue FRN-Identität")
+                .setView(input)
+                .setNegativeButton("Abbrechen", null)
+                .setPositiveButton("Anlegen") { _, _ ->
+                    try {
+                        val profile =
+                            org.funkgateway.mobile.frn.FrnProfileStore.create(
+                                this, input.text.toString()
+                            )
+                        org.funkgateway.mobile.frn.FrnProfileStore.select(
+                            this, profile.id
+                        )
+                        showFrnSettings()
+                    } catch (e: Exception) {
+                        android.widget.Toast.makeText(
+                            this,
+                            e.message ?: "Identität konnte nicht angelegt werden.",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+                .show()
+        })
+
+        root.addView(android.view.View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, dp(8))
+        })
+        root.addView(button("✎ Identität umbenennen") {
+            val selected = profiles.firstOrNull {
+                it.id == selectedProfileId
+            } ?: return@button
+            val input = android.widget.EditText(this).apply {
+                setSingleLine(true)
+                setText(selected.name)
+                setSelection(text.length)
+            }
+            android.app.AlertDialog.Builder(this)
+                .setTitle("FRN-Identität umbenennen")
+                .setView(input)
+                .setNegativeButton("Abbrechen", null)
+                .setPositiveButton("Speichern") { _, _ ->
+                    try {
+                        org.funkgateway.mobile.frn.FrnProfileStore.rename(
+                            this, selected.id, input.text.toString()
+                        )
+                        showFrnSettings()
+                    } catch (e: Exception) {
+                        android.widget.Toast.makeText(
+                            this,
+                            e.message ?: "Umbenennen fehlgeschlagen.",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+                .show()
+        })
+
+        root.addView(android.view.View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, dp(8))
+        })
+        root.addView(button("Identität löschen") {
+            val selected = profiles.firstOrNull {
+                it.id == selectedProfileId
+            } ?: return@button
+
+            if (profiles.size <= 1) {
+                android.widget.Toast.makeText(
+                    this, "Das letzte Profil kann nicht gelöscht werden.",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                return@button
+            }
+
+            android.app.AlertDialog.Builder(this)
+                .setTitle("FRN-Identität löschen?")
+                .setMessage(
+                    "Die Identität '${selected.name}' und ihre " +
+                    "gespeicherten Zugangsdaten werden gelöscht. " +
+                    "Eine bestehende Verbindung bleibt aktiv."
+                )
+                .setNegativeButton("Abbrechen", null)
+                .setPositiveButton("Löschen") { _, _ ->
+                    try {
+                        org.funkgateway.mobile.frn.FrnProfileStore.delete(
+                            this, selected.id
+                        )
+                        showFrnSettings()
+                    } catch (e: Exception) {
+                        android.widget.Toast.makeText(
+                            this,
+                            e.message ?: "Löschen fehlgeschlagen.",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+                .show()
+        })
 
         fun field(title: String, value: String, secret: Boolean = false):
             android.widget.EditText {
@@ -1955,8 +2906,49 @@ class MainActivity : Activity() {
         val country = field("Land", saved.country)
         val city = field("Stadt", saved.city)
         val vx = field("VX · Protokollkennung", saved.vx)
-        val clientType = field("CL · Clienttyp", saved.clientType)
+        root.addView(label("CL · Clienttyp", 14f, muted).apply {
+            setPadding(0, dp(12), 0, dp(4))
+        })
+        val clientTypes = arrayOf(
+            "0 – Crosslink", "1 – Gateway", "2 – PC-Only"
+        )
+        val clientType = android.widget.Spinner(this).apply {
+            val arrow = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.TRANSPARENT)
+            }
+
+            background = rounded(panel)
+            setPopupBackgroundDrawable(rounded(panel))
+            minimumHeight = dp(54)
+            setPadding(dp(8), 0, dp(8), 0)
+            adapter = android.widget.ArrayAdapter(
+                this@MainActivity,
+                R.layout.frn_spinner_item,
+                clientTypes
+            )
+            setSelection(saved.clientType.toIntOrNull()
+                ?.coerceIn(0, 2) ?: 2)
+            root.addView(this)
+        }
         val bandChannel = field("BC · Band / Kanal", saved.bandChannel)
+        clientType.onItemSelectedListener =
+            object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?,
+                    view: android.view.View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    if (position == 2 &&
+                        bandChannel.text.toString().isBlank()
+                    ) {
+                        bandChannel.setText("PC-Only")
+                    }
+                }
+                override fun onNothingSelected(
+                    parent: android.widget.AdapterView<*>?
+                ) = Unit
+            }
 
         val status = label("", 14f, accent).apply {
             setPadding(0, dp(12), 0, dp(12))
@@ -1972,7 +2964,7 @@ class MainActivity : Activity() {
                 country = country.text.toString().trim(),
                 city = city.text.toString().trim(),
                 vx = vx.text.toString().trim(),
-                clientType = clientType.text.toString().trim(),
+                clientType = clientType.selectedItemPosition.toString(),
                 bandChannel = bandChannel.text.toString().trim()
             )
             if (settings.email.isBlank() || settings.callsign.isBlank() ||
@@ -1980,7 +2972,9 @@ class MainActivity : Activity() {
                 status.text = "Bitte E-Mail, Rufzeichen und VX angeben."
             } else {
                 try {
-                    org.funkgateway.mobile.frn.FrnSettingsStore.save(this, settings)
+                    org.funkgateway.mobile.frn.FrnSettingsStore.saveProfile(
+                        this, selectedProfileId, settings
+                    )
                     status.text = "FRN-Einstellungen gespeichert."
                 } catch (e: Exception) {
                     status.text = "Speichern fehlgeschlagen: " +
@@ -2018,6 +3012,9 @@ class MainActivity : Activity() {
         root.addView(label("Weitere Einstellungen", 19f, accent, true).apply {
             setPadding(0, dp(24), 0, dp(12))
         })
+        root.addView(button("🎚 Audio-Mixer") {
+            showAudioMixer()
+        })
         for (name in listOf("Audio & PTT", "Schutzfunktionen", "Darstellung")) {
             root.addView(button(name) {
                 if (name == "Audio & PTT") {
@@ -2035,6 +3032,72 @@ class MainActivity : Activity() {
         })
         root.addView(button("← Zurück zur Übersicht") { showHome() })
         showGatewayScreen(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun showAudioMixer() {
+        currentPage = "Audio-Mixer"
+        val prefs = getSharedPreferences("funkgateway_audio", Context.MODE_PRIVATE)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(20))
+        }
+
+        root.addView(label("🎚 Audio-Mixer", 25f, Color.WHITE, true))
+        root.addView(label(
+            "Empfangslautstärke der einzelnen Integrationen",
+            14f, muted
+        ).apply {
+            setPadding(0, dp(12), 0, dp(24))
+        })
+
+        val initial = prefs.getInt("frn_volume", 100).coerceIn(0, 100)
+        gatewayService?.setFrnVolume(initial)
+
+        val valueLabel = label("FRN · $initial %", 19f, accent, true)
+        root.addView(valueLabel)
+
+        root.addView(android.widget.SeekBar(this).apply {
+            max = 100
+            progress = initial
+            setOnSeekBarChangeListener(
+                object : android.widget.SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(
+                        bar: android.widget.SeekBar?,
+                        value: Int,
+                        fromUser: Boolean
+                    ) {
+                        if (!fromUser) return
+                        valueLabel.text = "FRN · $value %"
+                        gatewayService?.setFrnVolume(value)
+                        prefs.edit().putInt("frn_volume", value).apply()
+                    }
+                    override fun onStartTrackingTouch(
+                        bar: android.widget.SeekBar?
+                    ) = Unit
+                    override fun onStopTrackingTouch(
+                        bar: android.widget.SeekBar?
+                    ) = Unit
+                }
+            )
+        })
+
+        root.addView(label(
+            "Global Deaf bleibt unabhängig von der FRN-Lautstärke.",
+            13f, muted
+        ))
+
+        root.addView(label("Mumble · folgt später", 16f, muted).apply {
+            setPadding(0, dp(28), 0, dp(12))
+        })
+        root.addView(label("Zello · folgt später", 16f, muted))
+
+        root.addView(button("← Zurück zu Einstellungen") {
+            showSettings()
+        })
+
+        showGatewayScreen(ScrollView(this).apply {
+            addView(root)
+        })
     }
 
     private fun showAudioPttSettings() {
@@ -2324,20 +3387,589 @@ class MainActivity : Activity() {
 
     private fun showFrnChat() {
         currentPage = "FRN_CHAT"
+
+        val store = org.funkgateway.mobile.frn.FrnChatStore
+        val contacts = frnOpenChatContacts.toList()
+            .filterNot { (id, _) -> id in frnClosedChatIds }
+
+        val groups = org.funkgateway.mobile.frn.FrnChatGroups.all()
+        val groupIds = groups.map { "group:${it.id}" }.toSet()
+        if (selectedFrnChatId != null &&
+            contacts.none { it.first == selectedFrnChatId } &&
+            selectedFrnChatId !in groupIds) {
+            selectedFrnChatId = null
+        }
+
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setPadding(dp(16), dp(18), dp(16), dp(12))
         }
         content.addView(label("FRN · Chat", 24f, Color.WHITE, true))
-        content.addView(label(
-            "Raumchat und private Nachrichten werden hier integriert.",
-            16f, muted
-        ).apply {
-            setPadding(0, dp(16), 0, dp(16))
-        })
-        showGatewayScreen(ScrollView(this).apply {
-            addView(content)
-        })
+
+        val service = gatewayService
+        val chatContacts = if (
+            service?.getFrnStatus() == GatewayService.FrnStatus.CONNECTED
+        ) {
+            org.funkgateway.mobile.frn.FrnChatContacts.fromParticipants(
+                service.getFrnParticipants().entries,
+                service.getConnectedFrnCallsign().orEmpty()
+            )
+        } else {
+            emptyList()
+        }
+
+        val contactPicker = Spinner(this).apply {
+            adapter = object : ArrayAdapter<String>(
+                this@MainActivity,
+                R.layout.frn_spinner_item,
+                listOf("＋ Privatchat auswählen") +
+                    chatContacts.map { it.name }
+            ) {
+                override fun getDropDownView(
+                    position: Int,
+                    convertView: View?,
+                    parent: android.view.ViewGroup
+                ): View {
+                    return TextView(this@MainActivity).apply {
+                        text = getItem(position).orEmpty()
+                        textSize = 16f
+                        setTextColor(Color.WHITE)
+                        setBackgroundColor(panel)
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(14), dp(10), dp(14), dp(10))
+                        minHeight = dp(48)
+                    }
+                }
+            }
+            background = rounded(panel)
+            dropDownWidth = dp(260)
+            onItemSelectedListener =
+                object : android.widget.AdapterView.OnItemSelectedListener {
+                    override fun onNothingSelected(
+                        parent: android.widget.AdapterView<*>?
+                    ) = Unit
+
+                    override fun onItemSelected(
+                        parent: android.widget.AdapterView<*>?,
+                        view: View?,
+                        position: Int,
+                        id: Long
+                    ) {
+                        if (position == 0) return
+                        val contact = chatContacts.getOrNull(position - 1)
+                            ?: return
+                        frnOpenChatContacts[contact.id] = contact.name
+                        frnClosedChatIds.remove(contact.id)
+                        selectedFrnChatId = contact.id
+                        frnUnreadChats.remove(contact.id)
+                        showFrnChat()
+                    }
+                }
+        }
+
+        content.addView(
+            contactPicker,
+            LinearLayout.LayoutParams(-1, dp(48)).apply {
+                topMargin = dp(12)
+            }
+        )
+
+        content.addView(
+            button("＋ Gruppenchat") {
+                if (chatContacts.size < 2) {
+                    Toast.makeText(
+                        this,
+                        "Für einen Gruppenchat werden mindestens zwei andere Teilnehmer benötigt.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    val selectedIds = linkedSetOf<String>()
+                    val choices = chatContacts.map { it.name }.toTypedArray()
+                    val checked = BooleanArray(chatContacts.size)
+
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("FRN · Gruppenchat")
+                        .setMultiChoiceItems(
+                            choices,
+                            checked
+                        ) { _, index, enabled ->
+                            val id = chatContacts[index].id
+                            if (enabled) selectedIds.add(id)
+                            else selectedIds.remove(id)
+                        }
+                        .setNegativeButton("Abbrechen", null)
+                        .setPositiveButton("Gruppe erstellen") { _, _ ->
+                            if (selectedIds.size < 2) {
+                                Toast.makeText(
+                                    this,
+                                    "Bitte mindestens zwei Teilnehmer auswählen.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            } else {
+                                val members = chatContacts.filter {
+                                    it.id in selectedIds
+                                }
+                                val gatewayIds = linkedSetOf<String>()
+                                val gatewayChoices =
+                                    members.map { it.name }.toTypedArray()
+                                val gatewayChecked =
+                                    BooleanArray(members.size)
+
+                                android.app.AlertDialog.Builder(this)
+                                    .setTitle("FunkGateway-Teilnehmer")
+                                    .setMessage(
+                                        "Welche Teilnehmer verwenden FunkGateway? " +
+                                        "Diese erhalten später eine Einladung. " +
+                                        "Nicht markierte Teilnehmer werden wie bisher direkt aufgenommen."
+                                    )
+                                    .setMultiChoiceItems(
+                                        gatewayChoices,
+                                        gatewayChecked
+                                    ) { _, index, enabled ->
+                                        val id = members[index].id
+                                        if (enabled) gatewayIds.add(id)
+                                        else gatewayIds.remove(id)
+                                    }
+                                    .setNegativeButton("Zurück", null)
+                                    .setPositiveButton("Weiter") { _, _ ->
+                                        val directMembers = members.filter {
+                                            it.id !in gatewayIds
+                                        }
+                                        val room = service?.getConnectedFrnRoom()
+                                        if (room == null) {
+                                            Toast.makeText(
+                                                this,
+                                                "Keine FRN-Raumverbindung vorhanden.",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        } else {
+                                            val group =
+                                                org.funkgateway.mobile.frn.FrnChatGroups.create(
+                                                    members,
+                                                    server = room.server,
+                                                    room = room.room,
+                                                    creatorId =
+                                                        org.funkgateway.mobile.frn.FrnGatewayIdentity.getId(this),
+                                                    creatorCallsign =
+                                                        service.getConnectedFrnCallsign().orEmpty(),
+                                                    initialMembers = directMembers
+                                                )
+                                            val groupSaved =
+                                                saveFrnGroupsOrWarn()
+
+                                            if (!groupSaved) {
+                                                android.util.Log.w(
+                                                    "FunkGateway-Groups",
+                                                    "Neue Gruppe konnte nicht dauerhaft gespeichert werden."
+                                                )
+                                            }
+
+                                            val gatewayMembers = members.filter {
+                                                it.id in gatewayIds
+                                            }
+                                            gatewayMembers.forEach { contact ->
+                                                val invitation =
+                                                    org.funkgateway.mobile.frn.FrnGroupInvitation(
+                                                        invitationId = java.util.UUID.randomUUID().toString(),
+                                                        groupId = group.id,
+                                                        groupName = group.name,
+                                                        shortCode = group.shortCode,
+                                                        server = group.server,
+                                                        room = group.room,
+                                                        senderId = contact.id,
+                                                        senderName = contact.name,
+                                                        hostId = group.hostId
+                                                    )
+                                                service.sendFrnGroupInvitationAsync(
+                                                    invitation
+                                                ) { sent, error ->
+                                                    if (!sent) {
+                                                        Toast.makeText(
+                                                            this,
+                                                            "Einladung an ${contact.name} fehlgeschlagen: " +
+                                                                (error ?: "Unbekannter Fehler"),
+                                                            Toast.LENGTH_LONG
+                                                        ).show()
+                                                    }
+                                                }
+                                            }
+                                            selectedFrnChatId = "group:${group.id}"
+                                            showFrnChat()
+                                            Toast.makeText(
+                                                this,
+                                                "${directMembers.size} direkt aufgenommen, " +
+                                                "${gatewayIds.size} Einladungen noch ausstehend.",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
+                                    .show()
+                            }
+                        }
+                        .show()
+                }
+            },
+            LinearLayout.LayoutParams(-1, dp(48)).apply {
+                topMargin = dp(8)
+            }
+        )
+
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        fun addTab(title: String, id: String?) {
+            val active = selectedFrnChatId == id
+            val tab = button(title) {
+                selectedFrnChatId = id
+                if (id != null) frnUnreadChats.remove(id)
+                showFrnChat()
+            }
+            tab.background = rounded(
+                if (active) Color.rgb(18, 103, 98) else panel
+            )
+            tabs.addView(tab, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(46)
+            ).apply {
+                marginEnd = dp(8)
+            })
+        }
+
+        content.addView(
+            button("👥 Gruppen öffnen") {
+                val availableGroups =
+                    org.funkgateway.mobile.frn.FrnChatGroups.all()
+
+                if (availableGroups.isEmpty()) {
+                    Toast.makeText(
+                        this,
+                        "Es sind keine Gruppen vorhanden.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    val names = availableGroups.map {
+                        "${it.shortCode} · ${it.name} (${it.participants.size} Mitglieder)"
+                    }.toTypedArray()
+
+                    val dialog = android.app.AlertDialog.Builder(this)
+                        .setTitle("FRN · Meine Gruppen")
+                        .setItems(names) { _, index ->
+                            val group = availableGroups[index]
+                            frnHiddenGroupIds.remove(group.id)
+                            selectedFrnChatId = "group:${group.id}"
+                            showFrnChat()
+                        }
+                        .setNegativeButton("Schließen", null)
+                        .create()
+
+                    dialog.setOnShowListener {
+                        dialog.window?.setBackgroundDrawable(
+                            rounded(panel)
+                        )
+                        dialog.findViewById<TextView>(
+                            resources.getIdentifier(
+                                "alertTitle", "id", "android"
+                            )
+                        )?.setTextColor(Color.WHITE)
+                        dialog.listView?.setBackgroundColor(panel)
+                        dialog.listView?.let { list ->
+                            for (i in 0 until list.childCount) {
+                                (list.getChildAt(i) as? TextView)
+                                    ?.setTextColor(Color.WHITE)
+                            }
+                        }
+                        dialog.getButton(
+                            android.app.AlertDialog.BUTTON_NEGATIVE
+                        )?.setTextColor(accent)
+                    }
+                    dialog.show()
+                }
+            },
+            LinearLayout.LayoutParams(-1, dp(48)).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(8)
+            }
+        )
+
+        addTab("Raumchat", null)
+        contacts.forEach { (id, name) ->
+            val unread = frnUnreadChats[id] ?: 0
+            val tabRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = rounded(
+                    if (selectedFrnChatId == id)
+                        Color.rgb(18, 103, 98) else panel
+                )
+            }
+            tabRow.addView(button(
+                name + if (unread > 0) " ($unread)" else ""
+            ) {
+                selectedFrnChatId = id
+                frnUnreadChats.remove(id)
+                showFrnChat()
+            }.apply {
+                background = null
+            })
+            tabRow.addView(button("×") {
+                frnOpenChatContacts.remove(id)
+                frnClosedChatIds.add(id)
+                frnUnreadChats.remove(id)
+                if (selectedFrnChatId == id) {
+                    selectedFrnChatId = null
+                }
+                showFrnChat()
+            }.apply {
+                background = null
+                textSize = 22f
+                setTextColor(muted)
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(dp(6), 0, dp(12), 0)
+            })
+            tabs.addView(
+                tabRow,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    dp(46)
+                ).apply {
+                    marginEnd = dp(8)
+                }
+            )
+        }
+
+        groups.filterNot { it.id in frnHiddenGroupIds }.forEach { group ->
+            val groupTabId = "group:${group.id}"
+            val groupRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = rounded(
+                    if (selectedFrnChatId == groupTabId)
+                        Color.rgb(18, 103, 98) else panel
+                )
+            }
+            groupRow.addView(button("👥 ${group.shortCode} · ${group.name}") {
+                selectedFrnChatId = groupTabId
+                showFrnChat()
+            }.apply { background = null })
+            groupRow.addView(button("×") {
+                frnHiddenGroupIds.add(group.id)
+                if (selectedFrnChatId == groupTabId) {
+                    selectedFrnChatId = null
+                }
+                showFrnChat()
+            }.apply {
+                background = null
+                textSize = 22f
+                setTextColor(muted)
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(dp(6), 0, dp(12), 0)
+            })
+            tabs.addView(
+                groupRow,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    dp(46)
+                ).apply { marginEnd = dp(8) }
+            )
+        }
+
+        content.addView(
+            android.widget.HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(tabs)
+            },
+            LinearLayout.LayoutParams(-1, dp(54)).apply {
+                topMargin = dp(12)
+            }
+        )
+
+        val activeGroup = selectedFrnChatId
+            ?.takeIf { it.startsWith("group:") }
+            ?.removePrefix("group:")
+            ?.let { org.funkgateway.mobile.frn.FrnChatGroups.get(it) }
+
+        if (activeGroup != null) {
+            val ownInstallationId =
+                org.funkgateway.mobile.frn.FrnGatewayIdentity.getId(this)
+
+            val isGroupHost =
+                org.funkgateway.mobile.frn.FrnChatGroups.isHost(
+                    activeGroup.id,
+                    ownInstallationId
+                )
+
+            val membersPanel = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = rounded(panel)
+                setPadding(dp(16), dp(12), dp(16), dp(12))
+            }
+
+            membersPanel.addView(label(
+                "👥 ${activeGroup.shortCode} · ${activeGroup.name} · ${activeGroup.participants.size} Mitglieder",
+                17f, accent, true
+            ))
+
+            activeGroup.participants.values.forEach { name ->
+                membersPanel.addView(label(
+                    "• $name",
+                    15f, Color.WHITE
+                ))
+            }
+
+            membersPanel.addView(label(
+                if (isGroupHost)
+                    "⚓ Du bist der Host dieser Gruppe."
+                else
+                    "👥 Du bist Mitglied dieser Gruppe.",
+                14f,
+                if (isGroupHost) accent else Color.WHITE
+            ))
+
+            content.addView(
+                membersPanel,
+                LinearLayout.LayoutParams(-1, -2).apply {
+                    topMargin = dp(8)
+                    bottomMargin = dp(8)
+                }
+            )
+        }
+
+        val messages = if (selectedFrnChatId == null) {
+            store.room()
+        } else if (activeGroup != null) {
+            org.funkgateway.mobile.frn.FrnGroupChatStore
+                .messages(activeGroup.id)
+        } else {
+            store.privateWith(selectedFrnChatId!!)
+        }
+
+        val messageList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        if (messages.isEmpty()) {
+            messageList.addView(label(
+                "Noch keine Nachrichten in diesem Chat.",
+                16f, muted
+            ))
+        } else {
+            fillFrnChatBubbles(messageList, messages)
+        }
+
+        val chatScroll = ScrollView(this).apply {
+            addView(messageList)
+        }
+        content.addView(
+            chatScroll,
+            LinearLayout.LayoutParams(-1, 0, 1f)
+        )
+        chatScroll.post {
+            chatScroll.fullScroll(View.FOCUS_DOWN)
+        }
+
+        val recipientId = selectedFrnChatId
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val messageInput = android.widget.EditText(this).apply {
+            hint = when {
+                activeGroup != null -> "Nachricht an Gruppe schreiben ..."
+                recipientId == null -> "Nachricht an alle (Test) ..."
+                else -> "Private Nachricht schreiben ..."
+            }
+            setHintTextColor(muted)
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setSingleLine(true)
+            filters = arrayOf(
+                android.text.InputFilter.LengthFilter(500)
+            )
+            background = rounded(panel)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        inputRow.addView(
+            messageInput,
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        inputRow.addView(
+            button("➤") {
+                val text = messageInput.text.toString().trim()
+                if (text.isNotEmpty()) {
+                    val destination = recipientId ?: "0"
+                    val service = gatewayService
+                    if (service == null) {
+                        Toast.makeText(
+                            this, "FRN ist nicht verbunden.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else if (activeGroup != null) {
+                        val targets = activeGroup.participants.keys.toList()
+                        val groupText = "[${activeGroup.shortCode}] $text"
+                        service.sendFrnGroupMessageAsync(
+                            targets, groupText
+                        ) { sent, total ->
+                            if (sent > 0) {
+                                org.funkgateway.mobile.frn.FrnGroupChatStore.add(
+                                    groupId = activeGroup.id,
+                                    sender = "Du",
+                                    senderId = "",
+                                    message = text,
+                                    outgoing = true
+                                )
+                                if (currentPage == "FRN_CHAT" &&
+                                    selectedFrnChatId == "group:${activeGroup.id}"
+                                ) {
+                                    showFrnChat()
+                                }
+                            }
+                            Toast.makeText(
+                                this,
+                                "An $sent von $total Teilnehmern an Server gesendet; Zustellung unbestätigt.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    } else {
+                        service.sendFrnTextMessageAsync(destination, text) { sent, error ->
+                            if (sent) {
+                                org.funkgateway.mobile.frn.FrnChatStore
+                                    .addOutgoing(destination, text, recipientId != null)
+                                if (currentPage == "FRN_CHAT" &&
+                                    selectedFrnChatId == recipientId
+                                ) {
+                                    showFrnChat()
+                                }
+                                Toast.makeText(
+                                    this,
+                                    "An Server gesendet; Zustellung unbestätigt.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } else {
+                                Toast.makeText(
+                                    this,
+                                    error ?: "Senden fehlgeschlagen.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    }
+                }
+            },
+            LinearLayout.LayoutParams(dp(54), dp(48)).apply {
+                marginStart = dp(8)
+            }
+        )
+        content.addView(
+            inputRow,
+            LinearLayout.LayoutParams(-1, -2).apply {
+                topMargin = dp(10)
+                bottomMargin = dp(6)
+            }
+        )
+
+        showGatewayScreen(content)
     }
 
     private fun showGatewayScreen(content: android.view.View) {
@@ -2463,7 +4095,7 @@ class MainActivity : Activity() {
         }
 
         val integrations = listOf(
-            "Start", "FRN", "Mumble", "Zello", "Mehr"
+            "Start", "FRN", "Mumble", "Zello", "Log", "Mehr"
         )
 
         integrations.forEach { integration ->
@@ -2473,6 +4105,7 @@ class MainActivity : Activity() {
                     "FRN" -> showFrn()
                     "Mumble" -> showPage("Mumble")
                     "Zello" -> showPage("Zello")
+                    "Log" -> showLog()
                     else -> showPage("Mehr")
                 }
             }.apply {
@@ -2486,6 +4119,7 @@ class MainActivity : Activity() {
                 "FRN-Einstellungen", "FRN_CHAT", "FRN_PARTICIPANTS" -> "FRN"
                 "Mumble" -> "Mumble"
                 "Zello" -> "Zello"
+                "Log" -> "Log"
                 else -> "Mehr"
             }
 
@@ -2578,19 +4212,39 @@ class MainActivity : Activity() {
 
             targetButton.text = "Ziel: " + when {
                 target == null -> "keines"
-                target !in available -> "nicht verbunden"
+                target !in available -> "${target.name} (getrennt)"
                 else -> target.name
             }
             targetButton.isEnabled = service != null
             val state = service?.getPttState() ?: GatewayService.PttState.IDLE
             val ready = target != null && target in available
-            pttButton.isEnabled = ready
+            val channelBusy =
+                target == GatewayService.PttTarget.FRN &&
+                service?.getFrnParticipants()?.activeIndex != null
+            val muted = service?.isGlobalMuted() == true
+            val releasePending = service?.isPttReleasePending() == true
+            pttButton.isEnabled =
+                ready && !channelBusy && !muted &&
+                !releasePending
             val (status, color) = when {
-                state == GatewayService.PttState.TRANSMITTING -> "🔴 SENDET" to Color.rgb(190, 30, 40)
-                state == GatewayService.PttState.REQUESTING -> "🔴 Warte auf Freigabe" to Color.rgb(165, 45, 45)
-                service?.isPttReleasePending() == true -> "🎙 PTT wird freigegeben" to Color.rgb(110, 120, 135)
-                ready -> "🎙 PTT bereit" to accent
-                else -> "🎙 PTT gesperrt" to Color.rgb(85, 92, 103)
+                state == GatewayService.PttState.TRANSMITTING ->
+                    "🔴 SENDET" to Color.rgb(190, 30, 40)
+                state == GatewayService.PttState.REQUESTING ->
+                    "🔴 Warte auf Freigabe" to Color.rgb(165, 45, 45)
+                releasePending ->
+                    "PTT wird freigegeben" to Color.rgb(110, 120, 135)
+                muted ->
+                    "PTT · Mikrofon stumm" to Color.rgb(85, 92, 103)
+                channelBusy ->
+                    "PTT belegt" to Color.rgb(85, 92, 103)
+                ready ->
+                    "🎙 PTT bereit" to accent
+                target == GatewayService.PttTarget.FRN &&
+                    service?.getFrnStatus() ==
+                    GatewayService.FrnStatus.CONNECTING ->
+                    "PTT verbindet …" to Color.rgb(65, 75, 90)
+                else ->
+                    "Kein Funkkontakt" to Color.rgb(52, 61, 76)
             }
             pttButton.text = status
             pttButton.background = rounded(color)
@@ -2852,10 +4506,71 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun commitFrnHostTransferSafely(
+        groupId: String,
+        installationId: String,
+        transferId: String
+    ): Boolean {
+        val saved =
+            org.funkgateway.mobile.frn.FrnGroupPersistence
+                .commitHostTransferPersisted(
+                    this, groupId, installationId, transferId
+                )
+
+        if (!saved) {
+            android.util.Log.e(
+                "FunkGateway-Groups",
+                "Hostübergabe angehalten: Sperre nicht bestätigt gespeichert."
+            )
+            android.widget.Toast.makeText(
+                this,
+                "Hostübergabe angehalten: Speicherfehler. " +
+                    "Bitte keine neue Übergabe starten.",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }
+
+        return saved
+    }
+
+    private fun saveFrnGroupsOrWarn(): Boolean {
+        val saved =
+            org.funkgateway.mobile.frn.FrnGroupPersistence
+                .saveCurrentGroups(this)
+
+        if (!saved) {
+            android.util.Log.e(
+                "FunkGateway-Groups",
+                "FRN-Gruppen konnten nicht dauerhaft gespeichert werden."
+            )
+
+            android.widget.Toast.makeText(
+                this,
+                "Achtung: Gruppenänderung konnte nicht gespeichert werden. " +
+                    "Sie könnte nach einem Neustart verloren gehen.",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }
+
+        return saved
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = bg
         window.navigationBarColor = bg
+
+        val groupsLoaded =
+            org.funkgateway.mobile.frn.FrnGroupPersistence.initialize(this)
+
+        if (!groupsLoaded) {
+            android.util.Log.w(
+                "FunkGateway-Groups",
+                "Gruppen konnten nicht initialisiert werden. " +
+                    "Vorhandene Gruppendaten bleiben unverändert."
+            )
+        }
+
         showHome()
         refreshFrnCacheOnStartup()
     }

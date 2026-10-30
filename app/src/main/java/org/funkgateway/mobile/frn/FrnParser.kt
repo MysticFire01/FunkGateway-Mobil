@@ -8,6 +8,7 @@ sealed class FrnEvent {
     data class TxGranted(val index: Int) : FrnEvent()
     data class ClientList(val activeIndex: Int, val entries: List<String>) : FrnEvent()
     data class ServerList(val type: Int, val entries: List<String>) : FrnEvent()
+    data class TextMessage(val entries: List<String>) : FrnEvent()
     data class Audio(val index: Int, val packet: ByteArray) : FrnEvent()
     data class Unknown(val type: Int) : FrnEvent()
 }
@@ -98,12 +99,14 @@ class FrnParser {
                     }
 
                     if (remaining == 0) {
-                        if (listType == 3) {
-                            events.add(
+                        when (listType) {
+                            3 -> events.add(
                                 FrnEvent.ClientList(activeIndex, entries.toList())
                             )
-                        } else {
-                            events.add(
+                            4 -> events.add(
+                                FrnEvent.TextMessage(entries.toList())
+                            )
+                            else -> events.add(
                                 FrnEvent.ServerList(listType, entries.toList())
                             )
                         }

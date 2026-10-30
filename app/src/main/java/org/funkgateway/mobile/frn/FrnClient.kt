@@ -89,7 +89,9 @@ class FrnConnection private constructor(
     fun send(command: String) {
         check(!socket.isClosed) { "FRN-Verbindung ist geschlossen." }
         require('\r' !in command && '\n' !in command)
-        output.write((command + "\r\n").toByteArray(Charsets.US_ASCII))
+        output.write((command + "\r\n").toByteArray(
+            Charset.forName("windows-1252")
+        ))
         output.flush()
     }
 

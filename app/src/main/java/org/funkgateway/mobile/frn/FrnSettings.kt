@@ -103,4 +103,52 @@ object FrnSettingsStore {
                 .commit()
         ) { "FRN-Einstellungen konnten nicht gespeichert werden." }
     }
+
+    fun loadProfile(context: Context, id: String): FrnSettings {
+        require(id.matches(Regex("[a-fA-F0-9-]{36}")))
+        val prefs = context.getSharedPreferences(
+            "frn_profile_data_$id", Context.MODE_PRIVATE
+        )
+        if (!prefs.contains("email")) {
+            if (FrnProfileStore.isLegacyProfile(context, id)) {
+                val legacy = load(context)
+                saveProfile(context, id, legacy)
+                return legacy
+            }
+            return FrnSettings()
+        }
+
+        return FrnSettings(
+            email = prefs.getString("email", "") ?: "",
+            password = decrypt(prefs.getString("password", "") ?: ""),
+            callsign = prefs.getString("callsign", "") ?: "",
+            description = prefs.getString("description", "") ?: "",
+            country = prefs.getString("country", "Germany") ?: "",
+            city = prefs.getString("city", "") ?: "",
+            vx = prefs.getString("vx", "20261016") ?: "",
+            clientType = prefs.getString("clientType", "2") ?: "",
+            bandChannel = prefs.getString("bandChannel", "PC-Only") ?: ""
+        )
+    }
+
+    fun saveProfile(context: Context, id: String, settings: FrnSettings) {
+        require(id.matches(Regex("[a-fA-F0-9-]{36}")))
+        val encryptedPassword = encrypt(settings.password)
+        val prefs = context.getSharedPreferences(
+            "frn_profile_data_$id", Context.MODE_PRIVATE
+        )
+        check(
+            prefs.edit()
+                .putString("email", settings.email)
+                .putString("password", encryptedPassword)
+                .putString("callsign", settings.callsign)
+                .putString("description", settings.description)
+                .putString("country", settings.country)
+                .putString("city", settings.city)
+                .putString("vx", settings.vx)
+                .putString("clientType", settings.clientType)
+                .putString("bandChannel", settings.bandChannel)
+                .commit()
+        ) { "FRN-Profil konnte nicht gespeichert werden." }
+    }
 }

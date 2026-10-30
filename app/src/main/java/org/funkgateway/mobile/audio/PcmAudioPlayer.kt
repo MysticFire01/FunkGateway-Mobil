@@ -22,12 +22,18 @@ class PcmAudioPlayer(
 
     private val running = AtomicBoolean(false)
     private val deafened = AtomicBoolean(false)
+    @Volatile private var volume = 1f
+
+    fun setVolume(value: Float) {
+        volume = value.coerceIn(0f, 1f)
+        activeTrack?.setVolume(if (deafened.get()) 0f else volume)
+    }
     @Volatile private var activeTrack: AudioTrack? = null
 
     fun setDeafened(value: Boolean) {
         deafened.set(value)
         if (value) packets.clear()
-        activeTrack?.setVolume(if (value) 0f else 1f)
+        activeTrack?.setVolume(if (value) 0f else volume)
     }
     private val packets = LinkedBlockingDeque<ByteArray>(6)
     private var worker: Thread? = null
@@ -73,7 +79,7 @@ class PcmAudioPlayer(
                 }
 
                 activeTrack = track
-                track.setVolume(if (deafened.get()) 0f else 1f)
+                track.setVolume(if (deafened.get()) 0f else volume)
                 track.play()
 
                 while (running.get()) {

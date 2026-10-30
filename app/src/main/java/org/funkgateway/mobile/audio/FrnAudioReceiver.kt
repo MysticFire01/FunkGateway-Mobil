@@ -28,6 +28,10 @@ class FrnAudioReceiver : Closeable {
     private val packets = LinkedBlockingDeque<ByteArray>(4)
     private val player = PcmAudioPlayer(GsmWav49Codec.SAMPLE_RATE)
 
+    fun setVolume(value: Float) {
+        player.setVolume(value)
+    }
+
     private val worker = Thread({
         var codec: GsmWav49Codec? = null
 
