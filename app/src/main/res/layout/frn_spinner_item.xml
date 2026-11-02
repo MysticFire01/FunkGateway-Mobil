@@ -1,15 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<TextView
-    xmlns:android="http://schemas.android.com/apk/res/android"
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@android:id/text1"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:minHeight="48dp"
     android:gravity="center_vertical"
-    android:paddingStart="12dp"
-    android:paddingEnd="12dp"
+    android:paddingStart="14dp"
+    android:paddingEnd="14dp"
     android:textColor="#FFFFFF"
-    android:background="#202B3A"
     android:textSize="16sp"
+    android:drawableEnd="@drawable/frn_dropdown_arrow"
+    android:drawablePadding="8dp"
     android:singleLine="true"
     android:ellipsize="end" />

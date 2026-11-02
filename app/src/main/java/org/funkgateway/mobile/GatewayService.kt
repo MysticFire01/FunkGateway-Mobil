@@ -155,6 +155,23 @@ class GatewayService : Service() {
         FRN, MUMBLE, ZELLO
     }
 
+    private var mumbleManager: MumbleConnectionManager? = null
+
+    @Synchronized
+    fun setMumbleManager(manager: MumbleConnectionManager?) {
+        if (mumbleManager === manager) return
+        if (selectedPttTarget == PttTarget.MUMBLE &&
+            pttState != PttState.IDLE) {
+            stopPtt()
+        }
+        mumbleManager = manager
+        manager?.setPlaybackVolume(mumbleVolume / 100f)
+        manager?.setPlaybackDeafened(globalDeafened)
+    }
+
+    @Synchronized
+    fun getMumbleManager(): MumbleConnectionManager? = mumbleManager
+
     private var selectedPttTarget: PttTarget? = null
 
     enum class PttState {
@@ -166,6 +183,16 @@ class GatewayService : Service() {
     private var globalMuted = false
     private var globalDeafened = false
     private var frnVolume = 100
+    private var mumbleVolume = 100
+
+    @Synchronized
+    fun getMumbleVolume(): Int = mumbleVolume
+
+    @Synchronized
+    fun setMumbleVolume(value: Int) {
+        mumbleVolume = value.coerceIn(0, 100)
+        mumbleManager?.setPlaybackVolume(mumbleVolume / 100f)
+    }
 
     @Synchronized
     fun getFrnVolume(): Int = frnVolume
@@ -192,6 +219,7 @@ class GatewayService : Service() {
     fun setGlobalDeafened(value: Boolean) {
         globalDeafened = value
         frnAudio?.setDeafened(value)
+        mumbleManager?.setPlaybackDeafened(value)
     }
 
     private var pttState = PttState.IDLE
@@ -274,6 +302,9 @@ class GatewayService : Service() {
             if (frnConnection != null && !frnConnecting) {
                 add(PttTarget.FRN)
             }
+            if (mumbleManager?.isConnected() == true) {
+                add(PttTarget.MUMBLE)
+            }
         }
 
     @Synchronized
@@ -293,6 +324,49 @@ class GatewayService : Service() {
     @Synchronized
     fun startPtt(): Boolean {
         if (globalMuted || serviceDestroyed || pttState != PttState.IDLE || pttReleasePending) return false
+        if (selectedPttTarget == PttTarget.MUMBLE) {
+            val manager = mumbleManager ?: return false
+            if (!manager.isConnected()) return false
+
+            try {
+                startGatewayForeground(true)
+            } catch (e: Exception) {
+                android.util.Log.e(
+                    "FunkGateway-PTT",
+                    "Mumble-Mikrofon-Vordergrunddienst fehlgeschlagen",
+                    e
+                )
+                return false
+            }
+
+            pttState = PttState.REQUESTING
+
+            if (!manager.startTalking()) {
+                resetPttState()
+                return false
+            }
+
+            pttState = PttState.TRANSMITTING
+            val session = ++pttSessionId
+
+            mainHandler.postDelayed({
+                synchronized(this) {
+                    if (session == pttSessionId &&
+                        selectedPttTarget == PttTarget.MUMBLE &&
+                        pttState != PttState.IDLE
+                    ) {
+                        android.util.Log.w(
+                            "FunkGateway-PTT",
+                            "Mumble-Sendezeitlimit erreicht: 180 Sekunden"
+                        )
+                        stopPtt()
+                    }
+                }
+            }, pttTimeoutMillis)
+
+            return true
+        }
+
         if (selectedPttTarget != PttTarget.FRN) return false
         val connection = frnConnection ?: return false
         if (frnConnecting || frnParticipants.activeIndex != null) {
@@ -348,6 +422,14 @@ class GatewayService : Service() {
     @Synchronized
     fun stopPtt() {
         if (pttState == PttState.IDLE) return
+        if (selectedPttTarget == PttTarget.MUMBLE) {
+            try {
+                mumbleManager?.stopTalking()
+            } finally {
+                resetPttState()
+            }
+            return
+        }
         val connection = if (pttState != PttState.IDLE && selectedPttTarget == PttTarget.FRN) frnConnection else null
         if (connection != null) pttReleasePending = true
         resetPttState()

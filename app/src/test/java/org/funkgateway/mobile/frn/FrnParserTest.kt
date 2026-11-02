@@ -55,9 +55,8 @@ class FrnParserTest {
 
         assertEquals(2, events.size)
 
-        val list = events[0] as FrnEvent.ServerList
-        assertEquals(4, list.type)
-        assertEquals(listOf("Nachricht"), list.entries)
+        val message = events[0] as FrnEvent.TextMessage
+        assertEquals(listOf("Nachricht"), message.entries)
 
         assertTrue(events[1] is FrnEvent.Idle)
     }
