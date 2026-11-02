@@ -4,6 +4,9 @@ plugins {
 }
 
 android {
+    packaging {
+        resources.pickFirsts.add("org/spongycastle/x509/CertPathReviewerMessages_de.properties")
+    }
     namespace = "org.funkgateway.mobile"
     compileSdk = 35
     ndkVersion = "27.2.12479018"
@@ -34,6 +37,15 @@ android {
 }
 
 dependencies {
+    // Nativer Mumble-Client (Humla)
+    implementation(files("libs/humla-debug.aar"))
+    implementation("com.google.protobuf:protobuf-java:3.11.4")
+    implementation("com.madgag.spongycastle:core:1.51.0.0")
+    implementation("com.googlecode.javacpp:javacpp:0.7")
+    implementation("org.jetbrains:annotations:18.0.0")
+    implementation("org.minidns:minidns-hla:0.3.4")
+    implementation("org.minidns:minidns-android21:0.3.4")
+    implementation("com.google.guava:guava:28.2-android")
     implementation("androidx.core:core:1.15.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

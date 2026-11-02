@@ -31,10 +31,43 @@ done
     exit 1
 }
 
-[[ -z "$(git ls-files --others --exclude-standard | grep -v '^release.sh$' || true)" ]] || {
-    echo "Abbruch: Unbekannte Dateien im Repository vorhanden."
-    exit 1
+# Neue Quelldateien nur aus bekannten Projektbereichen erlauben.
+python3 - <<'CHECK_NEW'
+import subprocess
+from pathlib import PurePosixPath
+
+files = subprocess.check_output(
+    ["git", "ls-files", "--others", "--exclude-standard", "-z"]
+).decode().split("\0")
+
+allowed = {
+    "release-test.sh",
+    "app/src/main/cpp/libgsm/COPYRIGHT",
+    "app/src/main/assets/licenses/libgsm.txt",
 }
+prefixes = (
+    "app/src/main/cpp/",
+    "app/src/main/java/org/funkgateway/mobile/audio/",
+)
+extensions = {".c", ".h", ".kt", ".txt"}
+
+unexpected = [
+    name for name in filter(None, files)
+    if name not in allowed
+    and not (
+        name.startswith(prefixes)
+        and PurePosixPath(name).suffix in extensions
+    )
+]
+
+if unexpected:
+    raise SystemExit(
+        "Abbruch: Unbekannte Dateien:\n" +
+        "\n".join(unexpected)
+    )
+
+print("OK: Neue Quelldateien geprüft.")
+CHECK_NEW
 
 git fetch origin main --tags
 [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || {
