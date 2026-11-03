@@ -2946,6 +2946,10 @@ class MainActivity : Activity() {
             showAboutMobile()
             return
         }
+        if (name == "Papageien") {
+            showParrots()
+            return
+        }
         if (name == "Verlinkung") {
             root.addView(label("🔗 FRN ↔ Mumble", 26f, Color.WHITE, true))
 
@@ -3019,6 +3023,112 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(-1, dp(64)))
 
         showGatewayScreen(root)
+    }
+
+
+    private fun showParrots() {
+        currentPage = "Papageien"
+        var settings = org.funkgateway.mobile.audio.ParrotSettings.load(this)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("🦜 Papageien", 26f, Color.WHITE, true))
+        root.addView(label("Mumble-Papagei", 20f, accent, true))
+        root.addView(label(
+            "Aufnehmen, kurz warten und die Sprache wiedergeben.",
+            15f, muted
+        ))
+
+        fun timeSlider(
+            title: String,
+            initial: Int,
+            maximum: Int,
+            display: (Int) -> String,
+            save: (Int) -> Unit
+        ) {
+            val valueLabel = label(
+                "$title: ${display(initial)}", 17f, Color.WHITE, true
+            ).apply { setPadding(0, dp(20), 0, dp(8)) }
+            root.addView(valueLabel)
+            root.addView(android.widget.SeekBar(this).apply {
+                max = maximum
+                progress = initial
+                setOnSeekBarChangeListener(
+                    object : android.widget.SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(
+                            bar: android.widget.SeekBar?,
+                            value: Int,
+                            fromUser: Boolean
+                        ) {
+                            if (!fromUser) return
+                            valueLabel.text = "$title: ${display(value)}"
+                            save(value)
+                        }
+                        override fun onStartTrackingTouch(
+                            bar: android.widget.SeekBar?
+                        ) = Unit
+                        override fun onStopTrackingTouch(
+                            bar: android.widget.SeekBar?
+                        ) = Unit
+                    }
+                )
+            })
+        }
+
+        timeSlider(
+            "Maximale Aufnahmezeit",
+            settings.maxRecordingSeconds - 5,
+            115,
+            { "${it + 5} Sekunden" }
+        ) {
+            settings = settings.copy(maxRecordingSeconds = it + 5)
+            settings.save(this)
+        }
+
+        timeSlider(
+            "Wartezeit vor Wiedergabe",
+            (settings.playbackDelayMillis / 500L).toInt(),
+            20,
+            { "${it / 2}.${if (it % 2 == 0) 0 else 5} Sekunden" }
+        ) {
+            settings = settings.copy(playbackDelayMillis = it * 500L)
+            settings.save(this)
+        }
+
+        root.addView(android.widget.CheckBox(this).apply {
+            text = "Signal bei maximaler Aufnahmezeit"
+            setTextColor(Color.WHITE)
+            isChecked = settings.timeoutSignalEnabled
+            setOnCheckedChangeListener { _, checked ->
+                settings = settings.copy(timeoutSignalEnabled = checked)
+                settings.save(this@MainActivity)
+            }
+        })
+
+        root.addView(android.widget.CheckBox(this).apply {
+            text = "Papageienkonzert erlauben"
+            setTextColor(Color.WHITE)
+            isChecked = settings.concertModeEnabled
+            setOnCheckedChangeListener { _, checked ->
+                settings = settings.copy(concertModeEnabled = checked)
+                settings.save(this@MainActivity)
+            }
+        })
+
+        root.addView(label(
+            "Die Sprachsteuerung wird als Nächstes eingebaut.",
+            14f, muted
+        ))
+        root.addView(button("← Zurück zur Übersicht") { showHome() })
+
+        showGatewayScreen(ScrollView(this).apply {
+            isFillViewport = true
+            addView(root)
+        })
     }
 
     private var mumbleStatusView: android.widget.TextView? = null

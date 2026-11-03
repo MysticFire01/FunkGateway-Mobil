@@ -49,6 +49,7 @@ class MumbleConnectionManager(
         onCertificateUntrusted = { _, _, _ -> }
     }
     var onTalkStateChanged: ((Int, String) -> Unit)? = null
+    var onParrotTalkStateChanged: ((Int, String) -> Unit)? = null
     var onChannelMembershipChanged: (() -> Unit)? = null
     var onRegistrationStatusChanged: ((String) -> Unit)? = null
     private var registrationPending = false
@@ -340,6 +341,7 @@ class MumbleConnectionManager(
             val talkState = user.talkState.name
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 onTalkStateChanged?.invoke(sessionId, talkState)
+                onParrotTalkStateChanged?.invoke(sessionId, talkState)
             }
         }
         override fun onUserJoinedChannel(user: IUser, newChannel: IChannel, oldChannel: IChannel) {
