@@ -4775,14 +4775,15 @@ class MainActivity : Activity() {
                     val currentChannel = bandChannel.text.toString().trim()
                     when (position) {
                         0 -> if (currentChannel.isBlank() ||
-                            currentChannel.equals("PC-Only", true)
+                            currentChannel.equals("PC-Only", true) ||
+                            currentChannel.equals("PC Only", true)
                         ) {
                             bandChannel.setText("Crosslink")
                         }
                         2 -> if (currentChannel.isBlank() ||
                             currentChannel.equals("Crosslink", true)
                         ) {
-                            bandChannel.setText("PC-Only")
+                            bandChannel.setText("PC Only")
                         }
                     }
                 }
