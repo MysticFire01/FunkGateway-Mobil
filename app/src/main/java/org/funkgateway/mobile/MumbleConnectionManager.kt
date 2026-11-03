@@ -293,11 +293,29 @@ class MumbleConnectionManager(
             onCertificateUntrusted(host, port, certificate)
         }
 
-        override fun onChannelAdded(channel: IChannel) {}
-        override fun onChannelStateUpdated(channel: IChannel) {}
-        override fun onChannelRemoved(channel: IChannel) {}
+        private fun notifyRoomTreeChanged() {
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                onChannelMembershipChanged?.invoke()
+            }
+        }
+
+        override fun onChannelAdded(channel: IChannel) {
+            notifyRoomTreeChanged()
+        }
+
+        override fun onChannelStateUpdated(channel: IChannel) {
+            notifyRoomTreeChanged()
+        }
+
+        override fun onChannelRemoved(channel: IChannel) {
+            notifyRoomTreeChanged()
+        }
+
         override fun onChannelPermissionsUpdated(channel: IChannel) {}
-        override fun onUserConnected(user: IUser) {}
+
+        override fun onUserConnected(user: IUser) {
+            notifyRoomTreeChanged()
+        }
         override fun onUserStateUpdated(user: IUser) {
             val ownSessionId = runCatching {
                 service?.HumlaSession()?.sessionId
@@ -313,6 +331,9 @@ class MumbleConnectionManager(
                     onRegistrationStatusChanged?.invoke(message)
                 }
             }
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                onChannelMembershipChanged?.invoke()
+            }
         }
         override fun onUserTalkStateUpdated(user: IUser) {
             val sessionId = user.session
@@ -326,7 +347,11 @@ class MumbleConnectionManager(
                 onChannelMembershipChanged?.invoke()
             }
         }
-        override fun onUserRemoved(user: IUser, reason: String?) {}
+        override fun onUserRemoved(user: IUser, reason: String?) {
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                onChannelMembershipChanged?.invoke()
+            }
+        }
         override fun onPermissionDenied(reason: String?) {
             if (!registrationPending) return
             registrationPending = false
@@ -500,7 +525,14 @@ class MumbleConnectionManager(
     data class MumbleUserItem(
         val sessionId: Int,
         val name: String,
-        val talkState: String
+        val talkState: String,
+        val registered: Boolean,
+        val selfMuted: Boolean,
+        val selfDeafened: Boolean,
+        val serverMuted: Boolean,
+        val serverDeafened: Boolean,
+        val localMuted: Boolean,
+        val suppressed: Boolean
     )
 
     data class MumbleChannelItem(
@@ -621,7 +653,20 @@ class MumbleConnectionManager(
                     name = channel.name,
                     users = channel.users
                         .sortedBy { it.name.lowercase() }
-                        .map { MumbleUserItem(it.session, it.name, it.talkState.name) },
+                        .map { user ->
+                            MumbleUserItem(
+                                sessionId = user.session,
+                                name = user.name,
+                                talkState = user.talkState.name,
+                                registered = user.userId >= 0,
+                                selfMuted = user.isSelfMuted,
+                                selfDeafened = user.isSelfDeafened,
+                                serverMuted = user.isMuted,
+                                serverDeafened = user.isDeafened,
+                                localMuted = user.isLocalMuted,
+                                suppressed = user.isSuppressed
+                            )
+                        },
                     children = channel.subchannels
                         .sortedWith(compareBy<IChannel> { it.position }.thenBy { it.name })
                         .map { snapshot(it) }
@@ -817,6 +862,52 @@ class MumbleConnectionManager(
         } catch (e: Exception) {
             Log.e("FGW-Mumble", "Registrierungsanforderung fehlgeschlagen", e)
             "Registrierung konnte nicht angefordert werden: ${e.message}"
+        }
+    }
+
+    data class MumbleSelfAudioState(
+        val muted: Boolean,
+        val deafened: Boolean
+    )
+
+    fun getSelfAudioState(): MumbleSelfAudioState? {
+        return try {
+            val active = service ?: return null
+            if (!active.isConnected) return null
+            val ownSessionId = active.HumlaSession().sessionId
+            fun findOwnUser(
+                channel: MumbleChannelItem
+            ): MumbleUserItem? {
+                channel.users.firstOrNull {
+                    it.sessionId == ownSessionId
+                }?.let { return it }
+                channel.children.forEach { child ->
+                    findOwnUser(child)?.let { return it }
+                }
+                return null
+            }
+            val ownUser = findOwnUser(getChannelTree() ?: return null)
+                ?: return null
+            MumbleSelfAudioState(
+                muted = ownUser.selfMuted,
+                deafened = ownUser.selfDeafened
+            )
+        } catch (e: Exception) {
+            Log.w("FGW-Mumble", "Eigener Mumble-Audiostatus nicht verfügbar", e)
+            null
+        }
+    }
+
+    fun setSelfAudioState(muted: Boolean, deafened: Boolean): Boolean {
+        val active = service as? HumlaService ?: return false
+        if (!active.isConnected) return false
+
+        return try {
+            active.setSelfMuteDeafState(muted, deafened)
+            true
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble", "Mumble Mute/Deaf fehlgeschlagen", e)
+            false
         }
     }
 

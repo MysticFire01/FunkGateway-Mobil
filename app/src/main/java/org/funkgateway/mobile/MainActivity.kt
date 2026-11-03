@@ -3022,6 +3022,29 @@ class MainActivity : Activity() {
     }
 
     private var mumbleStatusView: android.widget.TextView? = null
+    private var mumbleConnectButton: android.widget.Button? = null
+    private var mumbleDisconnectButton: android.widget.Button? = null
+
+    private fun refreshMumbleConnectionButtons() {
+        val manager = mumbleManager
+        val connected = manager?.isConnected() == true
+        val connecting = manager?.isConnecting() == true
+
+        mumbleConnectButton?.isEnabled = !connected && !connecting
+        mumbleDisconnectButton?.isEnabled = connected || connecting
+
+        if (currentPage == "Mumble") {
+            val actualStatus = when {
+                connected -> "Mit Mumble verbunden"
+                connecting -> "Verbinde mit Mumble …"
+                else -> null
+            }
+            if (actualStatus != null && mumbleStatus != actualStatus) {
+                mumbleStatus = actualStatus
+                mumbleStatusView?.text = "Status: $actualStatus"
+            }
+        }
+    }
 
     private fun attachMumbleUiCallbacks(
         manager: MumbleConnectionManager
@@ -3032,6 +3055,7 @@ class MainActivity : Activity() {
                     mumbleStatus = message
                     if (currentPage == "Mumble") {
                         mumbleStatusView?.text = "Status: $message"
+                        refreshMumbleConnectionButtons()
                     }
                 }
             },
@@ -3225,7 +3249,12 @@ class MainActivity : Activity() {
         )
         val password = field("Passwort", mumblePassword, true)
 
-        root.addView(button("💾 Als Standardverbindung speichern") {
+        val settingsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+
+        settingsContainer.addView(button("💾 Als Standardverbindung speichern") {
             val address = host.text.toString().trim()
             val number = port.text.toString().toIntOrNull()
             val user = username.text.toString().trim()
@@ -3272,7 +3301,7 @@ class MainActivity : Activity() {
             }
         })
 
-        root.addView(button("👤 Standard-Benutzername einstellen") {
+        settingsContainer.addView(button("👤 Standard-Benutzername einstellen") {
             val input = android.widget.EditText(this).apply {
                 setSingleLine(true)
                 setText(getDefaultMumbleUsername())
@@ -3313,23 +3342,29 @@ class MainActivity : Activity() {
                 .apply { styleMumbleDialog(this) }
         })
 
-        root.addView(button("🌐 Öffentliche Mumble-Server") {
+        val serverButtons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        serverButtons.addView(button("🌐 Serverliste") {
             mumbleHost = host.text.toString()
             mumblePort = port.text.toString()
             mumbleUsername = username.text.toString()
             mumblePassword = password.text.toString()
             showMumbleServerBrowser(false)
-        })
+        }, LinearLayout.LayoutParams(0, dp(52), 1f))
 
-        root.addView(button("⭐ Mumble-Favoriten") {
+        serverButtons.addView(button("⭐ Favoriten") {
             mumbleHost = host.text.toString()
             mumblePort = port.text.toString()
             mumbleUsername = username.text.toString()
             mumblePassword = password.text.toString()
             showMumbleServerBrowser(true)
-        })
+        }, LinearLayout.LayoutParams(0, dp(52), 1f))
 
-        root.addView(button("⭐ Aktuellen Server als Favorit speichern") {
+        root.addView(serverButtons)
+
+        settingsContainer.addView(button("⭐ Aktuellen Server als Favorit speichern") {
             val address = host.text.toString().trim()
             val number = port.text.toString().toIntOrNull()
 
@@ -3371,6 +3406,13 @@ class MainActivity : Activity() {
             }
         })
 
+        root.addView(button("⚙️ Verbindungseinstellungen") {
+            settingsContainer.visibility =
+                if (settingsContainer.visibility == View.VISIBLE)
+                    View.GONE else View.VISIBLE
+        })
+        root.addView(settingsContainer)
+
         val status = label("Status: $mumbleStatus", 17f, Color.WHITE).apply {
             setPadding(0, dp(24), 0, dp(16))
         }
@@ -3386,7 +3428,18 @@ class MainActivity : Activity() {
         mumbleStatusView = status
         val manager = getOrCreateMumbleManager()
 
-        root.addView(button("🔗 Verbinden") {
+        mumbleStatus = when {
+            manager.isConnected() -> "Mit Mumble verbunden"
+            manager.isConnecting() -> "Verbinde mit Mumble …"
+            else -> mumbleStatus
+        }
+        status.text = "Status: $mumbleStatus"
+
+        val connectionButtons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val connectButton = button("🔗 Verbinden") {
             saveInputs()
             val portNumber = mumblePort.toIntOrNull()
             if (portNumber == null) {
@@ -3402,13 +3455,39 @@ class MainActivity : Activity() {
 
                 manager.connect(mumbleHost, portNumber, mumbleUsername, mumblePassword)
             }
-        })
+        }
+        connectionButtons.addView(
+            connectButton, LinearLayout.LayoutParams(0, dp(56), 1f)
+        )
 
-        root.addView(button("⛔ Trennen") {
+        val disconnectButton = button("⛔ Trennen") {
             saveInputs()
             manager.disconnect()
             gatewayService?.stopIfIdle()
-        })
+            refreshMumbleConnectionButtons()
+        }
+        connectionButtons.addView(
+            disconnectButton, LinearLayout.LayoutParams(0, dp(56), 1f)
+        )
+
+        mumbleConnectButton = connectButton
+        mumbleDisconnectButton = disconnectButton
+        refreshMumbleConnectionButtons()
+
+        val connectionStatusHandler = android.os.Handler(
+            android.os.Looper.getMainLooper()
+        )
+        val connectionStatusUpdater = object : Runnable {
+            override fun run() {
+                if (currentPage != "Mumble" ||
+                    mumbleStatusView !== status) return
+                refreshMumbleConnectionButtons()
+                connectionStatusHandler.postDelayed(this, 500L)
+            }
+        }
+        connectionStatusHandler.postDelayed(connectionStatusUpdater, 500L)
+
+        root.addView(connectionButtons)
 
         root.addView(button("← Zurück zur Übersicht") {
             showHome()
@@ -4083,7 +4162,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(12), 0, dp(12))
         }
-        root.addView(treeContainer)
+
 
         val expandedChannels = mutableSetOf<Int>()
         var ownPosition = mumbleManager?.getOwnPosition()
@@ -4098,9 +4177,11 @@ class MainActivity : Activity() {
 
         mumbleManager?.getChannelTree()?.let { expandOwnPath(it) }
 
+        var treeScroll: ScrollView? = null
+
         fun renderTree() {
+            val previousScrollY = treeScroll?.scrollY ?: 0
             ownPosition = mumbleManager?.getOwnPosition()
-            mumbleManager?.getChannelTree()?.let { expandOwnPath(it) }
             mouthViews.clear()
             treeContainer.removeAllViews()
             val channelTree = mumbleManager?.getChannelTree()
@@ -4176,14 +4257,50 @@ class MainActivity : Activity() {
                         val mouthView = mumbleMouth(mouthColor)
                         mouthViews[user.sessionId] = mouthView
                         userRow.addView(mouthView)
-                        userRow.addView(
+                        val userStatus = buildList {
+                            add(if (user.registered) "🟢R" else "⚪G")
+                            if (user.selfMuted) add("🎙️SM")
+                            if (user.selfDeafened) add("🎧SD")
+                            if (user.serverMuted) add("🔴MM")
+                            if (user.serverDeafened) add("🔴MD")
+                            if (user.localMuted) add("🔇LM")
+                            if (user.suppressed) add("⛔SUP")
+                        }.joinToString(" ")
+
+                        val userDetails = LinearLayout(this).apply {
+                            orientation = LinearLayout.VERTICAL
+                            setPadding(dp(8), 0, 0, 0)
+                        }
+
+                        val displayName =
+                            if (isSelf) "⭐ ${user.name} (Ich)"
+                            else "👤 ${user.name}"
+
+                        userDetails.addView(
                             label(
-                                if (isSelf) "⭐ ${user.name} (Ich)"
-                                else "👤 ${user.name}",
+                                displayName,
                                 15f,
                                 if (isSelf) Color.WHITE else muted
                             )
                         )
+
+                        userDetails.addView(
+                            label(
+                                userStatus,
+                                12f,
+                                Color.rgb(170, 190, 205)
+                            )
+                        )
+
+                        userRow.addView(
+                            userDetails,
+                            LinearLayout.LayoutParams(
+                                0,
+                                LinearLayout.LayoutParams.WRAP_CONTENT,
+                                1f
+                            )
+                        )
+
                         treeContainer.addView(userRow)
                     }
 
@@ -4193,13 +4310,131 @@ class MainActivity : Activity() {
                 }
             }
 
-            expandedChannels.add(channelTree.id)
             addChannel(channelTree, 0)
+            treeScroll?.post {
+                treeScroll?.scrollTo(0, previousScrollY)
+            }
         }
 
-        root.addView(button("🔄 Aktualisieren") {
+        fun collectChannelIds(
+            channel: MumbleConnectionManager.MumbleChannelItem
+        ) {
+            expandedChannels.add(channel.id)
+            channel.children.forEach { collectChannelIds(it) }
+        }
+
+        val expandButtons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        expandButtons.addView(
+            button("📂 Alle auf") {
+                mumbleManager?.getChannelTree()?.let { collectChannelIds(it) }
+                renderTree()
+            },
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+
+        expandButtons.addView(
+            button("📁 Alle zu") {
+                expandedChannels.clear()
+                renderTree()
+            },
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+
+        val refreshButton = button("🔄") {
             renderTree()
-        })
+        }
+
+        expandButtons.addView(
+            refreshButton,
+            LinearLayout.LayoutParams(dp(56), dp(48))
+        )
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(treeContainer)
+        }
+
+        root.addView(expandButtons)
+
+        val mumbleAudioButtons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val mumbleMuteButton = button("🎙️ Mumble Mute") {}
+        val mumbleDeafButton = button("🎧 Mumble Deaf") {}
+
+        fun refreshMumbleAudioButtons() {
+            val state = mumbleManager?.getSelfAudioState()
+            mumbleMuteButton.isEnabled = state != null
+            mumbleDeafButton.isEnabled = state != null
+
+            mumbleMuteButton.text =
+                if (state?.muted == true) "🔴 Mumble Mute"
+                else "🟢 Mumble Mikrofon"
+
+            mumbleDeafButton.text =
+                if (state?.deafened == true) "🔴 Mumble Deaf"
+                else "🟢 Mumble Hören"
+        }
+
+        mumbleMuteButton.setOnClickListener {
+            val state = mumbleManager?.getSelfAudioState()
+                ?: return@setOnClickListener
+            val newMute = !state.muted
+            mumbleManager?.setSelfAudioState(
+                muted = newMute,
+                deafened = if (newMute) state.deafened else false
+            )
+            refreshMumbleAudioButtons()
+        }
+
+        mumbleDeafButton.setOnClickListener {
+            val state = mumbleManager?.getSelfAudioState()
+                ?: return@setOnClickListener
+            val newDeaf = !state.deafened
+            mumbleManager?.setSelfAudioState(
+                muted = if (newDeaf) true else state.muted,
+                deafened = newDeaf
+            )
+            refreshMumbleAudioButtons()
+        }
+
+        mumbleAudioButtons.addView(
+            mumbleMuteButton,
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+        mumbleAudioButtons.addView(
+            mumbleDeafButton,
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+        root.addView(mumbleAudioButtons)
+
+        val mumbleAudioStatusHandler =
+            android.os.Handler(android.os.Looper.getMainLooper())
+        val mumbleAudioStatusUpdater = object : Runnable {
+            override fun run() {
+                if (currentPage != "MUMBLE_ROOMS") return
+                refreshMumbleAudioButtons()
+                mumbleAudioStatusHandler.postDelayed(this, 500L)
+            }
+        }
+        mumbleAudioStatusHandler.postDelayed(
+            mumbleAudioStatusUpdater, 500L
+        )
+
+        refreshMumbleAudioButtons()
+        treeScroll = scroll
+        root.addView(
+            scroll,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
 
         renderTree()
 
@@ -4225,9 +4460,7 @@ class MainActivity : Activity() {
             }
         }
 
-        showGatewayScreen(ScrollView(this).apply {
-            addView(root)
-        })
+        showGatewayScreen(root)
     }
 
     private fun showAboutMobile() {
@@ -4539,10 +4772,18 @@ class MainActivity : Activity() {
                     position: Int,
                     id: Long
                 ) {
-                    if (position == 2 &&
-                        bandChannel.text.toString().isBlank()
-                    ) {
-                        bandChannel.setText("PC-Only")
+                    val currentChannel = bandChannel.text.toString().trim()
+                    when (position) {
+                        0 -> if (currentChannel.isBlank() ||
+                            currentChannel.equals("PC-Only", true)
+                        ) {
+                            bandChannel.setText("Crosslink")
+                        }
+                        2 -> if (currentChannel.isBlank() ||
+                            currentChannel.equals("Crosslink", true)
+                        ) {
+                            bandChannel.setText("PC-Only")
+                        }
                     }
                 }
                 override fun onNothingSelected(
