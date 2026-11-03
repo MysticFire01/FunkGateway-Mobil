@@ -57,13 +57,12 @@ object MobileUpdater {
                             .filter {
                                 it.optBoolean("prerelease") &&
                                 !it.optBoolean("draft") &&
-                                Regex("v[0-9]+[.][0-9]+[.][0-9]+-test")
+                                Regex("v[0-9]+[.][0-9]+[.][0-9]+")
                                     .matches(it.optString("tag_name"))
                             }
                         candidates.maxByOrNull {
                             val parts = it.getString("tag_name")
                                 .removePrefix("v")
-                                .removeSuffix("-test")
                                 .split(".")
                                 .map(String::toLong)
                             parts[0] * 1000000L +
@@ -75,7 +74,6 @@ object MobileUpdater {
 
                     val tag = json.getString("tag_name")
                     val code = tag.removePrefix("v")
-                        .removeSuffix(if (testChannel) "-test" else "")
                         .split(".")
                         .let { parts ->
                             require(parts.size == 3) {
@@ -84,6 +82,9 @@ object MobileUpdater {
                             val numbers = parts.map { it.toInt() }
                             require(numbers.all { it in 0..999 }) {
                                 "Ungültige Versionsnummer"
+                            }
+                            require(numbers[0] == 0 && numbers[1] <= 99) {
+                                "Versionsnummer außerhalb des Android-Codebereichs"
                             }
                             numbers[0] * 1000000 +
                                 numbers[1] * 1000 + numbers[2]
