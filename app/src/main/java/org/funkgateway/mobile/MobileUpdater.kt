@@ -57,12 +57,13 @@ object MobileUpdater {
                             .filter {
                                 it.optBoolean("prerelease") &&
                                 !it.optBoolean("draft") &&
-                                Regex("v[0-9]+[.][0-9]+[.][0-9]+")
+                                Regex("v[0-9]+[.][0-9]+[.][0-9]+-test")
                                     .matches(it.optString("tag_name"))
                             }
                         candidates.maxByOrNull {
                             val parts = it.getString("tag_name")
                                 .removePrefix("v")
+                                .removeSuffix("-test")
                                 .split(".")
                                 .map(String::toLong)
                             parts[0] * 1000000L +
@@ -74,6 +75,7 @@ object MobileUpdater {
 
                     val tag = json.getString("tag_name")
                     val code = tag.removePrefix("v")
+                        .removeSuffix(if (testChannel) "-test" else "")
                         .split(".")
                         .let { parts ->
                             require(parts.size == 3) {
