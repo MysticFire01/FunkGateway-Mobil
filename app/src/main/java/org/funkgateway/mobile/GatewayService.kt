@@ -196,14 +196,338 @@ class GatewayService : Service() {
     }
 
     /**
+     * Überträgt bereits dekodiertes FRN-PCM an Mumble.
+     * Die Sitzung wird bei jedem Bridge-Neustart ungültig.
+     */
+    private fun runFrnToMumbleBridge(
+        session: Long,
+        manager: MumbleConnectionManager
+    ) {
+        Thread({
+            // Humla/Opus erwartet exakt 480 Samples bei 48 kHz.
+            // Der Puffer gehört ausschließlich zu dieser FRN-Sprechphase.
+            val opusFrameSize = 480
+            val pending = ShortArray(opusFrameSize)
+            var pendingCount = 0
+
+            try {
+                bridgeLoop@ while (bridgeFrnToMumbleQueue.isActive(session)) {
+                    val frame = bridgeFrnToMumbleQueue.poll() ?: continue
+                    if (!bridgeFrnToMumbleQueue.isActive(session)) break
+
+                    val pcm48 =
+                        org.funkgateway.mobile.audio.PcmResampler
+                            .frnToMumble(frame.pcm)
+
+                    var offset = 0
+                    while (offset < pcm48.size) {
+                        if (!bridgeFrnToMumbleQueue.isActive(session)) {
+                            break@bridgeLoop
+                        }
+
+                        val count = minOf(
+                            opusFrameSize - pendingCount,
+                            pcm48.size - offset
+                        )
+
+                        System.arraycopy(
+                            pcm48, offset,
+                            pending, pendingCount,
+                            count
+                        )
+
+                        pendingCount += count
+                        offset += count
+
+                        if (pendingCount == opusFrameSize) {
+                            val submitted = synchronized(bridgeMumbleAudioLock) {
+                                if (bridgeFrnToMumbleQueue.isActive(session)) {
+                                    manager.submitBridgeAudio(
+                                        pending.copyOf(),
+                                        opusFrameSize
+                                    )
+                                } else {
+                                    null
+                                }
+                            }
+
+                            if (submitted == null) break@bridgeLoop
+
+                            if (!submitted) {
+                                android.util.Log.w(
+                                    "FunkGateway-Bridge",
+                                    "FRN-PCM konnte nicht an Mumble übergeben werden"
+                                )
+                                break@bridgeLoop
+                            }
+
+                            pendingCount = 0
+                        }
+                    }
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (e: Exception) {
+                android.util.Log.e(
+                    "FunkGateway-Bridge",
+                    "FRN-Mumble-Audio-Worker fehlgeschlagen",
+                    e
+                )
+            }
+        }, "Bridge-FRN-Mumble").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * Verarbeitet Mumble-PCM direkt für FRN.
+     * Noch keine Netzwerkübertragung: zunächst Codec und Audioweg prüfen.
+     */
+    /**
+     * Rücklaufschutz: Mumble darf nicht nach FRN senden,
+     * solange FRN bereits zur Mumble-Seite spricht.
+     */
+    @Synchronized
+    private fun canBridgeMumbleToFrn(session: Long): Boolean =
+        !serviceDestroyed &&
+        voipBridgeActive &&
+        bridgeMumbleToFrnQueue.isActive(session) &&
+        bridgeFrnSpeakerIndex == null &&
+        frnParticipants.activeIndex == null &&
+        !globalMuted
+
+    private fun runMumbleToFrnBridge(session: Long) {
+        Thread({
+            val resampler =
+                org.funkgateway.mobile.audio.StreamingPcmResampler()
+            val encoder =
+                org.funkgateway.mobile.audio.FrnBridgeEncoder()
+
+            var speechActive = false
+            var lastSpeechAt = 0L
+            var speechCandidateAt = 0L
+
+            try {
+                while (bridgeMumbleToFrnQueue.isActive(session)) {
+                    val frame = bridgeMumbleToFrnQueue.poll()
+
+                    if (!bridgeMumbleToFrnQueue.isActive(session)) break
+
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    val permitted = canBridgeMumbleToFrn(session)
+
+                    if (speechActive &&
+                        (!permitted || now - lastSpeechAt >= 1_000L)
+                    ) {
+                        if (!permitted) {
+                            android.util.Log.w(
+                                "FunkGateway-Bridge",
+                                "Mumble-FRN: PTT-Abbruch durch Rücklaufschutz" +
+                                    ", FRN-Sprecher=" + frnParticipants.activeIndex +
+                                    ", Bridge-Sprecher=" + bridgeFrnSpeakerIndex +
+                                    ", Bridge-PTT=" + bridgeFrnPttActive +
+                                    ", PTT=" + pttState +
+                                    ", Stumm=" + globalMuted
+                            )
+                        }
+                        speechActive = false
+                        synchronized(this@GatewayService) {
+                            if (bridgeFrnPttActive) stopPtt()
+                        }
+                        android.util.Log.i(
+                            "FunkGateway-Bridge",
+                            "Mumble-FRN: SPRACHE ENDET (Nachlauf)"
+                        )
+                    }
+
+                    if (frame == null) continue
+
+                    val pcm8 = resampler.process(frame.pcm)
+                    if (!bridgeMumbleToFrnQueue.isActive(session)) break
+
+                    if (pcm8.isNotEmpty()) {
+                        val averageLevel = pcm8.sumOf {
+                            kotlin.math.abs(it.toInt()).toLong()
+                        } / pcm8.size
+
+                        android.util.Log.d(
+                            "FunkGateway-Bridge",
+                            "Mumble-FRN: PCM-Pegel=" + averageLevel +
+                                ", Samples=" + pcm8.size
+                        )
+
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val permitted = canBridgeMumbleToFrn(session)
+
+                        if (permitted && averageLevel >= 250L) {
+                            lastSpeechAt = now
+                            if (!speechActive) {
+                                if (speechCandidateAt == 0L) {
+                                    speechCandidateAt = now
+                                }
+                                if (now - speechCandidateAt >= 150L &&
+                                    bridgeMumbleToFrnQueue.isActive(session) &&
+                                    canBridgeMumbleToFrn(session)
+                                ) {
+                                    if (startBridgeFrnPtt()) {
+                                        speechActive = true
+                                        android.util.Log.i(
+                                            "FunkGateway-Bridge",
+                                            "Mumble-FRN: TX0 angefordert"
+                                        )
+                                        android.util.Log.i(
+                                            "FunkGateway-Bridge",
+                                            "Mumble-FRN: SPRACHE BEGINNT"
+                                        )
+                                    }
+                                }
+                            }
+                        } else if (speechActive &&
+                            (!permitted || now - lastSpeechAt >= 1_000L)
+                        ) {
+                            speechActive = false
+                            synchronized(this@GatewayService) {
+                                if (bridgeFrnPttActive) stopPtt()
+                            }
+                            android.util.Log.i(
+                                "FunkGateway-Bridge",
+                                "Mumble-FRN: SPRACHE ENDET"
+                            )
+                        }
+                        if (!permitted || averageLevel < 250L) {
+                            if (!speechActive) speechCandidateAt = 0L
+                        }
+                    }
+
+                    val packets = encoder.encode(pcm8)
+                    if (!bridgeMumbleToFrnQueue.isActive(session)) break
+
+                    for (packet in packets) {
+                        if (!bridgeMumbleToFrnQueue.isActive(session)) break
+                        if (packet.size != 325) continue
+
+                        val tx = synchronized(this@GatewayService) {
+                            val connection = frnConnection
+                            if (speechActive &&
+                                connection != null &&
+                                canBridgeMumbleToFrn(session) &&
+                                isPttSessionValidForBridge(pttSessionId, connection)
+                            ) {
+                                Pair(connection, pttSessionId)
+                            } else null
+                        } ?: continue
+
+                        queuePttAudio {
+                            val valid = synchronized(this@GatewayService) {
+                                canBridgeMumbleToFrn(session) &&
+                                    isPttSessionValidForBridge(tx.second, tx.first)
+                            }
+                            if (valid) {
+                                try {
+                                    tx.first.sendAudioPacket(packet)
+                                } catch (e: Exception) {
+                                    android.util.Log.e(
+                                        "FunkGateway-Bridge",
+                                        "Mumble-FRN: GSM-Senden fehlgeschlagen",
+                                        e
+                                    )
+                                    mainHandler.post {
+                                        synchronized(this@GatewayService) {
+                                            if (isPttSessionValidForBridge(
+                                                    tx.second, tx.first
+                                                )) stopPtt()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (e: Exception) {
+                android.util.Log.e(
+                    "FunkGateway-Bridge",
+                    "Mumble-FRN-Audio-Worker fehlgeschlagen",
+                    e
+                )
+            } finally {
+                encoder.close()
+            }
+        }, "Bridge-Mumble-FRN").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * Beendet die aktuelle FRN-Sprechphase.
+     * Die Bridge-Verbindungen bleiben bestehen.
+     */
+    @Synchronized
+    private fun resetFrnToMumbleBridgeAudio() {
+        bridgeFrnSpeakerIndex = null
+        bridgeFrnToMumbleQueue.stop()
+        frnAudio?.setPcmListener(null)
+        frnAudio?.clearPendingPackets()
+        synchronized(bridgeMumbleAudioLock) {
+            mumbleManager?.stopBridgeAudio()
+        }
+    }
+
+    /**
+     * Aktiviert die FRN-Mumble-Verlinkung.
+     * Die Audio-Worker werden anschließend separat angeschlossen.
+     */
+    @Synchronized
+    fun startVoipBridge(): Boolean {
+        if (serviceDestroyed || voipBridgeActive || globalMuted ||
+            pttState != PttState.IDLE || pttReleasePending ||
+            frnConnection == null || frnConnecting ||
+            mumbleManager?.isConnected() != true) return false
+
+        val manager = mumbleManager ?: return false
+        if (!manager.setBridgeAudioEnabled(true)) return false
+
+        // Noch keinen FRN-Audio-Worker starten.
+        // Jede Aussendung erhält ihre eigene Sitzung.
+        bridgeFrnSpeakerIndex = null
+        bridgeFrnToMumbleQueue.stop()
+        frnAudio?.setPcmListener(null)
+
+        val mumbleSession = bridgeMumbleToFrnQueue.start()
+        bridgeSessionGeneration++
+        voipBridgeActive = true
+
+        manager.setBridgePcmListener { pcm ->
+            if (bridgeMumbleToFrnQueue.isActive(mumbleSession)) {
+                bridgeMumbleToFrnQueue.offer(mumbleSession, pcm)
+            }
+        }
+
+        runMumbleToFrnBridge(mumbleSession)
+        return true
+    }
+
+    @Synchronized
+    fun isVoipBridgeActive(): Boolean = voipBridgeActive
+
+    /**
      * Beendet die automatische VoIP-Verlinkung.
      * Bestehende FRN- und Mumble-Verbindungen bleiben erhalten.
      */
+    @Synchronized
+    fun stopVoipBridgeManually() {
+        stopVoipBridge()
+    }
+
     @Synchronized
     private fun stopVoipBridge() {
         // Zuerst alle alten Bridge-Audiositzungen ungültig machen.
         voipBridgeActive = false
         bridgeSessionGeneration++
+        bridgeFrnSpeakerIndex = null
         bridgeFrnToMumbleQueue.stop()
         bridgeMumbleToFrnQueue.stop()
 
@@ -216,7 +540,9 @@ class GatewayService : Service() {
         }
 
         mumbleManager?.setBridgePcmListener(null)
-        mumbleManager?.stopBridgeAudio()
+        synchronized(bridgeMumbleAudioLock) {
+            mumbleManager?.stopBridgeAudio()
+        }
         mumbleManager?.setBridgeAudioEnabled(false)
     }
 
@@ -315,6 +641,13 @@ class GatewayService : Service() {
 
     private var bridgeSessionGeneration = 0L
     private var voipBridgeActive = false
+
+    // Sprecherkennung ausschließlich für den FRN-Mumble-Audioweg.
+    // Zugriff erfolgt unter dem GatewayService-Monitor.
+    private var bridgeFrnSpeakerIndex: Int? = null
+
+    // Gemeinsame Sperre für Mumble-Audioübergabe und Sendeende.
+    private val bridgeMumbleAudioLock = Any()
 
 
 
@@ -443,9 +776,13 @@ class GatewayService : Service() {
 
         queuePttNetwork {
             if (isBridgeFrnPttSessionValid(bridgeSession) &&
-                isPttSessionValidForBridge(pttSession, connection)) {
+                isBridgeFrnPttRequestValid(pttSession, connection)) {
                 try {
                     connection.send("TX0")
+                    android.util.Log.i(
+                        "FunkGateway-Bridge",
+                        "FRN TX0 erfolgreich geschrieben"
+                    )
                 } catch (e: Exception) {
                     android.util.Log.e(
                         "FunkGateway-Bridge", "FRN TX0 fehlgeschlagen", e
@@ -458,6 +795,20 @@ class GatewayService : Service() {
                 }
             }
         }
+
+        mainHandler.postDelayed({
+            synchronized(this) {
+                if (isBridgeFrnPttSessionValid(bridgeSession) &&
+                    pttSession == pttSessionId &&
+                    pttState == PttState.REQUESTING) {
+                    android.util.Log.w(
+                        "FunkGateway-Bridge",
+                        "FRN TX0: keine Sendefreigabe innerhalb von 3 Sekunden"
+                    )
+                    stopPtt()
+                }
+            }
+        }, 3_000L)
 
         mainHandler.postDelayed({
             synchronized(this) {
@@ -477,6 +828,17 @@ class GatewayService : Service() {
     }
 
     @Synchronized
+    private fun isBridgeFrnPttRequestValid(
+        session: Long,
+        connection: FrnConnection
+    ): Boolean =
+        !serviceDestroyed &&
+        session == pttSessionId &&
+        frnConnection === connection &&
+        bridgeFrnPttActive &&
+        pttState == PttState.REQUESTING
+
+    @Synchronized
     private fun isPttSessionValidForBridge(
         session: Long,
         connection: FrnConnection
@@ -485,7 +847,7 @@ class GatewayService : Service() {
         session == pttSessionId &&
         frnConnection === connection &&
         bridgeFrnPttActive &&
-        pttState != PttState.IDLE
+        pttState == PttState.TRANSMITTING
 
     @Synchronized
     fun startPtt(): Boolean {
@@ -620,6 +982,10 @@ class GatewayService : Service() {
             queuePttNetwork {
                 try {
                     connection.send("RX0")
+                    android.util.Log.i(
+                        "FunkGateway-PTT",
+                        "FRN RX0 erfolgreich geschrieben"
+                    )
                     synchronized(this) {
                         if (frnConnection === connection &&
                             pttSessionId == releaseSession
@@ -805,7 +1171,7 @@ class GatewayService : Service() {
                         is FrnEvent.ClientList -> {
                             frnParticipants = FrnParticipants(
                                 entries = event.entries.toList(),
-                                activeIndex = event.activeIndex
+                                activeIndex = event.activeIndex.takeIf { it != 0 }
                             )
                         }
                         is FrnEvent.ServerList -> {
@@ -983,6 +1349,13 @@ class GatewayService : Service() {
                         onEvent = { event ->
                             if (event is FrnEvent.TxGranted) {
                                 synchronized(this) {
+                                    android.util.Log.i(
+                                        "FunkGateway-Bridge",
+                                        "FRN TxGranted empfangen: index=" +
+                                            event.index +
+                                            ", bridgePTT=" + bridgeFrnPttActive +
+                                            ", pttState=" + pttState
+                                    )
                                     if (!serviceDestroyed &&
                                         generation == frnGeneration &&
                                         frnConnection === activeConnection &&
@@ -1049,7 +1422,39 @@ class GatewayService : Service() {
                                         generation == frnGeneration &&
                                         frnAudio === audioReceiver
                                     ) {
+                                        if (voipBridgeActive &&
+                                            bridgeFrnSpeakerIndex != event.index
+                                        ) {
+                                            resetFrnToMumbleBridgeAudio()
+
+                                            val manager = mumbleManager
+                                            if (manager?.isConnected() == true) {
+                                                val session =
+                                                    bridgeFrnToMumbleQueue.start()
+
+                                                bridgeFrnSpeakerIndex = event.index
+
+                                                audioReceiver.setPcmListener { pcm ->
+                                                    if (bridgeFrnToMumbleQueue.isActive(session)) {
+                                                        bridgeFrnToMumbleQueue.offer(session, pcm)
+                                                    }
+                                                }
+
+                                                runFrnToMumbleBridge(session, manager)
+                                            }
+                                        }
+
                                         audioReceiver.receive(event.packet)
+                                    }
+                                }
+                            } else if (event is FrnEvent.Idle) {
+                                synchronized(this) {
+                                    if (!serviceDestroyed &&
+                                        generation == frnGeneration &&
+                                        frnAudio === audioReceiver &&
+                                        voipBridgeActive
+                                    ) {
+                                        resetFrnToMumbleBridgeAudio()
                                     }
                                 }
                             }

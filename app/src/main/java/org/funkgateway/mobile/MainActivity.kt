@@ -2946,6 +2946,66 @@ class MainActivity : Activity() {
             showAboutMobile()
             return
         }
+        if (name == "Verlinkung") {
+            root.addView(label("🔗 FRN ↔ Mumble", 26f, Color.WHITE, true))
+
+            val frnStatus = label("", 17f, Color.WHITE)
+            val mumbleBridgeStatus = label("", 17f, Color.WHITE)
+            val bridgeStatus = label("", 18f, Color.WHITE, true)
+
+            listOf(frnStatus, mumbleBridgeStatus, bridgeStatus).forEach {
+                it.setPadding(0, dp(12), 0, dp(12))
+                root.addView(it)
+            }
+
+            val startButton = button("▶ Verlinkung starten") {
+                val started = gatewayService?.startVoipBridge() == true
+                Toast.makeText(
+                    this,
+                    if (started) "FRN-Mumble-Verlinkung gestartet"
+                    else "Start nicht möglich. Beide Dienste müssen verbunden sein.",
+                    Toast.LENGTH_LONG
+                ).show()
+                showPage("Verlinkung")
+            }
+
+            val stopButton = button("■ Verlinkung stoppen") {
+                gatewayService?.stopVoipBridgeManually()
+                showPage("Verlinkung")
+            }
+
+            val service = gatewayService
+            val frnReady = service?.getConnectedFrnRoom() != null
+            val mumbleReady = mumbleManager?.isConnected() == true
+            val active = service?.isVoipBridgeActive() == true
+
+            frnStatus.text = if (frnReady) "🟢 FRN verbunden"
+                else "🔴 FRN nicht verbunden"
+            mumbleBridgeStatus.text = if (mumbleReady) "🟢 Mumble verbunden"
+                else "🔴 Mumble nicht verbunden"
+            bridgeStatus.text = if (active) "🟢 Verlinkung aktiv"
+                else "⚪ Verlinkung ausgeschaltet"
+
+            startButton.isEnabled = frnReady && mumbleReady && !active
+            stopButton.isEnabled = active
+
+            root.addView(startButton, LinearLayout.LayoutParams(-1, dp(64)))
+            root.addView(stopButton, LinearLayout.LayoutParams(-1, dp(64)))
+            root.addView(button("↻ Status aktualisieren") {
+                showPage("Verlinkung")
+            }, LinearLayout.LayoutParams(-1, dp(56)))
+            root.addView(button("← Zurück zur Übersicht") {
+                showHome()
+            }, LinearLayout.LayoutParams(-1, dp(64)))
+
+            showGatewayScreen(
+                ScrollView(this).apply {
+                    isFillViewport = true
+                    addView(root)
+                }
+            )
+            return
+        }
         root.addView(label(name, 26f, Color.WHITE, true))
         root.addView(label(
             "Dieser Bereich wird in einer der nächsten Versionen eingerichtet.",

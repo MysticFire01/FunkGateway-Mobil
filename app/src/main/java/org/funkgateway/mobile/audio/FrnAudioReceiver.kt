@@ -21,6 +21,11 @@ class FrnAudioReceiver : Closeable {
         pcmListener = listener
     }
 
+    private val packetGeneration =
+        java.util.concurrent.atomic.AtomicLong(0)
+
+    private val callbackLock = Any()
+
     private val running = AtomicBoolean(true)
     private val deafened = AtomicBoolean(false)
 
@@ -32,7 +37,12 @@ class FrnAudioReceiver : Closeable {
             player.clear()
         }
     }
-    private val packets = LinkedBlockingDeque<ByteArray>(4)
+    private data class QueuedPacket(
+        val data: ByteArray,
+        val generation: Long
+    )
+
+    private val packets = LinkedBlockingDeque<QueuedPacket>(4)
     private val player = PcmAudioPlayer(GsmWav49Codec.SAMPLE_RATE)
 
     fun setVolume(value: Float) {
@@ -53,12 +63,14 @@ class FrnAudioReceiver : Closeable {
                     break
                 } ?: continue
 
+                val generation = packet.generation
+                if (generation != packetGeneration.get()) continue
                 if (!running.get()) break
                 if (deafened.get()) continue
 
                 try {
-                    val pcm = codec.decode(packet)
-                    if (running.get() && !deafened.get()) {
+                    val pcm = codec.decode(packet.data)
+                    if (running.get() && !deafened.get() && generation == packetGeneration.get()) {
                         try {
                             val listener = pcmListener
                             if (listener != null && pcm.size == GsmWav49Codec.PCM_BYTES) {
@@ -67,7 +79,15 @@ class FrnAudioReceiver : Closeable {
                                     val hi = pcm[i * 2 + 1].toInt() and 0xff
                                     ((hi shl 8) or lo).toShort()
                                 }
-                                listener(samples)
+                                synchronized(callbackLock) {
+                                    if (running.get() &&
+                                        !deafened.get() &&
+                                        generation == packetGeneration.get() &&
+                                        pcmListener === listener
+                                    ) {
+                                        listener(samples)
+                                    }
+                                }
                             }
                         } catch (e: Exception) {
                             Log.w("FunkGateway", "FRN-PCM-Callback fehlgeschlagen", e)
@@ -104,13 +124,30 @@ class FrnAudioReceiver : Closeable {
         if (!running.get() || deafened.get()) return
         if (packet.size != GsmWav49Codec.PACKET_BYTES) return
 
-        val copy = packet.copyOf()
+        val copy = QueuedPacket(
+            packet.copyOf(),
+            packetGeneration.get()
+        )
 
         if (!running.get()) return
 
         if (!packets.offerLast(copy)) {
             packets.pollFirst()
             packets.offerLast(copy)
+        }
+    }
+
+    /**
+     * Verwirft noch nicht dekodierte FRN-Audiopakete.
+     * Der Decoder und die FRN-Verbindung laufen weiter.
+     *
+     * Ein bereits vom Decoder entnommenes Paket wird dadurch
+     * nicht nachträglich gestoppt.
+     */
+    fun clearPendingPackets() {
+        synchronized(callbackLock) {
+            packetGeneration.incrementAndGet()
+            packets.clear()
         }
     }
 
