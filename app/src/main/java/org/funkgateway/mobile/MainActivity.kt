@@ -297,6 +297,58 @@ class MainActivity : Activity() {
             Toast.LENGTH_LONG
         ).show()
     }
+    private var mumbleStartupPending = false
+
+    private fun startMumbleOnStartupIfRequested() {
+        if (!mumbleStartupPending) return
+        mumbleStartupPending = false
+
+        if (!ReconnectSettings.load(this).mumbleConnectOnStart) return
+
+        try {
+            val saved = MumbleConnectionStore.load(this)
+            if (saved.host.isBlank() || saved.username.isBlank() ||
+                saved.port !in 1..65535
+            ) {
+                android.util.Log.w(
+                    "FunkGateway-Mumble",
+                    "Autostart übersprungen: keine gültige Standardverbindung"
+                )
+                return
+            }
+
+            mumbleHost = saved.host
+            mumblePort = saved.port.toString()
+            mumbleUsername = saved.username
+            mumblePassword = saved.password
+
+            val manager = getOrCreateMumbleManager()
+            if (!manager.hasActiveConnectionAttempt()) {
+                val startIntent = Intent(
+                    this, GatewayService::class.java
+                ).apply {
+                    action = GatewayService.ACTION_START
+                }
+                startForegroundService(startIntent)
+
+                manager.connect(
+                    saved.host, saved.port, saved.username, saved.password
+                )
+            } else {
+                android.util.Log.i(
+                    "FunkGateway-Mumble",
+                    "Autostart übersprungen: Verbindung oder Reconnect aktiv"
+                )
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(
+                "FunkGateway-Mumble",
+                "Mumble-Autostart fehlgeschlagen",
+                e
+            )
+        }
+    }
+
     private var gatewayBound = false
     private var refreshPttBar: (() -> Unit)? = null
     private var refreshGlobalAudioControls: (() -> Unit)? = null
@@ -311,7 +363,23 @@ class MainActivity : Activity() {
         ) {
             gatewayService =
                 (binder as? GatewayService.LocalBinder)?.getService()
-            gatewayService?.setMumbleManager(mumbleManager)
+            val existingMumbleManager =
+                gatewayService?.getMumbleManager()
+
+            if (existingMumbleManager != null) {
+                if (mumbleManager !== existingMumbleManager) {
+                    mumbleManager?.release()
+                }
+                mumbleManager = existingMumbleManager
+                mumbleOwnedByGatewayService = true
+                attachMumbleUiCallbacks(existingMumbleManager)
+            } else {
+                gatewayService?.setMumbleManager(mumbleManager)
+                mumbleOwnedByGatewayService =
+                    gatewayService != null && mumbleManager != null
+            }
+
+            startMumbleOnStartupIfRequested()
 
             val audioPrefs = getSharedPreferences(
                 "funkgateway_audio",
@@ -355,9 +423,18 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        gatewayService?.setMumbleManager(null)
-        mumbleManager?.release()
+        mumbleManager?.let { manager ->
+            manager.clearUiCallbacks(this)
+
+            if (!mumbleOwnedByGatewayService) {
+                manager.release()
+            }
+        }
+
         mumbleManager = null
+        mumbleOwnedByGatewayService = false
+        mumbleStatusView = null
+
         super.onDestroy()
     }
 
@@ -2884,7 +2961,63 @@ class MainActivity : Activity() {
         showGatewayScreen(root)
     }
 
+    private var mumbleStatusView: android.widget.TextView? = null
+
+    private fun attachMumbleUiCallbacks(
+        manager: MumbleConnectionManager
+    ) {
+        manager.setUiCallbacks(
+            statusCallback = { message ->
+                runOnUiThread {
+                    mumbleStatus = message
+                    if (currentPage == "Mumble") {
+                        mumbleStatusView?.text = "Status: $message"
+                    }
+                }
+            },
+            certificateCallback = { host, port, certificate ->
+                runOnUiThread {
+                    if (mumbleManager === manager) {
+                        showMumbleCertificateDialog(
+                            manager, host, port, certificate
+                        )
+                    }
+                }
+            },
+            owner = this
+        )
+
+        manager.getPendingCertificateRequest()?.let { pending ->
+            runOnUiThread {
+                if (mumbleManager === manager) {
+                    showMumbleCertificateDialog(
+                        manager,
+                        pending.host,
+                        pending.port,
+                        pending.certificate
+                    )
+                }
+            }
+        }
+    }
+
+    private fun getOrCreateMumbleManager(): MumbleConnectionManager {
+        mumbleManager?.let { return it }
+
+        return MumbleConnectionManager(
+            applicationContext,
+            onStatusChanged = {},
+            onCertificateUntrusted = { _, _, _ -> }
+        ).also { manager ->
+            mumbleManager = manager
+            attachMumbleUiCallbacks(manager)
+            gatewayService?.setMumbleManager(manager)
+            mumbleOwnedByGatewayService = gatewayService != null
+        }
+    }
+
     private var mumbleManager: MumbleConnectionManager? = null
+    private var mumbleOwnedByGatewayService = false
     private var mumbleStatus = "Getrennt"
     private var mumbleHost = ""
     private var mumblePort = "64738"
@@ -2977,6 +3110,24 @@ class MainActivity : Activity() {
     private fun showMumble() {
         currentPage = "Mumble"
 
+        if (mumbleHost.isBlank()) {
+            try {
+                val saved = MumbleConnectionStore.load(this)
+                if (saved.host.isNotBlank()) {
+                    mumbleHost = saved.host
+                    mumblePort = saved.port.toString()
+                    mumbleUsername = saved.username
+                    mumblePassword = saved.password
+                }
+            } catch (e: Exception) {
+                android.util.Log.e(
+                    "FunkGateway",
+                    "Gespeicherte Mumble-Verbindung konnte nicht geladen werden",
+                    e
+                )
+            }
+        }
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(28), dp(20), dp(20))
@@ -3013,6 +3164,53 @@ class MainActivity : Activity() {
             mumbleUsername.ifBlank { getDefaultMumbleUsername() }
         )
         val password = field("Passwort", mumblePassword, true)
+
+        root.addView(button("💾 Als Standardverbindung speichern") {
+            val address = host.text.toString().trim()
+            val number = port.text.toString().toIntOrNull()
+            val user = username.text.toString().trim()
+
+            if (address.isBlank() || number == null ||
+                number !in 1..65535 || user.isBlank()
+            ) {
+                android.widget.Toast.makeText(
+                    this,
+                    "Bitte Server, gültigen Port und Benutzernamen eingeben",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            } else {
+                try {
+                    val connection = MumbleSavedConnection(
+                        host = address,
+                        port = number,
+                        username = user,
+                        password = password.text.toString()
+                    )
+                    MumbleConnectionStore.save(this, connection)
+                    mumbleHost = address
+                    mumblePort = number.toString()
+                    mumbleUsername = user
+                    mumblePassword = connection.password
+
+                    android.widget.Toast.makeText(
+                        this,
+                        "Mumble-Standardverbindung sicher gespeichert",
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                } catch (e: Exception) {
+                    android.util.Log.e(
+                        "FunkGateway",
+                        "Mumble-Standardverbindung konnte nicht gespeichert werden",
+                        e
+                    )
+                    android.widget.Toast.makeText(
+                        this,
+                        "Speichern fehlgeschlagen",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        })
 
         root.addView(button("👤 Standard-Benutzername einstellen") {
             val input = android.widget.EditText(this).apply {
@@ -3125,23 +3323,8 @@ class MainActivity : Activity() {
             mumblePassword = password.text.toString()
         }
 
-        val manager = mumbleManager ?: MumbleConnectionManager(this, onStatusChanged = { message ->
-            mumbleStatus = message
-            runOnUiThread {
-                if (currentPage == "Mumble") {
-                    status.text = "Status: $message"
-                }
-            }
-        }, onCertificateUntrusted = { host, port, certificate ->
-            runOnUiThread {
-                mumbleManager?.let { manager ->
-                    showMumbleCertificateDialog(manager, host, port, certificate)
-                }
-            }
-        }).also {
-            mumbleManager = it
-            gatewayService?.setMumbleManager(it)
-        }
+        mumbleStatusView = status
+        val manager = getOrCreateMumbleManager()
 
         root.addView(button("🔗 Verbinden") {
             saveInputs()
@@ -3150,6 +3333,13 @@ class MainActivity : Activity() {
                 mumbleStatus = "Ungültiger Port"
                 status.text = "Status: $mumbleStatus"
             } else {
+                val startIntent = Intent(
+                    this, GatewayService::class.java
+                ).apply {
+                    action = GatewayService.ACTION_START
+                }
+                startForegroundService(startIntent)
+
                 manager.connect(mumbleHost, portNumber, mumbleUsername, mumblePassword)
             }
         })
@@ -3157,6 +3347,7 @@ class MainActivity : Activity() {
         root.addView(button("⛔ Trennen") {
             saveInputs()
             manager.disconnect()
+            gatewayService?.stopIfIdle()
         })
 
         root.addView(button("← Zurück zur Übersicht") {
@@ -4355,6 +4546,9 @@ class MainActivity : Activity() {
         root.addView(button("🎧 Mumble · Verbindung") {
             showPage("Mumble-Einstellungen")
         })
+        root.addView(button("🔄 Automatische Wiederverbindung") {
+            showReconnectSettings()
+        })
         root.addView(button("Zello · Verbindung (später)") {
             showPage("Zello-Einstellungen")
         })
@@ -4380,6 +4574,113 @@ class MainActivity : Activity() {
             showSoftwareUpdate()
         })
         root.addView(button("← Zurück zur Übersicht") { showHome() })
+        showGatewayScreen(ScrollView(this).apply { addView(root) })
+    }
+
+
+    private fun showReconnectSettings() {
+        currentPage = "Automatische Wiederverbindung"
+        val saved = ReconnectSettings.load(this)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("🔄 Automatische Wiederverbindung", 24f, Color.WHITE, true))
+        root.addView(label(
+            "Bei einem technischen Verbindungsabbruch kann FunkGateway die Verbindung erneut aufbauen.",
+            14f, muted
+        ))
+
+        fun option(title: String, checked: Boolean): android.widget.CheckBox {
+            return android.widget.CheckBox(this).apply {
+                text = title
+                setTextColor(Color.WHITE)
+                isChecked = checked
+                setPadding(0, dp(8), 0, dp(8))
+                root.addView(this)
+            }
+        }
+
+        root.addView(label("Wiederverbindung", 19f, accent, true).apply {
+            setPadding(0, dp(22), 0, dp(8))
+        })
+        val frnReconnect = option("FRN automatisch wiederverbinden", saved.frnEnabled)
+        val mumbleReconnect = option("Mumble automatisch wiederverbinden", saved.mumbleEnabled)
+
+        root.addView(label("Automatisch beim App-Start verbinden", 19f, accent, true).apply {
+            setPadding(0, dp(22), 0, dp(8))
+        })
+        val frnStart = option("FRN beim Start verbinden", saved.frnConnectOnStart)
+        val mumbleStart = option("Mumble beim Start verbinden", saved.mumbleConnectOnStart)
+
+        fun delaySelector(title: String, values: List<Int>, selected: Int): android.widget.Spinner {
+            root.addView(label(title, 15f, muted).apply {
+                setPadding(0, dp(18), 0, dp(6))
+            })
+            return android.widget.Spinner(this).apply {
+                background = rounded(panel)
+                setPopupBackgroundDrawable(rounded(panel))
+                minimumHeight = dp(54)
+                adapter = android.widget.ArrayAdapter(
+                    this@MainActivity,
+                    R.layout.frn_spinner_item,
+                    values.map { "$it Sekunden" }
+                )
+                setSelection(values.indexOf(selected).coerceAtLeast(0))
+                root.addView(this)
+            }
+        }
+
+        val initialValues = listOf(3, 5, 10)
+        val maxValues = listOf(30, 60, 120)
+
+        val initialDelay = delaySelector(
+            "Wartezeit vor dem ersten Versuch",
+            initialValues,
+            saved.initialDelaySeconds
+        )
+        val maxDelay = delaySelector(
+            "Maximale Wartezeit",
+            maxValues,
+            saved.maxDelaySeconds
+        )
+
+        root.addView(label(
+            "Bei wiederholten Fehlern steigt die Wartezeit bis zum eingestellten Maximum. " +
+                "Nach einer Wiederverbindung bleiben PTT und Aussendung ausgeschaltet. " +
+                "Ein manuelles Trennen startet keine Wiederverbindung.",
+            14f, muted
+        ).apply {
+            setPadding(0, dp(20), 0, dp(12))
+        })
+
+        root.addView(button("💾 Einstellungen speichern") {
+            ReconnectSettings.save(
+                this,
+                ReconnectSettings(
+                    frnEnabled = frnReconnect.isChecked,
+                    mumbleEnabled = mumbleReconnect.isChecked,
+                    initialDelaySeconds = initialValues[initialDelay.selectedItemPosition],
+                    maxDelaySeconds = maxValues[maxDelay.selectedItemPosition],
+                    frnConnectOnStart = frnStart.isChecked,
+                    mumbleConnectOnStart = mumbleStart.isChecked
+                )
+            )
+            android.widget.Toast.makeText(
+                this,
+                "Wiederverbindungs-Einstellungen gespeichert",
+                android.widget.Toast.LENGTH_SHORT
+            ).show()
+            showSettings()
+        })
+
+        root.addView(button("← Zurück zu Einstellungen") {
+            showSettings()
+        })
+
         showGatewayScreen(ScrollView(this).apply { addView(root) })
     }
 
@@ -5980,6 +6281,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        mumbleStartupPending =
+            savedInstanceState == null &&
+            ReconnectSettings.load(this).mumbleConnectOnStart
         window.statusBarColor = bg
         window.navigationBarColor = bg
 

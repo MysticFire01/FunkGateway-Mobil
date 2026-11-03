@@ -111,15 +111,25 @@ class GatewayService : Service() {
 
     @Synchronized
     private fun hasActiveGatewayWork(): Boolean {
-        // Weitere Integrationen wie Mumble, Zello und Papageien
-        // werden hier später ergänzt.
-        return frnConnecting || frnConnection != null
+        // Mumble-Verbindungen ebenfalls als aktive Gateway-Arbeit
+        // berücksichtigen. Weitere Integrationen folgen später.
+        return frnConnecting ||
+            frnConnection != null ||
+            mumbleManager?.hasActiveConnectionAttempt() == true
     }
 
     private fun stopForegroundWhenIdle() {
         if (!hasActiveGatewayWork()) {
             stopGatewayForeground()
             stopSelf()
+        }
+    }
+
+    fun stopIfIdle() {
+        mainHandler.post {
+            if (!serviceDestroyed) {
+                stopForegroundWhenIdle()
+            }
         }
     }
 
@@ -160,13 +170,74 @@ class GatewayService : Service() {
     @Synchronized
     fun setMumbleManager(manager: MumbleConnectionManager?) {
         if (mumbleManager === manager) return
+
+        // Alte Bridge vor einem Manager-Wechsel vollständig stoppen.
+        if (voipBridgeActive || bridgeFrnPttActive) {
+            stopVoipBridge()
+        }
+
         if (selectedPttTarget == PttTarget.MUMBLE &&
             pttState != PttState.IDLE) {
             stopPtt()
         }
+        mumbleManager?.onConnectionLost = null
         mumbleManager = manager
+
+        manager?.let { activeManager ->
+            activeManager.onConnectionLost = {
+                mainHandler.post {
+                    onMumbleConnectionLost(activeManager)
+                }
+            }
+        }
+
         manager?.setPlaybackVolume(mumbleVolume / 100f)
         manager?.setPlaybackDeafened(globalDeafened)
+    }
+
+    /**
+     * Beendet die automatische VoIP-Verlinkung.
+     * Bestehende FRN- und Mumble-Verbindungen bleiben erhalten.
+     */
+    @Synchronized
+    private fun stopVoipBridge() {
+        // Zuerst alle alten Bridge-Audiositzungen ungültig machen.
+        voipBridgeActive = false
+        bridgeSessionGeneration++
+        bridgeFrnToMumbleQueue.stop()
+        bridgeMumbleToFrnQueue.stop()
+
+        // FRN-Empfang bleibt aktiv, aber nicht mehr zur Bridge.
+        frnAudio?.setPcmListener(null)
+
+        // Danach automatische Sendungen freigeben.
+        if (bridgeFrnPttActive) {
+            stopPtt()
+        }
+
+        mumbleManager?.setBridgePcmListener(null)
+        mumbleManager?.stopBridgeAudio()
+        mumbleManager?.setBridgeAudioEnabled(false)
+    }
+
+    /**
+     * Sicherheitsstopp bei unerwartetem Mumble-Verbindungsverlust.
+     * Die bestehende FRN-Verbindung bleibt erhalten.
+     */
+    @Synchronized
+    fun onMumbleConnectionLost(manager: MumbleConnectionManager) {
+        if (mumbleManager !== manager) return
+
+        if (voipBridgeActive || bridgeFrnPttActive) {
+            stopVoipBridge()
+        }
+
+        if (selectedPttTarget == PttTarget.MUMBLE &&
+            pttState != PttState.IDLE) {
+            manager.stopTalking()
+            resetPttState()
+            pttReleasePending = false
+        }
     }
 
     @Synchronized
@@ -224,10 +295,39 @@ class GatewayService : Service() {
 
     private var pttState = PttState.IDLE
     private var frnAudioSender: FrnAudioSender? = null
+
+    /**
+     * Kennzeichnet eine automatische FRN-Sendung der VoIP-Bridge.
+     * Die manuelle Handy-PTT verwendet weiterhin den Mikrofonpfad.
+     */
+    private var bridgeFrnPttActive = false
+    private var bridgeFrnPttSession = 0L
+
+    /**
+     * Getrennte Audiopuffer für beide Richtungen der VoIP-Bridge.
+     * Sitzungswechsel machen alte Audiopakete ungültig.
+     */
+    private val bridgeFrnToMumbleQueue =
+        org.funkgateway.mobile.audio.BridgeAudioQueue()
+
+    private val bridgeMumbleToFrnQueue =
+        org.funkgateway.mobile.audio.BridgeAudioQueue()
+
+    private var bridgeSessionGeneration = 0L
+    private var voipBridgeActive = false
+
+
+
+    @Synchronized
+    private fun isBridgeFrnPttSessionValid(session: Long): Boolean =
+        !serviceDestroyed &&
+        bridgeFrnPttActive &&
+        bridgeFrnPttSession == session
+
     private var pttSessionId = 0L
     private var pttReleasePending = false
     private val pttTimeoutMillis = 180_000L
-    private val pttReleaseTimeoutMillis = 5_000L
+    private val pttReleaseTimeoutMillis = 20_000L
     private val pttNetworkExecutor = java.util.concurrent.ThreadPoolExecutor(
         1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
         java.util.concurrent.LinkedBlockingQueue<Runnable>(),
@@ -279,6 +379,8 @@ class GatewayService : Service() {
     private fun resetPttState() {
         pttState = PttState.IDLE
         pttSessionId++
+        bridgeFrnPttActive = false
+        bridgeFrnPttSession++
         val sender = frnAudioSender
         frnAudioSender = null
         sender?.close()
@@ -321,9 +423,75 @@ class GatewayService : Service() {
         return true
     }
 
+    /**
+     * Fordert FRN-Senderecht für die digitale VoIP-Bridge an.
+     * Startet kein Mikrofon. Audio folgt erst nach TxGranted.
+     */
+    @Synchronized
+    private fun startBridgeFrnPtt(): Boolean {
+        if (serviceDestroyed || globalMuted ||
+            pttState != PttState.IDLE || pttReleasePending ||
+            bridgeFrnPttActive) return false
+
+        val connection = frnConnection ?: return false
+        if (frnConnecting || frnParticipants.activeIndex != null) return false
+
+        bridgeFrnPttActive = true
+        val bridgeSession = ++bridgeFrnPttSession
+        pttState = PttState.REQUESTING
+        val pttSession = ++pttSessionId
+
+        queuePttNetwork {
+            if (isBridgeFrnPttSessionValid(bridgeSession) &&
+                isPttSessionValidForBridge(pttSession, connection)) {
+                try {
+                    connection.send("TX0")
+                } catch (e: Exception) {
+                    android.util.Log.e(
+                        "FunkGateway-Bridge", "FRN TX0 fehlgeschlagen", e
+                    )
+                    mainHandler.post {
+                        if (isBridgeFrnPttSessionValid(bridgeSession)) {
+                            stopPtt()
+                        }
+                    }
+                }
+            }
+        }
+
+        mainHandler.postDelayed({
+            synchronized(this) {
+                if (isBridgeFrnPttSessionValid(bridgeSession) &&
+                    pttSession == pttSessionId &&
+                    pttState != PttState.IDLE) {
+                    android.util.Log.w(
+                        "FunkGateway-Bridge",
+                        "FRN-Bridge-Sendezeitlimit: 180 Sekunden"
+                    )
+                    stopPtt()
+                }
+            }
+        }, pttTimeoutMillis)
+
+        return true
+    }
+
+    @Synchronized
+    private fun isPttSessionValidForBridge(
+        session: Long,
+        connection: FrnConnection
+    ): Boolean =
+        !serviceDestroyed &&
+        session == pttSessionId &&
+        frnConnection === connection &&
+        bridgeFrnPttActive &&
+        pttState != PttState.IDLE
+
     @Synchronized
     fun startPtt(): Boolean {
-        if (globalMuted || serviceDestroyed || pttState != PttState.IDLE || pttReleasePending) return false
+        if (globalMuted || serviceDestroyed ||
+            pttState != PttState.IDLE || pttReleasePending ||
+            bridgeFrnPttActive) return false
         if (selectedPttTarget == PttTarget.MUMBLE) {
             val manager = mumbleManager ?: return false
             if (!manager.isConnected()) return false
@@ -422,7 +590,8 @@ class GatewayService : Service() {
     @Synchronized
     fun stopPtt() {
         if (pttState == PttState.IDLE) return
-        if (selectedPttTarget == PttTarget.MUMBLE) {
+        if (selectedPttTarget == PttTarget.MUMBLE &&
+            !bridgeFrnPttActive) {
             try {
                 mumbleManager?.stopTalking()
             } finally {
@@ -430,7 +599,10 @@ class GatewayService : Service() {
             }
             return
         }
-        val connection = if (pttState != PttState.IDLE && selectedPttTarget == PttTarget.FRN) frnConnection else null
+        val connection = if (
+            pttState != PttState.IDLE &&
+            (selectedPttTarget == PttTarget.FRN || bridgeFrnPttActive)
+        ) frnConnection else null
         if (connection != null) pttReleasePending = true
         resetPttState()
         val releaseSession = pttSessionId
@@ -439,7 +611,7 @@ class GatewayService : Service() {
                 synchronized(this) {
                     if (frnConnection === connection && pttReleasePending && pttSessionId == releaseSession) {
                         android.util.Log.e("FunkGateway-PTT", "RX0-Zeitlimit überschritten – FRN wird getrennt")
-                        disconnectFrn()
+                        recoverFrnConnection()
                     }
                 }
             }, pttReleaseTimeoutMillis)
@@ -449,7 +621,9 @@ class GatewayService : Service() {
                 try {
                     connection.send("RX0")
                     synchronized(this) {
-                        if (frnConnection === connection) {
+                        if (frnConnection === connection &&
+                            pttSessionId == releaseSession
+                        ) {
                             pttReleasePending = false
                         }
                     }
@@ -457,7 +631,7 @@ class GatewayService : Service() {
                     android.util.Log.w("FunkGateway-PTT", "FRN RX0 konnte nicht gesendet werden", e)
                     mainHandler.post {
                         synchronized(this) {
-                            if (frnConnection === connection) disconnectFrn()
+                            if (frnConnection === connection) recoverFrnConnection()
                         }
                     }
                 }
@@ -472,6 +646,18 @@ class GatewayService : Service() {
     private var frnGeneration = 0
     private var frnLastStoppedGeneration = -1
     private var frnConnecting = false
+
+    // Automatische FRN-Wiederverbindung.
+    private var frnReconnectEnabled = false
+    private var frnReconnectAttempt = 0
+    // Wartezeiten für FRN-Wiederverbindungsversuche.
+    private val frnReconnectBackoff = ReconnectBackoff()
+    private var frnReconnectGeneration = 0L
+    private var frnReconnectTask: Runnable? = null
+
+    // Zugangsdaten für den Wiederaufbau der letzten FRN-Verbindung.
+    // Keine Activity-Callbacks dauerhaft im Service speichern.
+    private var lastFrnLoginConfig: FrnLoginConfig? = null
     private var serviceDestroyed = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -739,11 +925,30 @@ class GatewayService : Service() {
         onEvent: (FrnEvent) -> Unit,
         onError: (Throwable) -> Unit,
         onConnected: () -> Unit = {},
-        onDisconnected: () -> Unit = {}
+        onDisconnected: () -> Unit = {},
+        automaticReconnect: Boolean = false
     ) {
         check(!serviceDestroyed) { "GatewayService wurde beendet." }
         check(!frnConnecting && frnConnection == null) {
             "FRN ist bereits verbunden oder wird verbunden."
+        }
+
+        // Ein manueller Verbindungsaufbau ersetzt geplante Reconnects.
+        if (!automaticReconnect) {
+            frnReconnectGeneration++
+            frnReconnectTask?.let { mainHandler.removeCallbacks(it) }
+            frnReconnectTask = null
+        }
+
+        // Letzte gewünschte FRN-Verbindung für einen möglichen Reconnect.
+        // Keine Activity-Callbacks speichern.
+        lastFrnLoginConfig = config
+
+        // Reconnect nur aktivieren, wenn der Benutzer ihn erlaubt.
+        frnReconnectEnabled = ReconnectSettings.load(this).frnEnabled
+        if (!automaticReconnect) {
+            frnReconnectBackoff.reset()
+            frnReconnectAttempt = 0
         }
 
         frnConnecting = true
@@ -781,10 +986,12 @@ class GatewayService : Service() {
                                     if (!serviceDestroyed &&
                                         generation == frnGeneration &&
                                         frnConnection === activeConnection &&
-                                        selectedPttTarget == PttTarget.FRN &&
+                                        (selectedPttTarget == PttTarget.FRN ||
+                                            bridgeFrnPttActive) &&
                                         pttState == PttState.REQUESTING
                                     ) {
                                         pttState = PttState.TRANSMITTING
+                                        if (!bridgeFrnPttActive) {
                                         val audioSession = pttSessionId
                                         val sender = FrnAudioSender(
                                             this,
@@ -832,6 +1039,7 @@ class GatewayService : Service() {
                                                 e
                                             )
                                         }
+                                        }
                                     }
                                 }
                             }
@@ -859,6 +1067,11 @@ class GatewayService : Service() {
                                 if (generation == frnGeneration &&
                                     frnConnection === activeConnection
                                 ) {
+                                    // Bei FRN-Verbindungsverlust die Bridge stoppen.
+                                    if (voipBridgeActive || bridgeFrnPttActive) {
+                                        stopVoipBridge()
+                                    }
+
                                     frnReceiver = null
                                     frnConnection = null
                                     org.funkgateway.mobile.frn.FrnGroupMemberSyncBuffer.clear()
@@ -872,6 +1085,11 @@ class GatewayService : Service() {
                                     frnServerRooms = emptyList()
                                     frnLastStoppedGeneration = generation
                                     frnGeneration++
+
+                                    // Unerwarteter Verbindungsabbruch:
+                                    // Nach dem Aufräumen Wiederverbindung planen.
+                                    scheduleFrnReconnect()
+
                                     mainHandler.post {
                                         val current = synchronized(this) {
                                             !serviceDestroyed &&
@@ -894,6 +1112,13 @@ class GatewayService : Service() {
                             }
                         }
                     )
+
+                    // Erfolgreiche Verbindung: Reconnect-Zähler zurücksetzen.
+                    frnReconnectBackoff.reset()
+                    frnReconnectAttempt = 0
+                    frnReconnectGeneration++
+                    frnReconnectTask?.let { mainHandler.removeCallbacks(it) }
+                    frnReconnectTask = null
 
                     frnConnection = activeConnection
                     frnReceiver = receiver
@@ -918,6 +1143,10 @@ class GatewayService : Service() {
                     if (generation == frnGeneration && !serviceDestroyed) {
                         frnConnecting = false
                         dispatchFrnError(generation, e, onError)
+
+                        // Nach einem fehlgeschlagenen Aufbau erneut versuchen.
+                        // Die gespeicherte Benutzereinstellung entscheidet.
+                        scheduleFrnReconnect()
                     }
                 }
                 connection?.close()
@@ -1211,8 +1440,124 @@ class GatewayService : Service() {
         }, "FRN-Chat-TX").start()
     }
 
+    /**
+     * Verhindert weitere automatische FRN-Verbindungsversuche.
+     * Bereits geplante Versuche werden entfernt.
+     */
+    /**
+     * Plant einen FRN-Wiederverbindungsversuch ein.
+     * Die eigentliche Verbindung wird im nächsten Schritt ergänzt.
+     */
+    @Synchronized
+    private fun scheduleFrnReconnect() {
+        if (serviceDestroyed || !frnReconnectEnabled) return
+        if (!ReconnectSettings.load(this).frnEnabled) return
+        if (lastFrnLoginConfig == null) return
+        if (frnConnecting || frnConnection != null) return
+        if (frnReconnectTask != null) return
+
+        val settings = ReconnectSettings.load(this)
+        val delay = frnReconnectBackoff.nextDelayMillis(settings)
+        val generation = ++frnReconnectGeneration
+
+        val task = Runnable {
+            synchronized(this) {
+                if (generation != frnReconnectGeneration ||
+                    serviceDestroyed || !frnReconnectEnabled
+                ) return@synchronized
+
+                frnReconnectTask = null
+
+                val config = lastFrnLoginConfig
+                if (config == null ||
+                    frnConnecting ||
+                    frnConnection != null ||
+                    !ReconnectSettings.load(this).frnEnabled
+                ) return@synchronized
+
+                GatewayLog.add(
+                    "FRN",
+                    "Automatischer Wiederverbindungsversuch gestartet."
+                )
+
+                try {
+                    connectFrn(
+                        config = config,
+                        onEvent = {},
+                        onError = { error ->
+                            GatewayLog.add(
+                                "FRN",
+                                "Wiederverbindung fehlgeschlagen: ${error.message}",
+                                "WARN"
+                            )
+                        },
+                        automaticReconnect = true
+                    )
+                } catch (e: Exception) {
+                    GatewayLog.add(
+                        "FRN",
+                        "Reconnect konnte nicht gestartet werden: ${e.message}",
+                        "WARN"
+                    )
+                }
+            }
+        }
+
+        frnReconnectTask = task
+        mainHandler.postDelayed(task, delay)
+
+        GatewayLog.add(
+            "FRN",
+            "Wiederverbindung in ${delay / 1000} Sekunden geplant."
+        )
+    }
+
+    @Synchronized
+    private fun cancelFrnReconnect() {
+        frnReconnectEnabled = false
+        frnReconnectGeneration++
+        frnReconnectAttempt = 0
+        frnReconnectBackoff.reset()
+
+        frnReconnectTask?.let { task ->
+            mainHandler.removeCallbacks(task)
+        }
+        frnReconnectTask = null
+        lastFrnLoginConfig = null
+    }
+
+    /**
+     * Technischer FRN-Verbindungsfehler.
+     * PTT sicher beenden und anschließend Reconnect ermöglichen.
+     */
+    @Synchronized
+    private fun recoverFrnConnection() {
+        val config = lastFrnLoginConfig
+        val reconnectAllowed =
+            frnReconnectEnabled &&
+            ReconnectSettings.load(this).frnEnabled &&
+            !serviceDestroyed
+
+        // Bestehende Verbindung vollständig und sicher beenden.
+        disconnectFrn()
+
+        if (reconnectAllowed && config != null && !serviceDestroyed) {
+            lastFrnLoginConfig = config
+            frnReconnectEnabled = true
+            scheduleFrnReconnect()
+        }
+    }
+
     @Synchronized
     fun disconnectFrn() {
+        // Bewusste Trennung: keine automatische Wiederverbindung.
+        cancelFrnReconnect()
+
+        // Automatische Audioweiterleitung vor FRN-Trennung beenden.
+        if (voipBridgeActive || bridgeFrnPttActive) {
+            stopVoipBridge()
+        }
+
         org.funkgateway.mobile.frn.FrnGroupMemberSyncBuffer.clear()
         if (frnConnection != null || frnConnecting) {
             GatewayLog.add(
@@ -1274,6 +1619,16 @@ class GatewayService : Service() {
         synchronized(this) {
             serviceDestroyed = true
             mainHandler.removeCallbacks(groupInvitationRetryTask)
+            stopPtt()
+            if (voipBridgeActive || bridgeFrnPttActive) {
+                stopVoipBridge()
+            }
+            mumbleManager?.let { manager ->
+                manager.onConnectionLost = null
+                manager.setUiCallbacks(null, null)
+                manager.release()
+            }
+            mumbleManager = null
             disconnectFrn()
             pttNetworkExecutor.shutdownNow()
         }

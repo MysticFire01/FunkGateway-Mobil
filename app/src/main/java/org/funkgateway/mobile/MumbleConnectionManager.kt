@@ -18,10 +18,36 @@ import se.lublin.humla.util.VoiceTargetMode
 import java.security.cert.X509Certificate
 
 class MumbleConnectionManager(
-    private val context: Context,
-    private val onStatusChanged: (String) -> Unit,
-    private val onCertificateUntrusted: (String, Int, X509Certificate) -> Unit = { _, _, _ -> }
+    context: Context,
+    onStatusChanged: (String) -> Unit,
+    onCertificateUntrusted: (String, Int, X509Certificate) -> Unit = { _, _, _ -> }
 ) {
+    private val context: Context = context.applicationContext
+
+    private var onStatusChanged: (String) -> Unit = onStatusChanged
+    private var onCertificateUntrusted:
+        (String, Int, X509Certificate) -> Unit = onCertificateUntrusted
+
+    private var uiCallbackOwner: Any? = null
+
+    @Synchronized
+    fun setUiCallbacks(
+        statusCallback: ((String) -> Unit)?,
+        certificateCallback: ((String, Int, X509Certificate) -> Unit)?,
+        owner: Any? = null
+    ) {
+        uiCallbackOwner = owner
+        onStatusChanged = statusCallback ?: {}
+        onCertificateUntrusted = certificateCallback ?: { _, _, _ -> }
+    }
+
+    @Synchronized
+    fun clearUiCallbacks(owner: Any) {
+        if (uiCallbackOwner !== owner) return
+        uiCallbackOwner = null
+        onStatusChanged = {}
+        onCertificateUntrusted = { _, _, _ -> }
+    }
     var onTalkStateChanged: ((Int, String) -> Unit)? = null
     var onChannelMembershipChanged: (() -> Unit)? = null
     var onRegistrationStatusChanged: ((String) -> Unit)? = null
@@ -29,6 +55,22 @@ class MumbleConnectionManager(
     private var registrationRequestId = 0L
 
     private var service: IHumlaService? = null
+
+    private var bridgePcmListener: ((ShortArray) -> Unit)? = null
+
+    private val humlaBridgePcmListener =
+        se.lublin.humla.audio.AudioOutput.BridgePcmListener { pcm ->
+            bridgePcmListener?.invoke(pcm)
+        }
+
+    fun setBridgePcmListener(listener: ((ShortArray) -> Unit)?) {
+        bridgePcmListener = listener
+        val humla = service as? HumlaService ?: return
+        humla.setBridgePcmListener(
+            if (listener != null) humlaBridgePcmListener else null
+        )
+    }
+
     private var playbackVolume = 1.0f
     private var playbackDeafened = false
 
@@ -56,10 +98,119 @@ class MumbleConnectionManager(
     private var connectionInProgress = false
     private var lastUsername: String = ""
     private var lastPassword: String = ""
+    // Automatische Mumble-Wiederverbindung.
+    private val reconnectHandler =
+        android.os.Handler(android.os.Looper.getMainLooper())
+    private val reconnectBackoff = ReconnectBackoff()
+    private var reconnectEnabled = false
+    private var reconnectGeneration = 0L
+    private var reconnectTask: Runnable? = null
+    private var manualDisconnect = false
+
+    // Zeitüberwachung für den Mumble-Verbindungsaufbau.
+    private var connectTimeoutTask: Runnable? = null
+
+    private fun cancelConnectTimeout() {
+        connectTimeoutTask?.let { reconnectHandler.removeCallbacks(it) }
+        connectTimeoutTask = null
+    }
+
+    private fun startConnectTimeout() {
+        cancelConnectTimeout()
+
+        val task = Runnable {
+            connectTimeoutTask = null
+
+            if (!connectionInProgress || manualDisconnect) return@Runnable
+
+            Log.w("FGW-Mumble", "Verbindungsaufbau nach 30 Sekunden abgebrochen")
+
+            connectionInProgress = false
+            pendingConnectIntent = null
+
+            stopTalking()
+            stopBridgeAudio()
+            onConnectionLost?.invoke()
+
+            // Einen eventuell noch laufenden Humla-Verbindungsaufbau abbrechen.
+            try {
+                service?.disconnect()
+            } catch (e: Exception) {
+                Log.w("FGW-Mumble", "Timeout: Humla-Abbruch fehlgeschlagen", e)
+            }
+
+            onStatusChanged("Mumble-Verbindungsaufbau: Zeitüberschreitung")
+            scheduleMumbleReconnect()
+        }
+
+        connectTimeoutTask = task
+        reconnectHandler.postDelayed(task, 30_000L)
+    }
+
+    // Benachrichtigt den GatewayService bei Verbindungsverlust.
+    // Keine dauerhafte Referenz auf eine Activity speichern.
+    var onConnectionLost: (() -> Unit)? = null
+
 
     private var pendingCertificate: X509Certificate? = null
     private var pendingCertificateHost: String? = null
     private var pendingCertificatePort: Int = 0
+
+    data class PendingCertificateRequest(
+        val host: String,
+        val port: Int,
+        val certificate: X509Certificate
+    )
+
+    fun getPendingCertificateRequest(): PendingCertificateRequest? {
+        val certificate = pendingCertificate ?: return null
+        val host = pendingCertificateHost ?: return null
+        val port = pendingCertificatePort
+        if (port !in 1..65535) return null
+
+        return PendingCertificateRequest(host, port, certificate)
+    }
+
+    private fun cancelMumbleReconnect() {
+        reconnectGeneration++
+        reconnectTask?.let { reconnectHandler.removeCallbacks(it) }
+        reconnectTask = null
+        reconnectBackoff.reset()
+    }
+
+    private fun scheduleMumbleReconnect() {
+        val settings = ReconnectSettings.load(context)
+        if (!reconnectEnabled || manualDisconnect ||
+            !settings.mumbleEnabled || pendingCertificate != null ||
+            connectionInProgress || reconnectTask != null ||
+            currentHost.isNullOrBlank() || lastUsername.isBlank()
+        ) return
+
+        val delay = reconnectBackoff.nextDelayMillis(settings)
+        val generation = ++reconnectGeneration
+
+        val task = Runnable {
+            if (generation != reconnectGeneration) return@Runnable
+            reconnectTask = null
+
+            if (!reconnectEnabled || manualDisconnect ||
+                !ReconnectSettings.load(context).mumbleEnabled ||
+                pendingCertificate != null || connectionInProgress ||
+                service?.isConnected == true
+            ) return@Runnable
+
+            val host = currentHost ?: return@Runnable
+            Log.i("FGW-Mumble", "Automatischer Reconnect gestartet")
+            connect(
+                host, currentPort, lastUsername, lastPassword,
+                automaticReconnect = true
+            )
+        }
+
+        reconnectTask = task
+        reconnectHandler.postDelayed(task, delay)
+        Log.i("FGW-Mumble", "Reconnect in ${delay / 1000} Sekunden geplant")
+    }
 
     private val observer = object : IHumlaObserver {
         override fun onConnecting() {
@@ -67,22 +218,49 @@ class MumbleConnectionManager(
         }
 
         override fun onConnected() {
+            if (!connectionInProgress || manualDisconnect) {
+                Log.w("FGW-Mumble", "Unerwartete Mumble-Verbindungsbestätigung")
+                stopTalking()
+                stopBridgeAudio()
+                onConnectionLost?.invoke()
+                try {
+                    service?.disconnect()
+                } catch (e: Exception) {
+                    Log.w("FGW-Mumble", "Verspätete Verbindung konnte nicht getrennt werden", e)
+                }
+                return
+            }
+
+            cancelConnectTimeout()
             connectionInProgress = false
+            cancelMumbleReconnect()
             onStatusChanged("Mit Mumble verbunden")
         }
 
         override fun onDisconnected(error: HumlaException?) {
+            cancelConnectTimeout()
             registrationPending = false
             connectionInProgress = false
+
+            // Keine alte Aussendung nach einer Trennung fortsetzen.
+            stopTalking()
+            stopBridgeAudio()
+            onConnectionLost?.invoke()
+
             Log.e("FGW-Mumble", "Verbindung getrennt", error)
             if (pendingCertificate != null) {
                 onStatusChanged("Mumble-Zertifikat wartet auf Bestätigung")
                 return
             }
+
             onStatusChanged(
                 if (error == null) "Mumble getrennt"
                 else "Mumble getrennt: ${error.message}"
             )
+
+            if (!manualDisconnect) {
+                scheduleMumbleReconnect()
+            }
         }
 
         override fun onTLSHandshakeFailed(certs: Array<X509Certificate>?) {
@@ -167,6 +345,9 @@ class MumbleConnectionManager(
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as HumlaService.HumlaBinder).service
+            (service as? HumlaService)?.setBridgePcmListener(
+                if (bridgePcmListener != null) humlaBridgePcmListener else null
+            )
             applyPlaybackVolume()
             bound = true
             binding = false
@@ -174,8 +355,14 @@ class MumbleConnectionManager(
             val pending = pendingConnectIntent
             pendingConnectIntent = null
             if (pending != null) {
-                context.startService(pending)
-                return
+                if (connectionInProgress && !manualDisconnect) {
+                    context.startService(pending)
+                    return
+                }
+                Log.w(
+                    "FGW-Mumble",
+                    "Veralteter Humla-Verbindungswunsch verworfen"
+                )
             }
             onStatusChanged(
                 if (service?.isConnected == true) "Mit Mumble verbunden"
@@ -184,15 +371,29 @@ class MumbleConnectionManager(
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
+            cancelConnectTimeout()
+            // Android behält die Dienstbindung bei und verbindet sie erneut.
+            // Nur die Dienstreferenz und laufende Verbindung zurücksetzen.
             service = null
-            bound = false
-            binding = false
             connectionInProgress = false
+            pendingConnectIntent = null
+            onConnectionLost?.invoke()
+
             onStatusChanged("Mumble-Dienst getrennt")
+
+            if (!manualDisconnect && pendingCertificate == null) {
+                scheduleMumbleReconnect()
+            }
         }
     }
 
-    fun connect(host: String, port: Int, username: String, password: String) {
+    fun connect(
+        host: String,
+        port: Int,
+        username: String,
+        password: String,
+        automaticReconnect: Boolean = false
+    ) {
         if (host.isBlank() || username.isBlank() || port !in 1..65535) {
             onStatusChanged("Bitte Server, Port und Benutzername prüfen")
             return
@@ -203,6 +404,12 @@ class MumbleConnectionManager(
             return
         }
 
+        if (!automaticReconnect) {
+            cancelMumbleReconnect()
+            manualDisconnect = false
+            reconnectEnabled = ReconnectSettings.load(context).mumbleEnabled
+        }
+
         pendingCertificate = null
         pendingCertificateHost = null
         pendingCertificatePort = 0
@@ -211,6 +418,7 @@ class MumbleConnectionManager(
         currentPort = port
         lastUsername = username.trim()
         lastPassword = password
+        startConnectTimeout()
 
         try {
             val server = Server(
@@ -261,11 +469,11 @@ class MumbleConnectionManager(
             }
 
             onStatusChanged("Verbinde mit ${host.trim()}:$port …")
-            if (bound) {
+            if (bound && service != null) {
                 context.startService(intent)
             } else {
                 pendingConnectIntent = intent
-                if (!binding) {
+                if (!bound && !binding) {
                     binding = context.bindService(
                         Intent(context, HumlaService::class.java),
                         connection,
@@ -274,13 +482,18 @@ class MumbleConnectionManager(
                     if (!binding) {
                         pendingConnectIntent = null
                         connectionInProgress = false
+                        cancelConnectTimeout()
                         onStatusChanged("Mumble-Dienst konnte nicht gebunden werden")
+                        scheduleMumbleReconnect()
                     }
                 }
             }
         } catch (e: Exception) {
             connectionInProgress = false
+            cancelConnectTimeout()
+            pendingConnectIntent = null
             onStatusChanged("Mumble-Fehler: ${e.message}")
+            scheduleMumbleReconnect()
         }
     }
 
@@ -320,6 +533,37 @@ class MumbleConnectionManager(
         } catch (e: Exception) {
             Log.e("FGW-Mumble", "Eigene Position nicht verfügbar", e)
             null
+        }
+    }
+
+    fun setBridgeAudioEnabled(enabled: Boolean): Boolean {
+        val humla = service as? HumlaService ?: return false
+        return try {
+            humla.setBridgeAudioEnabled(enabled)
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("MumbleBridge", "Bridge-Umschaltung fehlgeschlagen", e)
+            false
+        }
+    }
+
+    fun submitBridgeAudio(pcm: ShortArray, frameSize: Int): Boolean {
+        val humla = service as? HumlaService ?: return false
+        return try {
+            humla.submitBridgeAudio(pcm, frameSize)
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("MumbleBridge", "PCM-Uebergabe fehlgeschlagen", e)
+            false
+        }
+    }
+
+    fun stopBridgeAudio() {
+        val humla = service as? HumlaService ?: return
+        try {
+            humla.stopBridgeAudio()
+        } catch (e: Exception) {
+            android.util.Log.e("MumbleBridge", "Bridge-PTT-Stopp fehlgeschlagen", e)
         }
     }
 
@@ -425,8 +669,14 @@ class MumbleConnectionManager(
     }
 
     fun disconnect() {
+        cancelConnectTimeout()
+        // Bewusste Trennung: keine automatische Wiederverbindung.
+        manualDisconnect = true
+        reconnectEnabled = false
+        cancelMumbleReconnect()
         registrationPending = false
         stopTalking()
+        stopBridgeAudio()
         pendingCertificate = null
         pendingCertificateHost = null
         pendingCertificatePort = 0
@@ -572,7 +822,16 @@ class MumbleConnectionManager(
 
     fun isConnected(): Boolean = service?.isConnected ?: false
 
+    fun isConnecting(): Boolean = connectionInProgress
+
+    fun hasActiveConnectionAttempt(): Boolean =
+        isConnected() || connectionInProgress ||
+            pendingCertificate != null ||
+            reconnectTask != null
+
     fun release() {
+        cancelConnectTimeout()
+        cancelMumbleReconnect()
         stopTalking()
         if (bound || binding) {
             service?.unregisterObserver(observer)

@@ -14,6 +14,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class FrnAudioReceiver : Closeable {
 
+    @Volatile
+    private var pcmListener: ((ShortArray) -> Unit)? = null
+
+    fun setPcmListener(listener: ((ShortArray) -> Unit)?) {
+        pcmListener = listener
+    }
+
     private val running = AtomicBoolean(true)
     private val deafened = AtomicBoolean(false)
 
@@ -52,6 +59,19 @@ class FrnAudioReceiver : Closeable {
                 try {
                     val pcm = codec.decode(packet)
                     if (running.get() && !deafened.get()) {
+                        try {
+                            val listener = pcmListener
+                            if (listener != null && pcm.size == GsmWav49Codec.PCM_BYTES) {
+                                val samples = ShortArray(pcm.size / 2) { i ->
+                                    val lo = pcm[i * 2].toInt() and 0xff
+                                    val hi = pcm[i * 2 + 1].toInt() and 0xff
+                                    ((hi shl 8) or lo).toShort()
+                                }
+                                listener(samples)
+                            }
+                        } catch (e: Exception) {
+                            Log.w("FunkGateway", "FRN-PCM-Callback fehlgeschlagen", e)
+                        }
                         player.enqueue(pcm)
                     }
                 } catch (e: Exception) {
@@ -100,6 +120,7 @@ class FrnAudioReceiver : Closeable {
      */
     override fun close() {
         if (running.compareAndSet(true, false)) {
+            pcmListener = null
             packets.clear()
             worker.interrupt()
         }
