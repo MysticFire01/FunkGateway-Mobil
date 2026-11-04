@@ -62,6 +62,10 @@ class ParrotRecordingBuffer(
     }
 
     @Synchronized
+    fun isFull(session: Long): Boolean =
+        recording && session == generation && sampleCount >= maxSamples
+
+    @Synchronized
     fun isRecording(session: Long): Boolean =
         recording && session == generation
 }

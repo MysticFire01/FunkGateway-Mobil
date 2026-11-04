@@ -171,6 +171,12 @@ class GatewayService : Service() {
     fun setMumbleManager(manager: MumbleConnectionManager?) {
         if (mumbleManager === manager) return
 
+        // Alten Papageien-Controller beim Managerwechsel dauerhaft sperren.
+        mumbleParrotController?.requestClose()
+        mumbleParrotSession++
+        mumbleParrotRecording?.cancel()
+        mumbleParrotRecording = null
+
         // Alte Bridge vor einem Manager-Wechsel vollständig stoppen.
         if (voipBridgeActive || bridgeFrnPttActive) {
             stopVoipBridge()
@@ -181,12 +187,18 @@ class GatewayService : Service() {
             stopPtt()
         }
         mumbleManager?.onConnectionLost = null
+        mumbleManager?.onParrotTalkStateChanged = null
         mumbleManager = manager
 
         manager?.let { activeManager ->
             activeManager.onConnectionLost = {
                 mainHandler.post {
                     onMumbleConnectionLost(activeManager)
+                }
+            }
+            activeManager.onParrotTalkStateChanged = { sessionId, talkState ->
+                if (mumbleManager === activeManager) {
+                    onMumbleParrotTalkState(sessionId, talkState)
                 }
             }
         }
@@ -482,7 +494,10 @@ class GatewayService : Service() {
      */
     @Synchronized
     fun startVoipBridge(): Boolean {
-        if (serviceDestroyed || voipBridgeActive || globalMuted ||
+        if (parrotAnnouncementPreparing) return false
+
+        if (serviceDestroyed || voipBridgeActive ||
+            automaticAudioMode != AutomaticAudioMode.IDLE || globalMuted ||
             pttState != PttState.IDLE || pttReleasePending ||
             frnConnection == null || frnConnecting ||
             mumbleManager?.isConnected() != true) return false
@@ -499,6 +514,7 @@ class GatewayService : Service() {
         val mumbleSession = bridgeMumbleToFrnQueue.start()
         bridgeSessionGeneration++
         voipBridgeActive = true
+        automaticAudioMode = AutomaticAudioMode.VOIP_BRIDGE
 
         manager.setBridgePcmListener { pcm ->
             if (bridgeMumbleToFrnQueue.isActive(mumbleSession)) {
@@ -524,6 +540,9 @@ class GatewayService : Service() {
 
     @Synchronized
     private fun stopVoipBridge() {
+        // Die VoIP-Bridge darf den aktiven Papagei nicht abschalten.
+        if (automaticAudioMode == AutomaticAudioMode.MUMBLE_PARROT) return
+
         // Zuerst alle alten Bridge-Audiositzungen ungültig machen.
         voipBridgeActive = false
         bridgeSessionGeneration++
@@ -544,6 +563,9 @@ class GatewayService : Service() {
             mumbleManager?.stopBridgeAudio()
         }
         mumbleManager?.setBridgeAudioEnabled(false)
+        if (automaticAudioMode == AutomaticAudioMode.VOIP_BRIDGE) {
+            automaticAudioMode = AutomaticAudioMode.IDLE
+        }
     }
 
     /**
@@ -553,6 +575,20 @@ class GatewayService : Service() {
     @Synchronized
     fun onMumbleConnectionLost(manager: MumbleConnectionManager) {
         if (mumbleManager !== manager) return
+
+        // Papageien-Controller bei Verbindungsverlust dauerhaft sperren.
+        if (automaticAudioMode == AutomaticAudioMode.MUMBLE_PARROT) {
+            stopMumbleParrotManually()
+        } else {
+            mumbleParrotController?.requestClose()
+            mumbleParrotSession++
+            mumbleParrotRecording?.cancel()
+            mumbleParrotRecording = null
+            mumbleParrotActiveSpeakers.clear()
+            mumbleParrotPlaybackPending = false
+            mumbleParrotRecordingToken = null
+            mumbleParrotSpeakerSessionId = null
+        }
 
         if (voipBridgeActive || bridgeFrnPttActive) {
             stopVoipBridge()
@@ -641,6 +677,354 @@ class GatewayService : Service() {
 
     private var bridgeSessionGeneration = 0L
     private var voipBridgeActive = false
+
+    private enum class AutomaticAudioMode {
+        IDLE, VOIP_BRIDGE, MUMBLE_PARROT
+    }
+
+    private var automaticAudioMode = AutomaticAudioMode.IDLE
+
+    @Synchronized
+    fun isMumbleParrotActive(): Boolean =
+        automaticAudioMode == AutomaticAudioMode.MUMBLE_PARROT
+
+    @Synchronized
+    fun startMumbleParrot(): Boolean {
+        if (parrotAnnouncementPreparing) return false
+        if (serviceDestroyed ||
+            automaticAudioMode != AutomaticAudioMode.IDLE ||
+            voipBridgeActive ||
+            bridgeFrnPttActive ||
+            globalMuted ||
+            pttState != PttState.IDLE ||
+            pttReleasePending) return false
+
+        val manager = mumbleManager ?: return false
+        if (!manager.isConnected()) return false
+        if (manager.getOwnPosition() == null) return false
+
+        // Digitalen Audioeingang aktivieren und Smartphone-Mikrofon stoppen.
+        if (!manager.setBridgeAudioEnabled(true)) return false
+
+        mumbleParrotSession++
+        mumbleParrotPlaybackPending = false
+        mumbleParrotTimeoutTonePending = false
+        mumbleParrotTimeoutSignaledToken = null
+        mumbleParrotActiveSpeakers.clear()
+        mumbleParrotRecordingToken = null
+        mumbleParrotSpeakerSessionId = null
+        val parrotSettings =
+            org.funkgateway.mobile.audio.ParrotSettings.load(this)
+
+        // Nur bereits vorbereitete Sprachdaten übernehmen.
+        // Keine TTS-Erzeugung während des Papagei-Betriebs.
+        mumbleParrotPreparedAnnouncement =
+            if (parrotSettings.timeoutSignalEnabled &&
+                parrotSettings.timeoutAnnouncementMode in
+                    setOf("speech", "both")) {
+                parrotAnnouncementCache.getPrepared(
+                    parrotSettings.timeoutAnnouncementText
+                )
+            } else {
+                null
+            }
+
+        mumbleParrotRecording =
+            org.funkgateway.mobile.audio.ParrotRecordingBuffer(
+                maxSeconds = parrotSettings.maxRecordingSeconds
+            )
+
+        mumbleParrotController =
+            org.funkgateway.mobile.audio.MumbleParrotController(manager)
+
+        automaticAudioMode = AutomaticAudioMode.MUMBLE_PARROT
+
+        val parrotSession = mumbleParrotSession
+        manager.setBridgePcmListener { pcm ->
+            synchronized(this) {
+                if (automaticAudioMode == AutomaticAudioMode.MUMBLE_PARROT &&
+                    mumbleParrotSession == parrotSession) {
+                    val recording = mumbleParrotRecording
+                    val token = mumbleParrotRecordingToken
+                    if (recording != null && token != null) {
+                        recording.append(token, pcm)
+
+                        if (recording.isFull(token) &&
+                            mumbleParrotTimeoutSignaledToken != token &&
+                            parrotSettings.timeoutSignalEnabled &&
+                            parrotSettings.timeoutAnnouncementMode != "off") {
+                            mumbleParrotTimeoutSignaledToken = token
+                            mumbleParrotTimeoutTonePending = true
+
+                            val controller = mumbleParrotController
+                            val session = mumbleParrotSession
+
+                            if (controller != null) {
+                                Thread({
+                                    val allowed = synchronized(this) {
+                                        automaticAudioMode ==
+                                            AutomaticAudioMode.MUMBLE_PARROT &&
+                                        mumbleParrotSession == session &&
+                                        mumbleParrotController === controller &&
+                                        mumbleParrotTimeoutSignaledToken == token
+                                    }
+
+                                    try {
+                                        if (allowed) {
+                                            val mode =
+                                                parrotSettings.timeoutAnnouncementMode
+
+                                            if (mode == "beep" || mode == "both") {
+                                                controller.playTimeoutTone()
+                                            }
+
+                                            if (mode == "speech" || mode == "both") {
+                                                // Fertiges PCM verwenden: keine TTS-Erzeugung
+                                                // während des laufenden Papageis.
+                                                val audio = synchronized(this) {
+                                                    if (automaticAudioMode ==
+                                                            AutomaticAudioMode.MUMBLE_PARROT &&
+                                                        mumbleParrotSession == session &&
+                                                        mumbleParrotController === controller) {
+                                                        mumbleParrotPreparedAnnouncement
+                                                    } else {
+                                                        null
+                                                    }
+                                                }
+
+                                                if (audio != null && audio.isNotEmpty()) {
+                                                    controller.playSpeechAnnouncement(audio)
+                                                } else if (mode == "speech") {
+                                                    // Falls keine Ansage vorbereitet wurde:
+                                                    // wenigstens den bewährten Warnton senden.
+                                                    controller.playTimeoutTone()
+                                                }
+                                            }
+                                        }
+                                    } finally {
+                                        synchronized(this) {
+                                            if (mumbleParrotSession == session &&
+                                                mumbleParrotController === controller) {
+                                                mumbleParrotTimeoutTonePending = false
+                                            }
+                                        }
+                                    }
+                                }, "MumbleParrotTimeoutTone").start()
+                            }
+
+                            android.util.Log.i(
+                                "MumbleParrot",
+                                "Aufnahmezeit erreicht – Warnton gestartet"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        return true
+    }
+
+    @Synchronized
+    fun stopMumbleParrotManually() {
+        if (automaticAudioMode != AutomaticAudioMode.MUMBLE_PARROT) return
+
+        mumbleParrotSession++
+        mumbleParrotPlaybackPending = false
+        mumbleParrotTimeoutTonePending = false
+        mumbleParrotTimeoutSignaledToken = null
+        mumbleParrotActiveSpeakers.clear()
+        mumbleManager?.setBridgePcmListener(null)
+        mumbleParrotSpeakerSessionId = null
+        mumbleParrotRecordingToken = null
+        mumbleParrotRecording?.cancel()
+        mumbleParrotRecording = null
+
+        val controller = mumbleParrotController
+        controller?.requestClose()
+
+        if (controller == null) {
+            mumbleManager?.stopBridgeAudio()
+            mumbleManager?.setBridgeAudioEnabled(false)
+            mumbleParrotController = null
+            automaticAudioMode = AutomaticAudioMode.IDLE
+        } else {
+            val parrotManager = mumbleManager
+            Thread({
+                controller.cancel()
+                synchronized(this) {
+                    if (mumbleParrotController === controller &&
+                        automaticAudioMode == AutomaticAudioMode.MUMBLE_PARROT) {
+                        parrotManager?.stopBridgeAudio()
+                        parrotManager?.setBridgeAudioEnabled(false)
+                        mumbleParrotController = null
+                        automaticAudioMode = AutomaticAudioMode.IDLE
+                    }
+                }
+            }, "MumbleParrotStop").start()
+        }
+    }
+
+    @Synchronized
+    private fun onMumbleParrotTalkState(sessionId: Int, talkState: String) {
+        if (automaticAudioMode != AutomaticAudioMode.MUMBLE_PARROT) return
+
+        val ownSession = mumbleManager?.getOwnPosition()?.sessionId
+        if (sessionId == ownSession) return
+
+        if (talkState == "PASSIVE") {
+            mumbleParrotActiveSpeakers.remove(sessionId)
+        } else {
+            mumbleParrotActiveSpeakers.add(sessionId)
+
+            // Eine laufende Papagei-Wiedergabe sofort abbrechen.
+            // Während der Wartezeit bleibt die Aufnahme erhalten.
+        }
+
+        if (talkState != "PASSIVE") {
+            if (!mumbleParrotPlaybackPending &&
+                !mumbleParrotTimeoutTonePending &&
+                mumbleParrotSpeakerSessionId == null &&
+                mumbleParrotRecordingToken == null) {
+                val recording = mumbleParrotRecording ?: return
+                mumbleParrotSpeakerSessionId = sessionId
+                mumbleParrotTimeoutSignaledToken = null
+                mumbleParrotRecordingToken = recording.start()
+            }
+        } else if (mumbleParrotSpeakerSessionId == sessionId) {
+            val recording = mumbleParrotRecording
+            val token = mumbleParrotRecordingToken
+
+            mumbleParrotSpeakerSessionId = null
+            mumbleParrotRecordingToken = null
+
+            if (recording != null && token != null) {
+                val pcm = recording.finish(token)
+                if (pcm != null && pcm.isNotEmpty() &&
+                    !mumbleParrotPlaybackPending) {
+                    val controller = mumbleParrotController ?: return
+                    val session = mumbleParrotSession
+                    val delay = org.funkgateway.mobile.audio.ParrotSettings
+                        .load(this).playbackDelayMillis
+
+                    mumbleParrotPlaybackPending = true
+
+                    Thread({
+                        var quietSince = android.os.SystemClock.elapsedRealtime()
+                        while (true) {
+                            val state = synchronized(this) {
+                                if (automaticAudioMode != AutomaticAudioMode.MUMBLE_PARROT ||
+                                    mumbleParrotSession != session ||
+                                    mumbleParrotController !== controller ||
+                                    !mumbleParrotPlaybackPending) {
+                                    -1
+                                } else if (mumbleParrotActiveSpeakers.isEmpty()) {
+                                    0
+                                } else {
+                                    1
+                                }
+                            }
+                            if (state < 0) break
+                            if (state > 0) {
+                                quietSince = android.os.SystemClock.elapsedRealtime()
+                            } else if (android.os.SystemClock.elapsedRealtime() - quietSince >= delay) {
+                                val tonePending = synchronized(this) {
+                                    mumbleParrotTimeoutTonePending
+                                }
+                                if (!tonePending) break
+                            }
+                            android.os.SystemClock.sleep(50L)
+                        }
+
+                        val allowed = synchronized(this) {
+                            automaticAudioMode == AutomaticAudioMode.MUMBLE_PARROT &&
+                                mumbleParrotSession == session &&
+                                mumbleParrotController === controller &&
+                                mumbleParrotPlaybackPending &&
+                                !mumbleParrotTimeoutTonePending &&
+                                mumbleParrotActiveSpeakers.isEmpty()
+                        }
+
+                        if (allowed && controller.waitForPlaybackIdle()) {
+                            val stillAllowed = synchronized(this) {
+                                automaticAudioMode == AutomaticAudioMode.MUMBLE_PARROT &&
+                                    mumbleParrotSession == session &&
+                                    mumbleParrotController === controller &&
+                                    mumbleParrotPlaybackPending &&
+                                    !mumbleParrotTimeoutTonePending &&
+                                    mumbleParrotActiveSpeakers.isEmpty()
+                            }
+
+                            if (stillAllowed) {
+                                controller.playRecording(pcm)
+                            }
+                        }
+
+                        synchronized(this) {
+                            if (mumbleParrotSession == session &&
+                                mumbleParrotController === controller) {
+                                mumbleParrotPlaybackPending = false
+                            }
+                        }
+                    }, "MumbleParrotPlayback").start()
+                }
+            }
+        }
+    }
+
+    private var parrotAnnouncementPreparing = false
+
+    private val parrotAnnouncementCache by lazy {
+        org.funkgateway.mobile.audio.ParrotAnnouncementCache(
+            applicationContext
+        )
+    }
+
+    /**
+     * Sprachansage nur vorbereiten, wenn kein automatischer Audiomodus läuft.
+     * TTS wird außerhalb des Service-Monitors ausgeführt.
+     */
+    fun isMumbleParrotAnnouncementPrepared(): Boolean {
+        val settings =
+            org.funkgateway.mobile.audio.ParrotSettings.load(this)
+        return parrotAnnouncementCache.getPrepared(
+            settings.timeoutAnnouncementText
+        )?.isNotEmpty() == true
+    }
+
+    fun prepareMumbleParrotAnnouncement(): Boolean {
+        synchronized(this) {
+            if (serviceDestroyed ||
+                automaticAudioMode != AutomaticAudioMode.IDLE ||
+                parrotAnnouncementPreparing
+            ) return false
+
+            parrotAnnouncementPreparing = true
+        }
+
+        return try {
+            val settings =
+                org.funkgateway.mobile.audio.ParrotSettings.load(this)
+            parrotAnnouncementCache.prepare(
+                settings.timeoutAnnouncementText
+            )
+        } finally {
+            synchronized(this) {
+                parrotAnnouncementPreparing = false
+            }
+        }
+    }
+
+    private var mumbleParrotPreparedAnnouncement: ShortArray? = null
+    private var mumbleParrotController: org.funkgateway.mobile.audio.MumbleParrotController? = null
+    private var mumbleParrotRecording: org.funkgateway.mobile.audio.ParrotRecordingBuffer? = null
+    private var mumbleParrotSession = 0L
+    private var mumbleParrotSpeakerSessionId: Int? = null
+    private var mumbleParrotRecordingToken: Long? = null
+    private var mumbleParrotTimeoutSignaledToken: Long? = null
+    private var mumbleParrotTimeoutTonePending = false
+    private var mumbleParrotPlaybackPending = false
+    private val mumbleParrotActiveSpeakers = mutableSetOf<Int>()
 
     // Sprecherkennung ausschließlich für den FRN-Mumble-Audioweg.
     // Zugriff erfolgt unter dem GatewayService-Monitor.
@@ -2023,6 +2407,11 @@ class GatewayService : Service() {
     override fun onDestroy() {
         synchronized(this) {
             serviceDestroyed = true
+            // Papageien-Controller beim Dienstende dauerhaft sperren.
+            mumbleParrotController?.requestClose()
+            mumbleParrotSession++
+            mumbleParrotRecording?.cancel()
+            mumbleParrotRecording = null
             mainHandler.removeCallbacks(groupInvitationRetryTask)
             stopPtt()
             if (voipBridgeActive || bridgeFrnPttActive) {

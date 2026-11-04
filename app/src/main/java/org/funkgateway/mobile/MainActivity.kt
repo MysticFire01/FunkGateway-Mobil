@@ -2963,7 +2963,11 @@ class MainActivity : Activity() {
             }
 
             val startButton = button("▶ Verlinkung starten") {
-                val started = gatewayService?.startVoipBridge() == true
+                if (gatewayService?.isMumbleParrotActive() == true) {
+                Toast.makeText(this, "Der Papagei läuft noch. Bitte zuerst im Menü Papageien beenden.", Toast.LENGTH_LONG).show()
+                return@button
+            }
+            val started = gatewayService?.startVoipBridge() == true
                 Toast.makeText(
                     this,
                     if (started) "FRN-Mumble-Verlinkung gestartet"
@@ -2990,6 +2994,7 @@ class MainActivity : Activity() {
             bridgeStatus.text = if (active) "🟢 Verlinkung aktiv"
                 else "⚪ Verlinkung ausgeschaltet"
 
+            // Auch bei aktivem Papagei anklickbar lassen, damit die Warnung erscheint.
             startButton.isEnabled = frnReady && mumbleReady && !active
             stopButton.isEnabled = active
 
@@ -3099,13 +3104,178 @@ class MainActivity : Activity() {
             settings.save(this)
         }
 
-        root.addView(android.widget.CheckBox(this).apply {
-            text = "Signal bei maximaler Aufnahmezeit"
+        root.addView(label(
+            "Warnung bei abgelaufener Redezeit",
+            17f, Color.WHITE, true
+        ).apply {
+            setPadding(0, dp(16), 0, dp(8))
+        })
+
+        val announcementModes = listOf(
+            "Aus",
+            "Piepton",
+            "Sprachansage",
+            "Piepton und Sprachansage"
+        )
+        val announcementValues = listOf(
+            "off", "beep", "speech", "both"
+        )
+
+        root.addView(android.widget.Spinner(this).apply {
+            adapter = object : android.widget.ArrayAdapter<String>(
+                this@MainActivity,
+                android.R.layout.simple_spinner_item,
+                announcementModes
+            ) {
+                override fun getView(
+                    position: Int,
+                    convertView: android.view.View?,
+                    parent: android.view.ViewGroup
+                ): android.view.View {
+                    return super.getView(position, convertView, parent).also {
+                        (it as? android.widget.TextView)?.apply {
+                            setTextColor(Color.WHITE)
+                            setBackgroundColor(Color.rgb(30, 41, 55))
+                            setPadding(16, 12, 16, 12)
+                        }
+                    }
+                }
+
+                override fun getDropDownView(
+                    position: Int,
+                    convertView: android.view.View?,
+                    parent: android.view.ViewGroup
+                ): android.view.View {
+                    return super.getDropDownView(position, convertView, parent).also {
+                        (it as? android.widget.TextView)?.apply {
+                            setTextColor(Color.WHITE)
+                            setBackgroundColor(Color.rgb(30, 41, 55))
+                            setPadding(20, 18, 20, 18)
+                        }
+                    }
+                }
+            }
+            setSelection(
+                announcementValues.indexOf(
+                    settings.timeoutAnnouncementMode
+                ).coerceAtLeast(0)
+            )
+            onItemSelectedListener =
+                object : android.widget.AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(
+                        parent: android.widget.AdapterView<*>?,
+                        view: android.view.View?,
+                        position: Int,
+                        id: Long
+                    ) {
+                        settings = settings.copy(
+                            timeoutAnnouncementMode =
+                                announcementValues[position],
+                            timeoutSignalEnabled =
+                                announcementValues[position] != "off"
+                        )
+                        settings.save(this@MainActivity)
+                    }
+
+                    override fun onNothingSelected(
+                        parent: android.widget.AdapterView<*>?
+                    ) = Unit
+                }
+        })
+
+        root.addView(label(
+            "Text der Sprachansage",
+            17f, Color.WHITE, true
+        ).apply {
+            setPadding(0, dp(16), 0, dp(8))
+        })
+
+        val announcementTextField = android.widget.EditText(this).apply {
+            setText(settings.timeoutAnnouncementText)
             setTextColor(Color.WHITE)
-            isChecked = settings.timeoutSignalEnabled
-            setOnCheckedChangeListener { _, checked ->
-                settings = settings.copy(timeoutSignalEnabled = checked)
-                settings.save(this@MainActivity)
+            setHintTextColor(muted)
+            hint = "Hier den Ansagetext eingeben"
+            minLines = 3
+            maxLines = 8
+            inputType =
+                android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            gravity = android.view.Gravity.TOP
+        }
+        root.addView(announcementTextField)
+
+        root.addView(button("💾 Ansagetext speichern") {
+            val newText = announcementTextField.text.toString().trim()
+            if (newText.isBlank()) {
+                Toast.makeText(
+                    this,
+                    "Bitte einen Ansagetext eingeben.",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } else {
+                settings = settings.copy(
+                    timeoutAnnouncementText = newText.take(1000)
+                )
+                settings.save(this)
+                Toast.makeText(
+                    this,
+                    "Ansagetext gespeichert. Bitte Sprachansage neu vorbereiten.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        })
+
+        val announcementPrepared =
+            gatewayService?.isMumbleParrotAnnouncementPrepared() == true
+
+        root.addView(label(
+            if (announcementPrepared)
+                "✅ Sprachansage vorbereitet und einsatzbereit"
+            else
+                "⏳ Sprachansage noch nicht vorbereitet",
+            15f,
+            if (announcementPrepared) Color.GREEN else muted
+        ))
+
+        root.addView(button("🔊 Sprachansage vorbereiten") {
+            val service = gatewayService
+            if (service == null) {
+                Toast.makeText(
+                    this,
+                    "Gateway-Service ist nicht verbunden.",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } else if (service.isMumbleParrotActive() ||
+                       service.isVoipBridgeActive()) {
+                Toast.makeText(
+                    this,
+                    "Bitte zuerst Papagei oder VoIP-Verlinkung beenden.",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    "Sprachansage wird vorbereitet …",
+                    Toast.LENGTH_SHORT
+                ).show()
+
+                Thread({
+                    val prepared = service.prepareMumbleParrotAnnouncement()
+                    runOnUiThread {
+                        if (currentPage == "Papageien") {
+                            showParrots()
+                        }
+                        Toast.makeText(
+                            this,
+                            if (prepared)
+                                "Sprachansage ist vorbereitet und einsatzbereit."
+                            else
+                                "Vorbereitung fehlgeschlagen. Bitte TTS-Stimme prüfen.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }, "ParrotAnnouncementPreparation").start()
             }
         })
 
@@ -3119,9 +3289,55 @@ class MainActivity : Activity() {
             }
         })
 
+        root.addView(button("▶ Mumble-Papagei starten") {
+            if (gatewayService?.isVoipBridgeActive() == true) {
+                Toast.makeText(
+                    this,
+                    "Die VoIP-Verlinkung läuft noch. Bitte zuerst im Menü Verlinkung beenden.",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                val started = gatewayService?.startMumbleParrot() == true
+                Toast.makeText(
+                    this,
+                    if (started) "Mumble-Papagei gestartet"
+                    else "Start nicht möglich. Mumble muss verbunden und die Audiosteuerung frei sein.",
+                    Toast.LENGTH_LONG
+                ).show()
+                showParrots()
+            }
+        })
+
+        root.addView(button("■ Mumble-Papagei beenden") {
+            gatewayService?.stopMumbleParrotManually()
+            Toast.makeText(
+                this,
+                "Mumble-Papagei wird beendet.",
+                Toast.LENGTH_SHORT
+            ).show()
+            showParrots()
+        }.apply {
+            isEnabled = gatewayService?.isMumbleParrotActive() == true
+        })
+
+        val parrotRunning =
+            gatewayService?.isMumbleParrotActive() == true
+        val mumbleConnected =
+            mumbleManager?.isConnected() == true
+
+        val parrotStatus = when {
+            parrotRunning ->
+                "🟢 Mumble-Papagei läuft – Aufnahme und Wiedergabe aktiv"
+            !mumbleConnected ->
+                "🔴 Mumble nicht verbunden – bitte zuerst verbinden"
+            else ->
+                "🟢 Mumble verbunden – Papagei bereit zum Starten"
+        }
+
         root.addView(label(
-            "Die Sprachsteuerung wird als Nächstes eingebaut.",
-            14f, muted
+            parrotStatus,
+            14f,
+            if (parrotRunning || mumbleConnected) Color.GREEN else muted
         ))
         root.addView(button("← Zurück zur Übersicht") { showHome() })
 
