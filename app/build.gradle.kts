@@ -50,3 +50,18 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }
+
+// APK nach jedem erfolgreichen Debug-Build zusätzlich
+// unter dem Namen für GitHub und den Mobile-Updater bereitstellen.
+val prepareFunkGatewayApk by tasks.registering(Copy::class) {
+    group = "build"
+    description = "Erstellt FunkGateway-Mobile.apk für GitHub."
+    dependsOn("assembleDebug")
+    from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
+    into(layout.buildDirectory.dir("release"))
+    rename { "FunkGateway-Mobile.apk" }
+}
+
+tasks.matching { it.name == "assembleDebug" }.configureEach {
+    finalizedBy(prepareFunkGatewayApk)
+}
