@@ -30,9 +30,21 @@ object MobileUpdateVerifier {
             context.packageName, flags
         )
 
-        val candidate = pm.getPackageArchiveInfo(
+        var candidate = pm.getPackageArchiveInfo(
             apk.absolutePath, flags
         ) ?: error("APK kann nicht gelesen werden")
+
+        if (Build.VERSION.SDK_INT >= 28 &&
+            candidate.signingInfo?.apkContentsSigners.isNullOrEmpty()
+        ) {
+            val legacyCandidate = pm.getPackageArchiveInfo(
+                apk.absolutePath, PackageManager.GET_SIGNATURES
+            )
+
+            if (!legacyCandidate?.signatures.isNullOrEmpty()) {
+                candidate = legacyCandidate!!
+            }
+        }
 
         require(candidate.packageName == context.packageName) {
             "Falsche Paketkennung"
@@ -61,6 +73,8 @@ object MobileUpdateVerifier {
         ): Set<String> {
             val certs = if (Build.VERSION.SDK_INT >= 28) {
                 info.signingInfo?.apkContentsSigners
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: info.signatures
             } else {
                 info.signatures
             } ?: emptyArray()
@@ -77,8 +91,12 @@ object MobileUpdateVerifier {
         val expected = signatures(installed)
         val actual = signatures(candidate)
 
-        require(expected.isNotEmpty() && actual.isNotEmpty()) {
-            "APK-Signatur konnte nicht ermittelt werden"
+        require(expected.isNotEmpty()) {
+            "Signatur der installierten App fehlt (Android API ${Build.VERSION.SDK_INT})"
+        }
+
+        require(actual.isNotEmpty()) {
+            "Signatur der heruntergeladenen APK fehlt (Android API ${Build.VERSION.SDK_INT})"
         }
 
         require(actual == expected) {
