@@ -62,7 +62,7 @@ object FrnChatParser {
             }
         }
 
-        if (entries.size == 3 && entries[2].trim() == "P") {
+        if (entries.size == 3 && entries[2].trim() in setOf("P", "A")) {
             val senderId = try {
                 UUID.fromString(entries[0].trim()).toString()
             } catch (_: IllegalArgumentException) {
@@ -77,7 +77,7 @@ object FrnChatParser {
                 } ?: "FRN"
 
                 return listOf(
-                    FrnChatMessage(sender, senderId, message, true)
+                    FrnChatMessage(sender, senderId, message, entries[2].trim() == "P")
                 )
             }
         }

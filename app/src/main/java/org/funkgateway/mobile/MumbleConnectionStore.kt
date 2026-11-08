@@ -19,6 +19,7 @@ data class MumbleSavedConnection(
 
 object MumbleConnectionStore {
     private const val PREFS = "mumble_saved_connection"
+    private const val LAST_PREFS = "mumble_last_successful_connection"
     private const val KEY_ALIAS = "funkgateway_mobile_mumble_password"
 
     private fun secretKey(): SecretKey {
@@ -71,6 +72,40 @@ object MumbleConnectionStore {
             cipher.doFinal(bytes.copyOfRange(12, bytes.size)),
             Charsets.UTF_8
         )
+    }
+
+    fun loadLastSuccessful(context: Context): MumbleSavedConnection? {
+        val prefs = context.getSharedPreferences(LAST_PREFS, Context.MODE_PRIVATE)
+        val host = prefs.getString("host", null)?.takeIf { it.isNotBlank() }
+            ?: return null
+        val username = prefs.getString("username", null)?.takeIf { it.isNotBlank() }
+            ?: return null
+        val port = prefs.getInt("port", 0)
+        if (port !in 1..65535) return null
+        return MumbleSavedConnection(
+            host = host,
+            port = port,
+            username = username,
+            password = decrypt(prefs.getString("password", "") ?: "")
+        )
+    }
+
+    fun saveLastSuccessful(context: Context, connection: MumbleSavedConnection) {
+        require(connection.host.isNotBlank())
+        require(connection.username.isNotBlank())
+        require(connection.port in 1..65535)
+        val encryptedPassword = encrypt(connection.password)
+        check(
+            context.getSharedPreferences(LAST_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString("host", connection.host.trim())
+                .putInt("port", connection.port)
+                .putString("username", connection.username.trim())
+                .putString("password", encryptedPassword)
+                .commit()
+        ) {
+            "Letzte Mumble-Verbindung konnte nicht gespeichert werden."
+        }
     }
 
     fun load(context: Context): MumbleSavedConnection {

@@ -35,6 +35,28 @@ class MumbleCertificateStore(private val context: Context) {
             .digest(certificate.encoded)
             .joinToString(":") { "%02X".format(it.toInt() and 0xFF) }
 
+    data class SavedServerCertificate(
+        val host: String,
+        val port: Int,
+        val certificate: X509Certificate
+    )
+
+    fun listServerCertificates(): List<SavedServerCertificate> {
+        val store = load()
+        return store.aliases().toList().mapNotNull { name ->
+            val separator = name.lastIndexOf(':')
+            if (separator <= 0) return@mapNotNull null
+
+            val host = name.substring(0, separator)
+            val port = name.substring(separator + 1).toIntOrNull()
+                ?: return@mapNotNull null
+            val certificate = store.getCertificate(name) as? X509Certificate
+                ?: return@mapNotNull null
+
+            SavedServerCertificate(host, port, certificate)
+        }.sortedWith(compareBy({ it.host }, { it.port }))
+    }
+
     fun getCertificate(host: String, port: Int): X509Certificate? =
         load().getCertificate(alias(host, port)) as? X509Certificate
 
@@ -49,6 +71,25 @@ class MumbleCertificateStore(private val context: Context) {
         val file = File(context.cacheDir, "mumble-trust-$serverKey.bks")
         file.outputStream().use { store.store(it, password) }
         return file.absolutePath
+    }
+
+    fun deleteServerCertificate(host: String, port: Int): Boolean {
+        val store = load()
+        val serverAlias = alias(host, port)
+
+        if (!store.containsAlias(serverAlias)) return false
+
+        store.deleteEntry(serverAlias)
+
+        val temporary = File(context.filesDir, "mumble-certificates.tmp")
+        temporary.outputStream().use { store.store(it, password) }
+
+        if (!temporary.renameTo(storeFile)) {
+            temporary.delete()
+            error("TLS-Serverzertifikat konnte nicht gelöscht werden")
+        }
+
+        return true
     }
 
     fun saveCertificate(host: String, port: Int, certificate: X509Certificate) {

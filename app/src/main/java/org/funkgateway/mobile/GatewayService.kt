@@ -34,6 +34,9 @@ class GatewayService : Service() {
             MODE_PRIVATE
         )
         setFrnVolume(prefs.getInt("frn_volume", 100))
+        setFrnMicrophoneGain(
+            prefs.getInt("frn_microphone_gain", 100)
+        )
     }
 
     private var foregroundActive = false
@@ -617,6 +620,15 @@ class GatewayService : Service() {
     private var globalDeafened = false
     private var frnVolume = 100
     private var mumbleVolume = 100
+    private var frnMicrophoneGain = 100
+
+    @Synchronized
+    fun getFrnMicrophoneGain(): Int = frnMicrophoneGain
+
+    @Synchronized
+    fun setFrnMicrophoneGain(value: Int) {
+        frnMicrophoneGain = value.coerceIn(0, 300)
+    }
 
     @Synchronized
     fun getMumbleVolume(): Int = mumbleVolume
@@ -625,6 +637,11 @@ class GatewayService : Service() {
     fun setMumbleVolume(value: Int) {
         mumbleVolume = value.coerceIn(0, 100)
         mumbleManager?.setPlaybackVolume(mumbleVolume / 100f)
+    }
+
+    @Synchronized
+    fun setMumbleMicrophoneGain(value: Int) {
+        mumbleManager?.setMicrophoneGain(value.coerceIn(0, 300))
     }
 
     @Synchronized
@@ -1783,7 +1800,8 @@ class GatewayService : Service() {
                                                         stopPtt()
                                                     }
                                                 }
-                                            }
+                                            },
+                                            microphoneGainPercent = frnMicrophoneGain
                                         )
                                         frnAudioSender = sender
                                         try {
@@ -1971,7 +1989,7 @@ class GatewayService : Service() {
         val recipient = recipientId.trim()
         val message = text.trim()
 
-        require(recipient.isNotEmpty() && recipient.length <= 128) {
+        require(recipient.length <= 128) {
             "Ungültiger FRN-Empfänger."
         }
         require(recipient.none { it == '<' || it == '>' ||

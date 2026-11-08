@@ -12,7 +12,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class FrnAudioSender(
     private val context: Context,
     private val onPacket: (ByteArray) -> Unit,
-    private val onError: (Throwable) -> Unit
+    private val onError: (Throwable) -> Unit,
+    private val microphoneGainPercent: Int = 100
 ) : Closeable {
     private val running = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
@@ -96,6 +97,7 @@ class FrnAudioSender(
 
                         if (!running.get()) break
 
+                        applyMicrophoneGain(pcm)
                         val packet = codec.encode(pcm)
 
                         if (running.get()) {
@@ -132,6 +134,25 @@ class FrnAudioSender(
         }, "FRN-Audio-Sender")
 
         worker?.start()
+    }
+
+    private fun applyMicrophoneGain(pcm: ByteArray) {
+        val gain = microphoneGainPercent.coerceIn(0, 300)
+        if (gain == 100) return
+
+        var i = 0
+        while (i + 1 < pcm.size) {
+            val low = pcm[i].toInt() and 0xff
+            val high = pcm[i + 1].toInt()
+            val sample = (high shl 8) or low
+
+            val amplified = (sample * gain / 100)
+                .coerceIn(-32768, 32767)
+
+            pcm[i] = amplified.toByte()
+            pcm[i + 1] = (amplified shr 8).toByte()
+            i += 2
+        }
     }
 
     @Synchronized

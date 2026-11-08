@@ -16,6 +16,7 @@ import se.lublin.humla.model.IUser
 import se.lublin.humla.model.IMessage
 import se.lublin.humla.util.VoiceTargetMode
 import java.security.cert.X509Certificate
+import se.lublin.humla.protobuf.Mumble
 
 class MumbleConnectionManager(
     context: Context,
@@ -55,7 +56,108 @@ class MumbleConnectionManager(
     private var registrationPending = false
     private var registrationRequestId = 0L
 
+    var onOtherUserRegistrationStatusChanged: ((String) -> Unit)? = null
+    private var otherRegistrationSessionId: Int? = null
+    private var otherRegistrationRequestId = 0L
+
     private var service: IHumlaService? = null
+
+    private val registeredUsers = MumbleRegisteredUsers()
+
+    // Mumble-Bannliste: zunächst ausschließlich lesen.
+    private val mumbleBanList = MumbleBanList()
+
+    var onMumbleBansReceived:
+        ((List<MumbleBanList.BanEntry>) -> Unit)? = null
+
+    var onMumbleBanListConnectionLost: (() -> Unit)? = null
+
+    var onMumbleBanListTimeout: (() -> Unit)? = null
+
+    fun requestMumbleBanList(): Boolean {
+        if (!hasMumbleModerationPermission(
+                se.lublin.humla.net.Permissions.Ban
+            )
+        ) return false
+
+        return mumbleBanList.requestBans()
+    }
+
+    fun getMumbleBans(): List<MumbleBanList.BanEntry> =
+        mumbleBanList.getBans()
+
+
+    var onRegisteredUsersReceived:
+        ((List<MumbleRegisteredUsers.RegisteredUser>) -> Unit)? = null
+
+    var onRegisteredUsersConnectionLost: (() -> Unit)? = null
+
+    fun requestRegisteredUsers(): Boolean {
+        if (!canRegisterOtherUsers()) return false
+        return registeredUsers.requestUsers()
+    }
+
+    private fun attachMumbleBanList() {
+        val humla = service as? HumlaService ?: return
+        val generation = moderationConnectionGeneration
+        val expectedConnection = humla.connection
+
+        mumbleBanList.onBansReceived = { bans ->
+            reconnectHandler.post {
+                if (
+                    service === humla &&
+                    service?.isConnected == true &&
+                    moderationConnectionGeneration == generation &&
+                    humla.connection === expectedConnection
+                ) {
+                    onMumbleBansReceived?.invoke(bans)
+                }
+            }
+        }
+
+        mumbleBanList.onRequestTimeout = {
+            reconnectHandler.post {
+                if (
+                    service === humla &&
+                    service?.isConnected == true &&
+                    moderationConnectionGeneration == generation &&
+                    humla.connection === expectedConnection
+                ) {
+                    onMumbleBanListTimeout?.invoke()
+                }
+            }
+        }
+
+        mumbleBanList.attach(expectedConnection)
+    }
+
+    private fun detachMumbleBanList() {
+        // Vorbereitete Moderationsaktionen der alten Sitzung ungültig machen.
+        ++moderationConnectionGeneration
+        mumbleBanList.detach()
+        mumbleBanList.onBansReceived = null
+        mumbleBanList.onRequestTimeout = null
+        onMumbleBanListConnectionLost?.invoke()
+        onMumbleBansReceived?.invoke(emptyList())
+    }
+
+    private fun attachRegisteredUsers() {
+        val humla = service as? HumlaService ?: return
+        registeredUsers.onUsersReceived = { users ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                if (service?.isConnected == true) {
+                    onRegisteredUsersReceived?.invoke(users)
+                }
+            }
+        }
+        registeredUsers.attach(humla.connection)
+    }
+
+    private fun detachRegisteredUsers() {
+        registeredUsers.detach()
+        onRegisteredUsersConnectionLost?.invoke()
+        onRegisteredUsersReceived?.invoke(emptyList())
+    }
 
     private var bridgePcmListener: ((ShortArray) -> Unit)? = null
 
@@ -85,6 +187,11 @@ class MumbleConnectionManager(
         applyPlaybackVolume()
     }
 
+    fun setMicrophoneGain(percent: Int) {
+        val gain = percent.coerceIn(0, 300) / 100.0f
+        (service as? HumlaService)?.setMicrophoneGain(gain)
+    }
+
     private fun applyPlaybackVolume() {
         (service as? HumlaService)?.setLocalPlaybackVolume(
             if (playbackDeafened) 0f else playbackVolume
@@ -97,6 +204,7 @@ class MumbleConnectionManager(
     private var currentHost: String? = null
     private var currentPort: Int = 0
     private var connectionInProgress = false
+    private var tlsConnectStartedAt = 0L
     private var lastUsername: String = ""
     private var lastPassword: String = ""
     // Automatische Mumble-Wiederverbindung.
@@ -105,6 +213,7 @@ class MumbleConnectionManager(
     private val reconnectBackoff = ReconnectBackoff()
     private var reconnectEnabled = false
     private var reconnectGeneration = 0L
+    private var moderationConnectionGeneration = 0L
     private var reconnectTask: Runnable? = null
     private var manualDisconnect = false
 
@@ -235,12 +344,45 @@ class MumbleConnectionManager(
             cancelConnectTimeout()
             connectionInProgress = false
             cancelMumbleReconnect()
+            ++moderationConnectionGeneration
+
+            // Registrierungsrechte für jeden Server neu anfordern.
+            requestRegistrationPermissions()
+            attachRegisteredUsers()
+            attachMumbleBanList()
+
+            // Nur eine tatsächlich erfolgreiche Verbindung merken.
+            try {
+                MumbleConnectionStore.saveLastSuccessful(
+                    context,
+                    MumbleSavedConnection(
+                        host = currentHost?.takeIf { it.isNotBlank() }
+                            ?: error("Keine gültige Mumble-Serveradresse"),
+                        port = currentPort,
+                        username = lastUsername,
+                        password = lastPassword
+                    )
+                )
+                Log.i("FGW-Mumble", "Letzte erfolgreiche Verbindung gespeichert")
+            } catch (e: Exception) {
+                Log.w(
+                    "FGW-Mumble",
+                    "Letzte erfolgreiche Verbindung konnte nicht gespeichert werden",
+                    e
+                )
+            }
+
             onStatusChanged("Mit Mumble verbunden")
         }
 
         override fun onDisconnected(error: HumlaException?) {
+            detachMumbleBanList()
+            detachRegisteredUsers()
             cancelConnectTimeout()
             registrationPending = false
+            otherRegistrationSessionId = null
+            ++otherRegistrationRequestId
+            rootRegistrationPermissionsConfirmed = false
             connectionInProgress = false
 
             // Keine alte Aussendung nach einer Trennung fortsetzen.
@@ -287,6 +429,12 @@ class MumbleConnectionManager(
                 return
             }
 
+            Log.i(
+                "FGW-Mumble-Cert",
+                "TLS-Zertifikat nach " +
+                    (android.os.SystemClock.elapsedRealtime() - tlsConnectStartedAt) +
+                    " ms gemeldet"
+            )
             pendingCertificate = certificate
             pendingCertificateHost = host
             pendingCertificatePort = port
@@ -312,12 +460,29 @@ class MumbleConnectionManager(
             notifyRoomTreeChanged()
         }
 
-        override fun onChannelPermissionsUpdated(channel: IChannel) {}
+        override fun onChannelPermissionsUpdated(channel: IChannel) {
+            if (channel.id == 0) {
+                Log.i("FGW-Mumble", "Root-Rechte: Antwort empfangen, permissions=${channel.permissions}, Register=${(channel.permissions and 262144) != 0}")
+                rootRegistrationPermissionsConfirmed = true
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    onChannelMembershipChanged?.invoke()
+                }
+            }
+}
 
         override fun onUserConnected(user: IUser) {
             notifyRoomTreeChanged()
         }
         override fun onUserStateUpdated(user: IUser) {
+            if (otherRegistrationSessionId == user.session && user.userId >= 0) {
+                otherRegistrationSessionId = null
+                ++otherRegistrationRequestId
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    onOtherUserRegistrationStatusChanged?.invoke(
+                        "✅ ${user.name} wurde registriert (ID ${user.userId})."
+                    )
+                }
+            }
             val ownSessionId = runCatching {
                 service?.HumlaSession()?.sessionId
             }.getOrNull()
@@ -355,6 +520,10 @@ class MumbleConnectionManager(
             }
         }
         override fun onPermissionDenied(reason: String?) {
+            Log.w(
+                "FGW-Mumble",
+                "Mumble PermissionDenied empfangen: ${reason ?: "Keine Begründung"}"
+            )
             if (!registrationPending) return
             registrationPending = false
             val message = "⛔ Der Mumble-Server hat eine Berechtigung verweigert. Die Selbstregistrierung ist möglicherweise nicht erlaubt. Servermeldung: ${reason ?: "Keine Begründung"}"
@@ -398,7 +567,13 @@ class MumbleConnectionManager(
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
+            detachMumbleBanList()
+            detachRegisteredUsers()
             cancelConnectTimeout()
+            rootRegistrationPermissionsConfirmed = false
+            registrationPending = false
+            otherRegistrationSessionId = null
+            ++otherRegistrationRequestId
             // Android behält die Dienstbindung bei und verbindet sie erneut.
             // Nur die Dienstreferenz und laufende Verbindung zurücksetzen.
             service = null
@@ -441,6 +616,7 @@ class MumbleConnectionManager(
         pendingCertificateHost = null
         pendingCertificatePort = 0
         connectionInProgress = true
+        tlsConnectStartedAt = android.os.SystemClock.elapsedRealtime()
         currentHost = host.trim()
         currentPort = port
         lastUsername = username.trim()
@@ -461,6 +637,14 @@ class MumbleConnectionManager(
                 putExtra(HumlaService.EXTRAS_INPUT_QUALITY, 40000)
                 putExtra(HumlaService.EXTRAS_FRAMES_PER_PACKET, 2)
                 putExtra(HumlaService.EXTRAS_AUDIO_SOURCE, android.media.MediaRecorder.AudioSource.MIC)
+                val mumbleMicGain = context
+                    .getSharedPreferences("funkgateway_audio", Context.MODE_PRIVATE)
+                    .getInt("mumble_microphone_gain", 100)
+                    .coerceIn(0, 300)
+                putExtra(
+                    HumlaService.EXTRAS_AMPLITUDE_BOOST,
+                    mumbleMicGain / 100.0f
+                )
                 putExtra(HumlaService.EXTRAS_AUDIO_STREAM, android.media.AudioManager.STREAM_MUSIC)
                 putExtra(HumlaService.EXTRAS_ECHO_CANCELLATION_METHOD, "none")
                 putExtra(HumlaService.EXTRAS_USE_OPUS, true)
@@ -716,12 +900,22 @@ class MumbleConnectionManager(
     }
 
     fun disconnect() {
+        detachMumbleBanList()
+        detachRegisteredUsers()
         cancelConnectTimeout()
         // Bewusste Trennung: keine automatische Wiederverbindung.
         manualDisconnect = true
         reconnectEnabled = false
         cancelMumbleReconnect()
         registrationPending = false
+        otherRegistrationSessionId = null
+        ++otherRegistrationRequestId
+        rootRegistrationPermissionsConfirmed = false
+
+        // Vor der manuellen Trennung die Gateway-Bridge und PTT
+        // synchron über den vorhandenen Sicherheitsstopp beenden.
+        onConnectionLost?.invoke()
+
         stopTalking()
         stopBridgeAudio()
         pendingCertificate = null
@@ -829,7 +1023,7 @@ class MumbleConnectionManager(
 
             if (ownUser.userId >= 0) {
                 "Benutzer ${ownUser.name} ist bereits registriert (ID ${ownUser.userId})"
-            } else if (registrationPending) {
+            } else if (registrationPending || otherRegistrationSessionId != null) {
                 "Registrierung wurde bereits angefordert – warte auf Server"
             } else {
                 registrationPending = true
@@ -863,6 +1057,294 @@ class MumbleConnectionManager(
             }
         } catch (e: Exception) {
             Log.e("FGW-Mumble", "Registrierungsanforderung fehlgeschlagen", e)
+            "Registrierung konnte nicht angefordert werden: ${e.message}"
+        }
+    }
+
+    private var rootRegistrationPermissionsConfirmed = false
+
+    fun hasMumbleModerationPermission(permission: Int): Boolean {
+        val activeService = service ?: return false
+        if (!activeService.isConnected || !rootRegistrationPermissionsConfirmed) {
+            return false
+        }
+
+        val allowedPermissions = setOf(
+            se.lublin.humla.net.Permissions.Kick,
+            se.lublin.humla.net.Permissions.Ban,
+            se.lublin.humla.net.Permissions.MuteDeafen,
+            se.lublin.humla.net.Permissions.Move
+        )
+        if (permission !in allowedPermissions) return false
+
+        return runCatching {
+            val root = activeService.HumlaSession().rootChannel
+            (root.permissions and permission) == permission
+        }.getOrDefault(false)
+    }
+
+    fun canRegisterOtherUsers(): Boolean {
+        val activeService = service ?: return false
+        if (!activeService.isConnected ||
+            !rootRegistrationPermissionsConfirmed
+        ) return false
+
+        return runCatching {
+            val root = activeService.HumlaSession().rootChannel
+            (root.permissions and 262144) != 0
+        }.getOrDefault(false)
+    }
+
+    fun requestRegistrationPermissions() {
+        // Bereits bestätigte Rechte nicht durch eine erneute Abfrage verlieren.
+        // Beim Trennen der Verbindung werden sie weiterhin zurückgesetzt.
+        val activeService = service ?: return
+        if (!activeService.isConnected) {
+            Log.w("FGW-Mumble", "Root-Rechte: Abfrage übersprungen, isConnected=false")
+            return
+        }
+
+        Log.i("FGW-Mumble", "Root-Rechte: PermissionQuery für Kanal 0 wird gesendet")
+        runCatching {
+            activeService.HumlaSession().requestPermissions(0)
+        }.onFailure {
+            Log.w("FGW-Mumble", "Root-Berechtigungen nicht abrufbar", it)
+        }
+    }
+
+    fun unregisterRegisteredUser(userId: Int): String {
+        if (!canRegisterOtherUsers()) {
+            return "⛔ Keine bestätigte Berechtigung zur Deregistrierung"
+        }
+        if (userId <= 0) {
+            return "Ungültige Registrierungs-ID"
+        }
+        if (service?.isConnected != true) {
+            return "Keine Mumble-Verbindung vorhanden"
+        }
+
+        return if (registeredUsers.unregisterUser(userId)) {
+            "Deregistrierung für ID $userId angefordert"
+        } else {
+            "Deregistrierung konnte nicht gesendet werden"
+        }
+    }
+
+    fun setMumbleUserServerAudioState(
+        sessionId: Int,
+        expectedName: String,
+        expectedGeneration: Long,
+        muted: Boolean? = null,
+        deafened: Boolean? = null
+    ): String {
+        if (muted == null && deafened == null) {
+            return "Keine Audioänderung ausgewählt"
+        }
+
+        if (getModerationConnectionGeneration() != expectedGeneration) {
+            return "⛔ Mumble-Verbindung hat sich geändert"
+        }
+
+        if (!hasMumbleModerationPermission(
+                se.lublin.humla.net.Permissions.MuteDeafen
+            )
+        ) {
+            return "⛔ Keine bestätigte Mute/Deaf-Berechtigung"
+        }
+
+        val activeService = service ?: return "Keine Mumble-Verbindung"
+        if (!activeService.isConnected) return "Keine Mumble-Verbindung"
+
+        return try {
+            val session = activeService.HumlaSession()
+
+            if (sessionId == session.sessionId) {
+                return "⛔ Eigenen Benutzer hier nicht administrieren"
+            }
+
+            val target = session.getUser(sessionId)
+                ?: return "Benutzer ist nicht mehr verbunden"
+
+            if (target.name != expectedName) {
+                return "⛔ Benutzeridentität hat sich geändert"
+            }
+
+            if (getModerationConnectionGeneration() != expectedGeneration) {
+                return "⛔ Mumble-Verbindung hat sich geändert"
+            }
+
+            val newMuted = muted ?: target.isMuted
+            val newDeafened = deafened ?: target.isDeafened
+
+            session.setMuteDeafState(
+                sessionId,
+                newMuted,
+                newDeafened
+            )
+
+            Log.i(
+                "FGW-Mumble",
+                "Server-Audiostatus angefordert: ${target.name}, " +
+                    "Mute=$newMuted, Deaf=$newDeafened"
+            )
+
+            "Audioänderung für ${target.name} angefordert"
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble", "Server-Mute/Deaf fehlgeschlagen", e)
+            "Audioänderung fehlgeschlagen: ${e.message}"
+        }
+    }
+
+    fun kickMumbleUser(
+        sessionId: Int,
+        expectedName: String,
+        expectedGeneration: Long,
+        reason: String = ""
+    ): String {
+        if (getModerationConnectionGeneration() != expectedGeneration) {
+            return "⛔ Mumble-Verbindung hat sich geändert"
+        }
+        if (!hasMumbleModerationPermission(
+                se.lublin.humla.net.Permissions.Kick
+            )
+        ) {
+            return "⛔ Keine bestätigte Kick-Berechtigung"
+        }
+
+        val activeService = service ?: return "Keine Mumble-Verbindung"
+        if (!activeService.isConnected) return "Keine Mumble-Verbindung"
+
+        return try {
+            val session = activeService.HumlaSession()
+            if (sessionId == session.sessionId) {
+                return "⛔ Eigenen Benutzer nicht entfernen"
+            }
+
+            val target = session.getUser(sessionId)
+                ?: return "Benutzer ist nicht mehr verbunden"
+
+            if (target.name != expectedName) {
+                return "⛔ Benutzeridentität hat sich geändert"
+            }
+
+            if (getModerationConnectionGeneration() != expectedGeneration) {
+                return "⛔ Mumble-Verbindung hat sich geändert"
+            }
+
+            session.kickBanUser(sessionId, reason, false)
+
+            Log.i(
+                "FGW-Mumble",
+                "Kick ohne Bann angefordert: ${target.name}, Sitzung $sessionId"
+            )
+            "Kick für ${target.name} angefordert"
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble", "Mumble-Kick fehlgeschlagen", e)
+            "Kick konnte nicht angefordert werden: ${e.message}"
+        }
+    }
+
+    fun banMumbleUser(
+        sessionId: Int,
+        expectedName: String,
+        expectedGeneration: Long,
+        reason: String = ""
+    ): String {
+        if (getModerationConnectionGeneration() != expectedGeneration) {
+            return "⛔ Mumble-Verbindung hat sich geändert"
+        }
+        if (!hasMumbleModerationPermission(
+                se.lublin.humla.net.Permissions.Ban
+            )
+        ) {
+            return "⛔ Keine bestätigte Bann-Berechtigung"
+        }
+
+        val activeService = service ?: return "Keine Mumble-Verbindung"
+        if (!activeService.isConnected) return "Keine Mumble-Verbindung"
+
+        return try {
+            val session = activeService.HumlaSession()
+            if (sessionId == session.sessionId) {
+                return "⛔ Eigenen Benutzer nicht bannen"
+            }
+
+            val target = session.getUser(sessionId)
+                ?: return "Benutzer ist nicht mehr verbunden"
+
+            if (target.name != expectedName) {
+                return "⛔ Benutzeridentität hat sich geändert"
+            }
+
+            if (getModerationConnectionGeneration() != expectedGeneration) {
+                return "⛔ Mumble-Verbindung hat sich geändert"
+            }
+
+            session.kickBanUser(sessionId, reason, true)
+
+            Log.i(
+                "FGW-Mumble",
+                "Bann angefordert: ${target.name}, Sitzung $sessionId"
+            )
+            "Bann für ${target.name} angefordert"
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble", "Mumble-Bann fehlgeschlagen", e)
+            "Bann konnte nicht angefordert werden: ${e.message}"
+        }
+    }
+
+    fun requestOtherUserRegistration(sessionId: Int): String {
+        if (!canRegisterOtherUsers()) {
+            return "⛔ Keine bestätigte Berechtigung zum Registrieren anderer Benutzer"
+        }
+        val activeService = service
+        if (activeService?.isConnected != true) {
+            return "Keine Mumble-Verbindung vorhanden"
+        }
+
+        return try {
+            val session = activeService.HumlaSession()
+            val targetUser = session.getUser(sessionId)
+                ?: return "Benutzer ist nicht mehr verbunden"
+
+            if (sessionId == session.sessionId) {
+                return "Für die Eigenregistrierung bitte die vorhandene Funktion verwenden"
+            }
+            if (targetUser.userId >= 0) {
+                return "${targetUser.name} ist bereits registriert"
+            }
+            if (registrationPending || otherRegistrationSessionId != null) {
+                return "Eine Mumble-Registrierung läuft bereits"
+            }
+
+            otherRegistrationSessionId = sessionId
+            val requestId = ++otherRegistrationRequestId
+
+            try {
+                session.registerUser(sessionId)
+            } catch (e: Exception) {
+                otherRegistrationSessionId = null
+                throw e
+            }
+
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (otherRegistrationSessionId == sessionId &&
+                    otherRegistrationRequestId == requestId
+                ) {
+                    otherRegistrationSessionId = null
+                    onOtherUserRegistrationStatusChanged?.invoke(
+                        "⏳ Keine Serverbestätigung für ${targetUser.name} nach 15 Sekunden."
+                    )
+                }
+            }, 15000L)
+
+            Log.i(
+                "FGW-Mumble",
+                "Fremdregistrierung angefordert: ${targetUser.name}, Sitzung $sessionId"
+            )
+            "Registrierung für ${targetUser.name} angefordert – warte auf Server"
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble", "Fremdregistrierung fehlgeschlagen", e)
             "Registrierung konnte nicht angefordert werden: ${e.message}"
         }
     }
@@ -913,6 +1395,189 @@ class MumbleConnectionManager(
         }
     }
 
+    /**
+     * Prüft die Voraussetzungen für eine geplante Bannlistenänderung.
+     * Diese Funktion führt ausdrücklich keinen Schreibvorgang aus.
+     *
+     * Eine erfolgreiche Prüfung ersetzt keine frische Serverabfrage
+     * unmittelbar vor einer späteren Übertragung.
+     */
+    fun checkMumbleBanChangeSafety(
+        expectedGeneration: Long,
+        expectedServer: Pair<String, Int>,
+        expectedListVersion: Long
+    ): String? = MumbleBanChangeSafety.check(
+        connected = isConnected(),
+        expectedGeneration = expectedGeneration,
+        currentGeneration = moderationConnectionGeneration,
+        expectedServer = expectedServer,
+        currentServer = getConnectedServer(),
+        hasBanPermission = hasMumbleModerationPermission(
+            se.lublin.humla.net.Permissions.Ban
+        ),
+        hasValidBanList = mumbleBanList.isBanListWriteSafe(),
+        expectedListVersion = expectedListVersion,
+        currentListVersion = mumbleBanList.getReceivedListVersion()
+    )
+
+    /**
+     * Erstellt einen Sicherheitskontext für eine geplante
+     * Bannlistenänderung. Führt keinen Schreibvorgang aus.
+     */
+    /**
+     * Prüft einen zuvor gespeicherten Sicherheitskontext erneut.
+     *
+     * Eine erfolgreiche Prüfung ist noch keine Schreibfreigabe.
+     * Vor einem Schreibvorgang ist eine frische Serverabfrage nötig.
+     */
+    /**
+     * Bereitet eine neue Mumble-Sperre ausschließlich lokal vor.
+     * Es wird keine Bannliste an den Server übertragen.
+     */
+    /**
+     * Bereitet das Entfernen einer Mumble-Sperre ausschließlich lokal vor.
+     * Es wird keine Bannliste an den Server übertragen.
+     */
+    /**
+     * Sendet eine bereits vorbereitete und ausdrücklich bestätigte
+     * Bannlistenänderung. Keine automatische Wiederholung.
+     *
+     * true bedeutet nur: Übertragung ausgelöst.
+     * Die tatsächliche Serverliste muss danach neu geladen werden.
+     */
+    internal fun sendMumblePreparedBanChange(
+        change: MumblePreparedBanChange
+    ): Boolean {
+        if (validateMumbleBanChangeContext(change.context) != null) {
+            return false
+        }
+
+        val snapshot = mumbleBanList.getBanListSnapshot()
+            ?: return false
+
+        if (snapshot.first != change.context.banListVersion ||
+            snapshot.second != change.originalBans
+        ) {
+            return false
+        }
+
+        if (validateMumbleBanChangeContext(change.context) != null) {
+            return false
+        }
+
+        return mumbleBanList.sendPreparedBanList(
+            expectedVersion = change.context.banListVersion,
+            entries = change.preparedBans
+        )
+    }
+
+    internal fun prepareMumbleBanRemoval(
+        selectedBan: Mumble.BanList.BanEntry
+    ): MumblePreparedBanChange? {
+        val context = createMumbleBanChangeContext()
+            ?: return null
+
+        val snapshot = mumbleBanList.getBanListSnapshot()
+            ?: return null
+
+        if (snapshot.first != context.banListVersion) {
+            return null
+        }
+
+        if (validateMumbleBanChangeContext(context) != null) {
+            return null
+        }
+
+        val originalBans = snapshot.second
+        val preparedBans = try {
+            MumbleBanList.prepareBanRemoval(
+                existing = originalBans,
+                selected = selectedBan
+            )
+        } catch (e: IllegalArgumentException) {
+            return null
+        }
+
+        return MumblePreparedBanChange(
+            context = context,
+            operation = MumblePreparedBanChange.Operation.REMOVE,
+            originalBans = originalBans,
+            preparedBans = preparedBans
+        )
+    }
+
+    internal fun prepareMumbleBanAddition(
+        newBan: Mumble.BanList.BanEntry
+    ): MumblePreparedBanChange? {
+        val context = createMumbleBanChangeContext()
+            ?: return null
+
+        val snapshot = mumbleBanList.getBanListSnapshot()
+            ?: return null
+
+        if (snapshot.first != context.banListVersion) {
+            return null
+        }
+
+        if (validateMumbleBanChangeContext(context) != null) {
+            return null
+        }
+
+        val originalBans = snapshot.second
+        val preparedBans = MumbleBanList.prepareBanAddition(
+            existing = originalBans,
+            newBan = newBan
+        )
+
+        return MumblePreparedBanChange(
+            context = context,
+            operation = MumblePreparedBanChange.Operation.ADD,
+            originalBans = originalBans,
+            preparedBans = preparedBans
+        )
+    }
+
+    internal fun validateMumbleBanChangeContext(
+        context: MumbleBanChangeContext
+    ): String? = checkMumbleBanChangeSafety(
+        expectedGeneration = context.connectionGeneration,
+        expectedServer = context.server,
+        expectedListVersion = context.banListVersion
+    )
+
+    internal fun createMumbleBanChangeContext(): MumbleBanChangeContext? {
+        val generation = getModerationConnectionGeneration()
+            ?: return null
+        val server = getConnectedServer()
+            ?: return null
+        val version = mumbleBanList.getReceivedListVersion()
+            ?: return null
+
+        if (
+            checkMumbleBanChangeSafety(
+                expectedGeneration = generation,
+                expectedServer = server,
+                expectedListVersion = version
+            ) != null
+        ) {
+            return null
+        }
+
+        return MumbleBanChangeContext(
+            connectionGeneration = generation,
+            server = server,
+            banListVersion = version
+        )
+    }
+
+    fun getModerationConnectionGeneration(): Long? =
+        if (isConnected()) moderationConnectionGeneration else null
+
+    fun getConnectedServer(): Pair<String, Int>? =
+        if (isConnected() && !currentHost.isNullOrBlank() && currentPort in 1..65535)
+            Pair(currentHost!!, currentPort)
+        else null
+
     fun isConnected(): Boolean = service?.isConnected ?: false
 
     fun isConnecting(): Boolean = connectionInProgress
@@ -923,6 +1588,8 @@ class MumbleConnectionManager(
             reconnectTask != null
 
     fun release() {
+        detachMumbleBanList()
+        detachRegisteredUsers()
         cancelConnectTimeout()
         cancelMumbleReconnect()
         stopTalking()

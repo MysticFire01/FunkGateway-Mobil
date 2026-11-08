@@ -27,6 +27,36 @@ import org.funkgateway.mobile.frn.FrnCache
 class MainActivity : Activity() {
     private var gatewayService: GatewayService? = null
 
+    // Zertifikatsdialog nur bei aktiver Oberfläche anzeigen.
+    private var mumbleUiResumed = false
+    private var activeMumbleCertificateDialog: android.app.AlertDialog? = null
+    private var activeMumbleCertificateKey: String? = null
+
+    override fun onResume() {
+        super.onResume()
+        mumbleUiResumed = true
+        window.decorView.post {
+            checkPendingMumbleCertificate()
+        }
+    }
+
+    private fun checkPendingMumbleCertificate() {
+        if (!mumbleUiResumed || isFinishing || isDestroyed) return
+
+        val manager = mumbleManager ?: return
+        val pending = manager.getPendingCertificateRequest() ?: return
+
+        showMumbleCertificateDialog(
+            manager, pending.host, pending.port, pending.certificate
+        )
+    }
+
+    override fun onPause() {
+        mumbleUiResumed = false
+        super.onPause()
+    }
+
+
     private val mumbleCertificateImportRequest = 1496
 
     private val mumbleCertificateExportRequest = 1497
@@ -2054,7 +2084,9 @@ class MainActivity : Activity() {
     }
 
     private fun connectFrnFromSelection(
-        room: org.funkgateway.mobile.frn.FrnRoom
+        room: org.funkgateway.mobile.frn.FrnRoom,
+        profileId: String = org.funkgateway.mobile.frn.FrnProfileStore.selectedId(this),
+        navigateToParticipants: Boolean = true
     ) {
         val service = gatewayService
         if (service == null) {
@@ -2076,7 +2108,7 @@ class MainActivity : Activity() {
         try {
             val saved = org.funkgateway.mobile.frn.FrnSettingsStore.loadProfile(
                 this,
-                org.funkgateway.mobile.frn.FrnProfileStore.selectedId(this)
+                profileId
             )
             if (saved.email.isBlank() || saved.password.isBlank() ||
                 saved.callsign.isBlank()
@@ -2131,6 +2163,13 @@ class MainActivity : Activity() {
                 },
                 onConnected = {
                     selectedFrnRoom = service.getConnectedFrnRoom()
+                    selectedFrnRoom?.let { connectedRoom ->
+                        org.funkgateway.mobile.frn.FrnLastConnectionStore.save(
+                            this,
+                            connectedRoom,
+                            profileId
+                        )
+                    }
                     refreshFrnOccupancyUi()
                     if (currentPage == "FRN_PARTICIPANTS") {
                         refreshFrnParticipantsView?.invoke()
@@ -2144,7 +2183,9 @@ class MainActivity : Activity() {
                 }
             )
 
-            showFrnParticipants()
+            if (navigateToParticipants) {
+                showFrnParticipants()
+            }
         } catch (e: Exception) {
             android.app.AlertDialog.Builder(this)
                 .setTitle("FRN-Verbindung")
@@ -2950,6 +2991,10 @@ class MainActivity : Activity() {
             showParrots()
             return
         }
+        if (name == "Hilfe") {
+            showHelp()
+            return
+        }
         if (name == "Verlinkung") {
             root.addView(label("🔗 FRN ↔ Mumble", 26f, Color.WHITE, true))
 
@@ -3030,6 +3075,110 @@ class MainActivity : Activity() {
         showGatewayScreen(root)
     }
 
+
+    private fun showHelp() {
+        currentPage = "Hilfe"
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(28))
+            setBackgroundColor(bg)
+        }
+
+        content.addView(label("❔ Hilfe", 26f, Color.WHITE, true))
+        content.addView(label(
+            "FunkGateway Mobile einfach erklärt. " +
+            "Tippe auf ein Thema, um die Anleitung zu öffnen.",
+            16f, muted
+        ).apply {
+            setPadding(0, dp(12), 0, dp(20))
+        })
+
+        fun chapter(title: String, explanation: String) {
+            val details = label(explanation, 16f, Color.WHITE).apply {
+                setPadding(dp(14), dp(12), dp(14), dp(18))
+                visibility = android.view.View.GONE
+            }
+
+            val header = button("▸ $title") {
+                val opening = details.visibility != android.view.View.VISIBLE
+                details.visibility = if (opening)
+                    android.view.View.VISIBLE
+                else
+                    android.view.View.GONE
+            }
+
+            content.addView(header)
+            content.addView(details)
+        }
+
+        chapter(
+            "🚀 Erste Schritte",
+            "1. Öffne FRN oder Mumble.\n" +
+            "2. Wähle deinen Server und verbinde dich.\n" +
+            "3. Auf der Startseite siehst du den Verbindungsstatus.\n" +
+            "4. Mit „Beide zuletzt verbinden“ kannst du später " +
+            "beide zuletzt verwendeten Verbindungen starten."
+        )
+
+        chapter(
+            "📱 Handy-User",
+            "In diesem Modus nutzt du dein Smartphone zum Sprechen " +
+            "und Zuhören.\n\n" +
+            "Drücke die PTT-Taste, wenn du sprechen möchtest. " +
+            "Lasse sie wieder los, wenn du fertig bist."
+        )
+
+        chapter(
+            "🔗 VoIP-Verlinkung",
+            "Mit der Verlinkung werden FRN und Mumble miteinander verbunden.\n\n" +
+            "Verbinde zuerst beide Dienste. Starte danach die Verlinkung.\n" +
+            "Gespräche können dann zwischen beiden Diensten übertragen werden.\n\n" +
+            "Zum Beenden drücke „Verlinkung stoppen“."
+        )
+
+        chapter(
+            "🦜 Mumble-Papagei",
+            "Der Papagei nimmt eine Aussendung auf und gibt sie " +
+            "anschließend wieder.\n\n" +
+            "Verbinde zuerst Mumble. Starte dann den Papagei.\n" +
+            "Zum Beenden drücke „Papagei stoppen“."
+        )
+
+        chapter(
+            "🎙️ PTT und Audio",
+            "PTT bedeutet: Drücken, um zu sprechen.\n\n" +
+            "Im Handy-User-Modus:\n" +
+            "1. Verbinde FRN oder Mumble.\n" +
+            "2. Tippe unten auf Ziel.\n" +
+            "3. Wähle dein PTT-Ziel aus.\n" +
+            "4. Halte die PTT-Taste zum Sprechen gedrückt.\n" +
+            "5. Lasse die Taste danach los.\n\n" +
+            "Wichtig: Ohne ausgewähltes Ziel kannst du nicht senden.\n\n\n\n" +
+            "Prüfe, ob Mikrofon und Lautsprecher richtig eingestellt sind.\n" +
+            "Wenn du nichts hörst, prüfe die Lautstärke und die Verbindung."
+        )
+
+        chapter(
+            "🛡️ Sicherheit",
+            "Verlinkung und Papagei können nicht gleichzeitig laufen.\n" +
+            "Beim Stoppen werden laufende Audioübertragungen beendet.\n" +
+            "Eine Sendezeitbegrenzung schützt vor zu langen Aussendungen."
+        )
+
+        chapter(
+            "🛠️ Probleme lösen",
+            "Keine Verbindung? Prüfe Internet, Server und Zugangsdaten.\n\n" +
+            "Kein Ton? Prüfe Lautstärke und Audioeinstellungen.\n\n" +
+            "PTT funktioniert nicht? Prüfe Verbindung und ausgewähltes Sendeziel.\n\n" +
+            "Verlinkung startet nicht? FRN und Mumble müssen verbunden sein."
+        )
+
+        showGatewayScreen(ScrollView(this).apply {
+            isFillViewport = true
+            addView(content)
+        })
+    }
 
     private fun showParrots() {
         currentPage = "Papageien"
@@ -3385,12 +3534,14 @@ class MainActivity : Activity() {
                     }
                 }
             },
-            certificateCallback = { host, port, certificate ->
+            certificateCallback = { _, _, _ ->
                 runOnUiThread {
                     if (mumbleManager === manager) {
-                        showMumbleCertificateDialog(
-                            manager, host, port, certificate
+                        android.util.Log.i(
+                            "FGW-Mumble-Cert",
+                            "Zertifikatsanfrage an Oberfläche gemeldet"
                         )
+                        checkPendingMumbleCertificate()
                     }
                 }
             },
@@ -3451,9 +3602,22 @@ class MainActivity : Activity() {
         port: Int,
         certificate: java.security.cert.X509Certificate
     ) {
-        val fingerprint = manager.certificateFingerprint(certificate)
-        val previous = manager.previousCertificateFingerprint(host, port)
+        if (!mumbleUiResumed || isFinishing || isDestroyed) return
 
+        val pending = manager.getPendingCertificateRequest() ?: return
+        if (pending.host != host || pending.port != port ||
+            !pending.certificate.encoded.contentEquals(certificate.encoded)
+        ) return
+
+        val fingerprint = manager.certificateFingerprint(certificate)
+        val key = "$host:$port:$fingerprint"
+
+        if (activeMumbleCertificateDialog?.isShowing == true) {
+            if (activeMumbleCertificateKey == key) return
+            activeMumbleCertificateDialog?.dismiss()
+        }
+
+        val previous = manager.previousCertificateFingerprint(host, port)
         val warning = if (previous == null) {
             "Unbekanntes Serverzertifikat"
         } else {
@@ -3476,19 +3640,30 @@ class MainActivity : Activity() {
             append("Nur bestätigen, wenn du dem Zertifikat vertraust.")
         }
 
-        android.app.AlertDialog.Builder(this)
+        val dialog = android.app.AlertDialog.Builder(this)
             .setTitle("Mumble-Zertifikat prüfen")
             .setMessage(message)
             .setNegativeButton("Abbrechen") { _, _ ->
                 manager.rejectCertificate(host, port, certificate)
             }
-            .setOnCancelListener {
-                manager.rejectCertificate(host, port, certificate)
-            }
             .setPositiveButton("Zertifikat vertrauen") { _, _ ->
                 manager.acceptCertificate(host, port, certificate)
             }
-            .show()
+            .create()
+
+        dialog.setOnCancelListener {
+            manager.rejectCertificate(host, port, certificate)
+        }
+        dialog.setOnDismissListener {
+            if (activeMumbleCertificateDialog === dialog) {
+                activeMumbleCertificateDialog = null
+                activeMumbleCertificateKey = null
+            }
+        }
+
+        activeMumbleCertificateDialog = dialog
+        activeMumbleCertificateKey = key
+        dialog.show()
     }
 
     private fun styleMumbleDialog(dialog: android.app.AlertDialog) {
@@ -3509,6 +3684,30 @@ class MainActivity : Activity() {
         dialog.findViewById<android.widget.TextView>(android.R.id.message)
             ?.setTextColor(Color.LTGRAY)
 
+        dialog.listView?.apply {
+            setBackgroundColor(dark)
+            setOnHierarchyChangeListener(
+                object : android.view.ViewGroup.OnHierarchyChangeListener {
+                    override fun onChildViewAdded(
+                        parent: android.view.View,
+                        child: android.view.View
+                    ) {
+                        (child as? android.widget.TextView)
+                            ?.setTextColor(Color.LTGRAY)
+                    }
+
+                    override fun onChildViewRemoved(
+                        parent: android.view.View,
+                        child: android.view.View
+                    ) = Unit
+                }
+            )
+            for (i in 0 until childCount) {
+                (getChildAt(i) as? android.widget.TextView)
+                    ?.setTextColor(Color.LTGRAY)
+            }
+        }
+
         listOf(
             android.app.AlertDialog.BUTTON_POSITIVE,
             android.app.AlertDialog.BUTTON_NEGATIVE
@@ -3517,12 +3716,23 @@ class MainActivity : Activity() {
         }
     }
 
+
+    private fun showStyledMumbleDialog(
+        builder: android.app.AlertDialog.Builder
+    ): android.app.AlertDialog {
+        val dialog = builder.create()
+        dialog.show()
+        styleMumbleDialog(dialog)
+        return dialog
+    }
+
     private fun showMumble() {
         currentPage = "Mumble"
 
         if (mumbleHost.isBlank()) {
             try {
-                val saved = MumbleConnectionStore.load(this)
+                val saved = MumbleConnectionStore.loadLastSuccessful(this)
+                    ?: MumbleConnectionStore.load(this)
                 if (saved.host.isNotBlank()) {
                     mumbleHost = saved.host
                     mumblePort = saved.port.toString()
@@ -3690,22 +3900,49 @@ class MainActivity : Activity() {
 
         root.addView(serverButtons)
 
-        settingsContainer.addView(button("⭐ Aktuellen Server als Favorit speichern") {
+        fun isCurrentMumbleFavorite(): Boolean {
             val address = host.text.toString().trim()
-            val number = port.text.toString().toIntOrNull()
+            val number = port.text.toString().trim().toIntOrNull()
+            if (address.isEmpty() || number == null || number !in 1..65535) {
+                return false
+            }
+            return MumbleFavorites.load(this).any {
+                it.host.trim().equals(address, ignoreCase = true) &&
+                    it.port == number
+            }
+        }
+
+        val saveFavoriteButton = button("☆ Server als Favorit speichern") {}
+
+        fun refreshFavoriteButton() {
+            val saved = isCurrentMumbleFavorite()
+            saveFavoriteButton.text = if (saved) {
+                "✓ Bereits in Favoriten"
+            } else {
+                "☆ Server als Favorit speichern"
+            }
+            saveFavoriteButton.isEnabled = !saved
+        }
+
+        saveFavoriteButton.setOnClickListener {
+            val address = host.text.toString().trim()
+            val number = port.text.toString().trim().toIntOrNull()
 
             when {
                 address.isEmpty() -> {
-                    android.widget.Toast.makeText(
+                    Toast.makeText(
                         this, "Bitte Serveradresse eingeben",
-                        android.widget.Toast.LENGTH_SHORT
+                        Toast.LENGTH_SHORT
                     ).show()
                 }
                 number == null || number !in 1..65535 -> {
-                    android.widget.Toast.makeText(
+                    Toast.makeText(
                         this, "Bitte gültigen Port eingeben",
-                        android.widget.Toast.LENGTH_SHORT
+                        Toast.LENGTH_SHORT
                     ).show()
+                }
+                isCurrentMumbleFavorite() -> {
+                    refreshFavoriteButton()
                 }
                 else -> {
                     MumbleFavorites.add(
@@ -3715,22 +3952,36 @@ class MainActivity : Activity() {
                             host = address,
                             port = number,
                             source = "private",
-                            username = username.text.toString().trim().ifBlank {
-                                MumbleFavorites.load(this)
-                                    .firstOrNull {
-                                        it.host.equals(address, ignoreCase = true) &&
-                                        it.port == number
-                                    }?.username.orEmpty()
-                            }
+                            username = username.text.toString().trim()
                         )
                     )
-                    android.widget.Toast.makeText(
+                    Toast.makeText(
                         this, "Mumble-Server als Favorit gespeichert",
-                        android.widget.Toast.LENGTH_SHORT
+                        Toast.LENGTH_SHORT
                     ).show()
+                    refreshFavoriteButton()
                 }
             }
-        })
+        }
+
+        val favoriteWatcher = object : android.text.TextWatcher {
+            override fun beforeTextChanged(
+                s: CharSequence?, start: Int, count: Int, after: Int
+            ) = Unit
+
+            override fun onTextChanged(
+                s: CharSequence?, start: Int, before: Int, count: Int
+            ) {
+                refreshFavoriteButton()
+            }
+
+            override fun afterTextChanged(s: android.text.Editable?) = Unit
+        }
+
+        host.addTextChangedListener(favoriteWatcher)
+        port.addTextChangedListener(favoriteWatcher)
+        root.addView(saveFavoriteButton)
+        refreshFavoriteButton()
 
         root.addView(button("⚙️ Verbindungseinstellungen") {
             settingsContainer.visibility =
@@ -3743,6 +3994,28 @@ class MainActivity : Activity() {
             setPadding(0, dp(24), 0, dp(16))
         }
         root.addView(status)
+
+        val tlsStatus = label(
+            "🔐 TLS: Noch keine Verbindung gestartet",
+            14f, Color.LTGRAY
+        )
+        root.addView(tlsStatus)
+
+        fun refreshTlsStatus() {
+            val currentManager = mumbleManager
+            tlsStatus.text = when {
+                currentManager?.getPendingCertificateRequest() != null ->
+                    "🔐 TLS: Zertifikat empfangen – Bestätigung erforderlich"
+                currentManager?.isConnected() == true ->
+                    "✅ TLS: Verbindung hergestellt"
+                currentManager?.isConnecting() == true ->
+                    "⏳ TLS: Warte auf TLS-Ergebnis vom Server"
+                else ->
+                    "🔐 TLS: Keine aktive Verbindung"
+            }
+        }
+
+        refreshTlsStatus()
 
         fun saveInputs() {
             mumbleHost = host.text.toString()
@@ -3788,6 +4061,8 @@ class MainActivity : Activity() {
 
         val disconnectButton = button("⛔ Trennen") {
             saveInputs()
+            // Bridge und PTT vor dem eigentlichen Mumble-Disconnect stoppen.
+            gatewayService?.onMumbleConnectionLost(manager)
             manager.disconnect()
             gatewayService?.stopIfIdle()
             refreshMumbleConnectionButtons()
@@ -3808,12 +4083,60 @@ class MainActivity : Activity() {
                 if (currentPage != "Mumble" ||
                     mumbleStatusView !== status) return
                 refreshMumbleConnectionButtons()
+                refreshTlsStatus()
+                checkPendingMumbleCertificate()
                 connectionStatusHandler.postDelayed(this, 500L)
             }
         }
         connectionStatusHandler.postDelayed(connectionStatusUpdater, 500L)
 
         root.addView(connectionButtons)
+
+        root.addView(button("🔐 Serverzertifikat prüfen") {
+            saveInputs()
+            val pending = manager.getPendingCertificateRequest()
+
+            when {
+                pending != null -> {
+                    checkPendingMumbleCertificate()
+                }
+                manager.isConnected() -> {
+                    Toast.makeText(
+                        this,
+                        "Mumble ist verbunden. Keine Zertifikatsbestätigung offen.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                manager.isConnecting() -> {
+                    Toast.makeText(
+                        this,
+                        "Verbindungsaufbau läuft. Warte auf TLS-Ergebnis.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                else -> {
+                    val portNumber = mumblePort.toIntOrNull()
+                    if (portNumber == null || portNumber !in 1..65535 ||
+                        mumbleHost.isBlank() || mumbleUsername.isBlank()
+                    ) {
+                        Toast.makeText(
+                            this,
+                            "Bitte zuerst gültige Mumble-Verbindungsdaten eingeben.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } else {
+                        startForegroundService(
+                            Intent(this, GatewayService::class.java).apply {
+                                action = GatewayService.ACTION_START
+                            }
+                        )
+                        manager.connect(
+                            mumbleHost, portNumber, mumbleUsername, mumblePassword
+                        )
+                    }
+                }
+            }
+        })
 
         root.addView(button("← Zurück zur Übersicht") {
             showHome()
@@ -4286,11 +4609,20 @@ class MainActivity : Activity() {
                 .show()
     }
 
+    private var mumbleCertificateTab = "TLS"
+
     private fun showMumbleCertificates() {
         currentPage = "MUMBLE_CERTIFICATES"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+
+        val identityCertificateContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val tlsCertificateContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
 
         val registrationTitle = android.widget.TextView(this).apply {
@@ -4299,14 +4631,14 @@ class MainActivity : Activity() {
             textSize = 18f
             setPadding(0, dp(12), 0, dp(8))
         }
-        root.addView(registrationTitle)
+        identityCertificateContent.addView(registrationTitle)
 
         val registrationStatus = android.widget.TextView(this).apply {
             setTextColor(android.graphics.Color.LTGRAY)
             textSize = 15f
             setPadding(0, 0, 0, dp(8))
         }
-        root.addView(registrationStatus)
+        identityCertificateContent.addView(registrationStatus)
 
         val registrationManager = mumbleManager
         val registrationInfo = registrationManager?.getOwnRegistrationInfo()
@@ -4330,7 +4662,7 @@ class MainActivity : Activity() {
         }
         registrationButton.isEnabled =
             registrationInfo != null && !registrationInfo.isRegistered
-        root.addView(registrationButton)
+        identityCertificateContent.addView(registrationButton)
 
         registrationManager?.onRegistrationStatusChanged = { message ->
             runOnUiThread {
@@ -4343,129 +4675,334 @@ class MainActivity : Activity() {
             }
         }
 
-        root.addView(button("➕ Neues Zertifikat erstellen") {
+        // Gespeicherte TLS-Serverzertifikate unabhängig vom gewählten Server.
+        tlsCertificateContent.addView(label(
+            "🔐 Gespeicherte TLS-Serverzertifikate", 18f, Color.WHITE
+        ))
+        tlsCertificateContent.addView(label(
+            "Hier findest du alle Mumble-Server, deren Zertifikat du bestätigt hast.",
+            14f, Color.LTGRAY
+        ))
+
+        val serverCertificateStore = MumbleCertificateStore(this)
+        val savedServers = runCatching {
+            serverCertificateStore.listServerCertificates()
+        }
+
+        savedServers.onFailure { error ->
+            tlsCertificateContent.addView(label(
+                "⚠️ Zertifikatsliste konnte nicht gelesen werden: ${error.message}",
+                14f, Color.LTGRAY
+            ))
+        }
+
+        savedServers.getOrNull()?.let { servers ->
+            if (servers.isEmpty()) {
+                tlsCertificateContent.addView(label(
+                    "Noch keine TLS-Serverzertifikate gespeichert.",
+                    14f, Color.LTGRAY
+                ))
+            } else {
+                tlsCertificateContent.addView(label(
+                    "Server auswählen:", 15f, Color.WHITE
+                ))
+
+                val serverNames = servers.map {
+                    "${it.host}:${it.port}"
+                }
+
+                val selector = android.widget.Spinner(this).apply {
+                    adapter = android.widget.ArrayAdapter(
+                        this@MainActivity,
+                        R.layout.frn_spinner_item,
+                        serverNames
+                    )
+                    background = rounded(panel)
+                    setPopupBackgroundDrawable(rounded(panel))
+                    minimumHeight = dp(54)
+                    setPadding(dp(8), 0, dp(8), 0)
+                }
+
+                tlsCertificateContent.addView(selector)
+
+                val detailsContainer = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+                tlsCertificateContent.addView(detailsContainer)
+
+                fun showSelectedCertificate(position: Int) {
+                    detailsContainer.removeAllViews()
+                    val saved = servers.getOrNull(position) ?: return
+                    val serverName = "${saved.host}:${saved.port}"
+
+                    detailsContainer.addView(label(
+                        "🛡️ $serverName", 16f, Color.WHITE
+                    ))
+                    detailsContainer.addView(label(
+                        "SHA-256-Fingerabdruck:", 13f, Color.LTGRAY
+                    ))
+                    detailsContainer.addView(label(
+                        serverCertificateStore.fingerprint(saved.certificate),
+                        13f, Color.LTGRAY
+                    ))
+
+                    detailsContainer.addView(button(
+                        "🗑️ Zertifikat dieses Servers löschen"
+                    ) {
+                        if (mumbleManager?.isConnected() == true ||
+                            mumbleManager?.isConnecting() == true
+                        ) {
+                            Toast.makeText(
+                                this,
+                                "Bitte zuerst die Mumble-Verbindung trennen.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        } else {
+                            android.app.AlertDialog.Builder(this)
+                                .setTitle("TLS-Zertifikat löschen?")
+                                .setMessage(
+                                    "Server: $serverName\n\n" +
+                                    "Dieses Serverzertifikat wirklich löschen?\n\n" +
+                                    "Bei der nächsten Verbindung muss es erneut " +
+                                    "geprüft und bestätigt werden.\n\n" +
+                                    "Persönliche P12/PFX-Zertifikate bleiben erhalten."
+                                )
+                                .setNegativeButton("Abbrechen", null)
+                                .setPositiveButton("Löschen") { _, _ ->
+                                    if (mumbleManager?.isConnected() == true ||
+                                        mumbleManager?.isConnecting() == true
+                                    ) {
+                                        Toast.makeText(
+                                            this,
+                                            "Bitte zuerst Mumble trennen.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                        runCatching {
+                                            serverCertificateStore.deleteServerCertificate(
+                                                saved.host, saved.port
+                                            )
+                                        }.onSuccess {
+                                            Toast.makeText(
+                                                this,
+                                                "TLS-Zertifikat gelöscht.",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                            showMumbleCertificates()
+                                        }.onFailure { error ->
+                                            Toast.makeText(
+                                                this,
+                                                "Löschen fehlgeschlagen: ${error.message}",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
+                                }
+                                .show()
+                        }
+                    })
+                }
+
+                selector.onItemSelectedListener =
+                    object : android.widget.AdapterView.OnItemSelectedListener {
+                        override fun onItemSelected(
+                            parent: android.widget.AdapterView<*>?,
+                            view: View?,
+                            position: Int,
+                            id: Long
+                        ) {
+                            showSelectedCertificate(position)
+                        }
+
+                        override fun onNothingSelected(
+                            parent: android.widget.AdapterView<*>?
+                        ) {
+                            detailsContainer.removeAllViews()
+                        }
+                    }
+            }
+        }
+
+        identityCertificateContent.addView(label("👤 Persönliche Benutzerzertifikate (P12/PFX)", 18f, Color.WHITE))
+        identityCertificateContent.addView(label(
+            "Diese Zertifikate gehören zu deinem Benutzerkonto und " +
+            "werden durch das Löschen eines TLS-Serverzertifikats nicht verändert.",
+            14f, Color.LTGRAY
+        ))
+
+        identityCertificateContent.addView(button("➕ Neues Zertifikat erstellen") {
             createMumbleIdentity()
         })
 
-        root.addView(button("📂 Zertifikat importieren") {
+        identityCertificateContent.addView(button("📂 Zertifikat importieren") {
             selectMumbleCertificateFile()
         })
 
-        val store = MumbleIdentityStore(this)
-        val identities = store.listIdentities()
-        val selected = store.selectedIdentityId()
+        var identityCertificatesLoaded = false
 
-        if (identities.isEmpty()) {
-            root.addView(android.widget.TextView(this).apply {
-                text = "Noch keine Mumble-Zertifikate gespeichert."
-                textSize = 15f
-            })
-        }
+        fun loadIdentityCertificates() {
+            if (identityCertificatesLoaded) return
+            identityCertificatesLoaded = true
 
-        identities.forEach { id ->
-            val active = id == selected
+            val store = MumbleIdentityStore(this)
+            val identities = store.listIdentities()
+            val selected = store.selectedIdentityId()
 
-            val details = runCatching {
-                val bytes = store.loadIdentity(id)
-                val password = store.loadIdentityPassword(id)
-                store.inspectPkcs12(bytes, password)
+            if (identities.isEmpty()) {
+                identityCertificateContent.addView(android.widget.TextView(this).apply {
+                    text = "Noch keine Mumble-Zertifikate gespeichert."
+                    textSize = 15f
+                })
             }
 
-            val displayName = details.getOrNull()?.subject
-                ?.let { subject ->
-                    Regex("(?:^|,)\\s*CN=([^,]+)")
-                        .find(subject)?.groupValues?.get(1)
-                        ?: subject
-                }
-                ?: "Zertifikat nicht lesbar"
+            identities.forEach { id ->
+                val active = id == selected
 
-            val validity = details.getOrNull()?.let { info ->
-                val date = java.text.SimpleDateFormat(
-                    "dd.MM.yyyy",
-                    java.util.Locale.GERMANY
-                ).format(java.util.Date(info.validUntil))
-                "Gültig bis $date"
-            } ?: "Zertifikat prüfen"
-
-            val status = if (active) "✅ Aktiv" else "🔐 Auswählbar"
-            root.addView(button(
-                "$status · $displayName\n$validity"
-            ) {
-                val info = details.getOrNull()
-                val dateFormat = java.text.SimpleDateFormat(
-                    "dd.MM.yyyy", java.util.Locale.GERMANY
-                )
-
-                val message = if (info != null) {
-                    "Name: $displayName\n\n" +
-                    "Inhaber: ${info.subject}\n\n" +
-                    "Aussteller: ${info.issuer}\n\n" +
-                    "Gültig ab: ${dateFormat.format(java.util.Date(info.validFrom))}\n" +
-                    "Gültig bis: ${dateFormat.format(java.util.Date(info.validUntil))}\n\n" +
-                    "SHA-256:\n${info.fingerprint}\n\n" +
-                    "Status: ${if (active) "Aktive Identität" else "Nicht ausgewählt"}"
-                } else {
-                    "Dieses Zertifikat konnte nicht gelesen werden.\n\n" +
-                    (details.exceptionOrNull()?.message ?: "Unbekannter Fehler")
+                val details = runCatching {
+                    val bytes = store.loadIdentity(id)
+                    val password = store.loadIdentityPassword(id)
+                    store.inspectPkcs12(bytes, password)
                 }
 
-                android.app.AlertDialog.Builder(this)
-                    .setTitle("🔐 Zertifikatsdetails")
-                    .setMessage(message)
-                    .setNegativeButton("Schließen", null)
-                    .setNeutralButton("📤 Exportieren") { _, _ ->
-                        exportMumbleCertificate(id)
+                val displayName = details.getOrNull()?.subject
+                    ?.let { subject ->
+                        Regex("(?:^|,)\\s*CN=([^,]+)")
+                            .find(subject)?.groupValues?.get(1)
+                            ?: subject
                     }
-                    .setPositiveButton("Auswählen") { _, _ ->
-                        runCatching {
-                            store.selectIdentity(id)
-                        }.onSuccess {
-                            showMumbleCertificates()
-                        }.onFailure { error ->
-                            android.widget.Toast.makeText(
-                                this, error.message ?: "Auswahl fehlgeschlagen",
-                                android.widget.Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
-                    .show()
-            })
-            root.addView(button("🗑️ $displayName löschen") {
-                android.app.AlertDialog.Builder(this)
-                    .setTitle("Zertifikat wirklich löschen?")
-                    .setMessage(
-                        "Zertifikat: $displayName\n\n" +
-                        "Das Zertifikat und sein gespeichertes Passwort " +
-                        "werden von diesem Smartphone gelöscht.\n\n" +
-                        "Diese Aktion kann nicht rückgängig gemacht werden. " +
-                        "Bereits exportierte Dateien bleiben erhalten." +
-                        if (active) "\n\nACHTUNG: Dieses Zertifikat ist aktuell ausgewählt." else ""
+                    ?: "Zertifikat nicht lesbar"
+
+                val validity = details.getOrNull()?.let { info ->
+                    val date = java.text.SimpleDateFormat(
+                        "dd.MM.yyyy",
+                        java.util.Locale.GERMANY
+                    ).format(java.util.Date(info.validUntil))
+                    "Gültig bis $date"
+                } ?: "Zertifikat prüfen"
+
+                val status = if (active) "✅ Aktiv" else "🔐 Auswählbar"
+                identityCertificateContent.addView(button(
+                    "$status · $displayName\n$validity"
+                ) {
+                    val info = details.getOrNull()
+                    val dateFormat = java.text.SimpleDateFormat(
+                        "dd.MM.yyyy", java.util.Locale.GERMANY
                     )
-                    .setNegativeButton("Abbrechen", null)
-                    .setPositiveButton("Endgültig löschen") { _, _ ->
-                        runCatching {
-                            store.deleteIdentity(id)
-                        }.onSuccess {
-                            Toast.makeText(
-                                this,
-                                "Zertifikat gelöscht",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                            showMumbleCertificates()
-                        }.onFailure { error ->
-                            android.app.AlertDialog.Builder(this)
-                                .setTitle("Löschen fehlgeschlagen")
-                                .setMessage(error.message ?: "Unbekannter Fehler")
-                                .setPositiveButton("OK", null)
-                                .show()
-                        }
+
+                    val message = if (info != null) {
+                        "Name: $displayName\n\n" +
+                        "Inhaber: ${info.subject}\n\n" +
+                        "Aussteller: ${info.issuer}\n\n" +
+                        "Gültig ab: ${dateFormat.format(java.util.Date(info.validFrom))}\n" +
+                        "Gültig bis: ${dateFormat.format(java.util.Date(info.validUntil))}\n\n" +
+                        "SHA-256:\n${info.fingerprint}\n\n" +
+                        "Status: ${if (active) "Aktive Identität" else "Nicht ausgewählt"}"
+                    } else {
+                        "Dieses Zertifikat konnte nicht gelesen werden.\n\n" +
+                        (details.exceptionOrNull()?.message ?: "Unbekannter Fehler")
                     }
-                    .show()
-            })
+
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("🔐 Zertifikatsdetails")
+                        .setMessage(message)
+                        .setNegativeButton("Schließen", null)
+                        .setNeutralButton("📤 Exportieren") { _, _ ->
+                            exportMumbleCertificate(id)
+                        }
+                        .setPositiveButton("Auswählen") { _, _ ->
+                            runCatching {
+                                store.selectIdentity(id)
+                            }.onSuccess {
+                                showMumbleCertificates()
+                            }.onFailure { error ->
+                                android.widget.Toast.makeText(
+                                    this, error.message ?: "Auswahl fehlgeschlagen",
+                                    android.widget.Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                        .show()
+                })
+                identityCertificateContent.addView(button("🗑️ $displayName löschen") {
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("Zertifikat wirklich löschen?")
+                        .setMessage(
+                            "Zertifikat: $displayName\n\n" +
+                            "Das Zertifikat und sein gespeichertes Passwort " +
+                            "werden von diesem Smartphone gelöscht.\n\n" +
+                            "Diese Aktion kann nicht rückgängig gemacht werden. " +
+                            "Bereits exportierte Dateien bleiben erhalten." +
+                            if (active) "\n\nACHTUNG: Dieses Zertifikat ist aktuell ausgewählt." else ""
+                        )
+                        .setNegativeButton("Abbrechen", null)
+                        .setPositiveButton("Endgültig löschen") { _, _ ->
+                            runCatching {
+                                store.deleteIdentity(id)
+                            }.onSuccess {
+                                Toast.makeText(
+                                    this,
+                                    "Zertifikat gelöscht",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                showMumbleCertificates()
+                            }.onFailure { error ->
+                                android.app.AlertDialog.Builder(this)
+                                    .setTitle("Löschen fehlgeschlagen")
+                                    .setMessage(error.message ?: "Unbekannter Fehler")
+                                    .setPositiveButton("OK", null)
+                                    .show()
+                            }
+                        }
+                        .show()
+                })
 
 
 
+            }
         }
+
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val tlsTabButton = button("🔐 TLS-Server") {}
+        val identityTabButton = button("👤 Benutzer-Identität") {}
+
+        tabs.addView(tlsTabButton, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+        ))
+        tabs.addView(identityTabButton, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+        ))
+
+        root.addView(tabs)
+        root.addView(tlsCertificateContent)
+        root.addView(identityCertificateContent)
+
+        fun updateCertificateTabs() {
+            val showTls = mumbleCertificateTab == "TLS"
+            tlsCertificateContent.visibility =
+                if (showTls) View.VISIBLE else View.GONE
+            identityCertificateContent.visibility =
+                if (showTls) View.GONE else View.VISIBLE
+
+            if (!showTls) {
+                loadIdentityCertificates()
+            }
+
+            tlsTabButton.isEnabled = !showTls
+            identityTabButton.isEnabled = showTls
+        }
+
+        tlsTabButton.setOnClickListener {
+            mumbleCertificateTab = "TLS"
+            updateCertificateTabs()
+        }
+        identityTabButton.setOnClickListener {
+            mumbleCertificateTab = "IDENTITY"
+            updateCertificateTabs()
+        }
+        updateCertificateTabs()
 
         showGatewayScreen(ScrollView(this).apply {
             addView(root)
@@ -4627,6 +5164,149 @@ class MainActivity : Activity() {
                             )
                         )
 
+                        if (!isSelf) {
+                            userRow.setOnLongClickListener {
+                                val manager = mumbleManager
+                                val generation =
+                                    manager?.getModerationConnectionGeneration()
+
+                                val actions = mutableListOf<String>()
+                                if (!user.registered && manager?.canRegisterOtherUsers() == true) {
+                                    actions.add("🔐 Benutzer registrieren")
+                                }
+                                if (generation != null &&
+                                    manager.hasMumbleModerationPermission(
+                                        se.lublin.humla.net.Permissions.Kick
+                                    )
+                                ) {
+                                    actions.add("🚪 Benutzer kicken")
+                                }
+                                if (generation != null &&
+                                    manager.hasMumbleModerationPermission(
+                                        se.lublin.humla.net.Permissions.MuteDeafen
+                                    )
+                                ) {
+                                    actions.add(
+                                        if (user.serverMuted)
+                                            "🔊 Server-Mute aufheben"
+                                        else "🔇 Serverseitig stummschalten"
+                                    )
+                                    actions.add(
+                                        if (user.serverDeafened)
+                                            "🔉 Server-Deaf aufheben"
+                                        else "🎧 Serverseitig taubschalten"
+                                    )
+                                }
+
+                                if (actions.isEmpty()) {
+                                    android.widget.Toast.makeText(
+                                        this@MainActivity,
+                                        "Keine verfügbaren Benutzeraktionen",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    android.app.AlertDialog.Builder(this@MainActivity)
+                                        .setTitle("👤 ${user.name}")
+                                        .setItems(actions.toTypedArray()) { _, selected ->
+                                            when (actions[selected]) {
+                                                "🔐 Benutzer registrieren" -> {
+                                                    android.app.AlertDialog.Builder(this@MainActivity)
+                                                        .setTitle("Benutzer registrieren?")
+                                                        .setMessage(
+                                                            "Soll ${user.name} auf diesem Mumble-Server " +
+                                                                "registriert werden?\n\n" +
+                                                                "Dafür benötigst du die entsprechende " +
+                                                                "Berechtigung auf dem Server."
+                                                        )
+                                                        .setNegativeButton("Abbrechen", null)
+                                                        .setPositiveButton("Registrieren") { _, _ ->
+                                                            val result = mumbleManager
+                                                                ?.requestOtherUserRegistration(user.sessionId)
+                                                                ?: "Keine Mumble-Verbindung vorhanden"
+                                                            android.widget.Toast.makeText(
+                                                                this@MainActivity,
+                                                                result,
+                                                                android.widget.Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
+                                                        .show().also { styleMumbleDialog(it) }
+                                                }
+                                                "🔇 Serverseitig stummschalten",
+                                                "🔊 Server-Mute aufheben",
+                                                "🎧 Serverseitig taubschalten",
+                                                "🔉 Server-Deaf aufheben" -> {
+                                                    val action = actions[selected]
+                                                    val isMute = action.contains("Mute") ||
+                                                        action.contains("stummschalten")
+                                                    val enable = action.contains("stummschalten") ||
+                                                        action.contains("taubschalten")
+
+                                                    android.app.AlertDialog.Builder(this@MainActivity)
+                                                        .setTitle(action)
+                                                        .setMessage(
+                                                            "Soll der serverseitige Audiostatus von " +
+                                                                "${user.name} geändert werden?\n\n" +
+                                                                "Dafür benötigst du die entsprechende " +
+                                                                "Mumble-Administratorberechtigung."
+                                                        )
+                                                        .setNegativeButton("Abbrechen", null)
+                                                        .setPositiveButton("Bestätigen") { _, _ ->
+                                                            val result = if (generation != null) {
+                                                                mumbleManager
+                                                                    ?.setMumbleUserServerAudioState(
+                                                                        user.sessionId,
+                                                                        user.name,
+                                                                        generation,
+                                                                        muted = if (isMute) enable else null,
+                                                                        deafened = if (isMute) null else enable
+                                                                    )
+                                                                    ?: "Keine Mumble-Verbindung vorhanden"
+                                                            } else {
+                                                                "Mumble-Verbindung hat sich geändert"
+                                                            }
+                                                            android.widget.Toast.makeText(
+                                                                this@MainActivity,
+                                                                result,
+                                                                android.widget.Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
+                                                        .show().also { styleMumbleDialog(it) }
+                                                }
+                                                "🚪 Benutzer kicken" -> {
+                                                    android.app.AlertDialog.Builder(this@MainActivity)
+                                                        .setTitle("Benutzer kicken?")
+                                                        .setMessage(
+                                                            "Soll ${user.name} vom Mumble-Server " +
+                                                                "entfernt werden?\n\n" +
+                                                                "Dies ist kein dauerhafter Bann."
+                                                        )
+                                                        .setNegativeButton("Abbrechen", null)
+                                                        .setPositiveButton("Kicken") { _, _ ->
+                                                            val result = if (generation != null) {
+                                                                mumbleManager?.kickMumbleUser(
+                                                                    user.sessionId,
+                                                                    user.name,
+                                                                    generation
+                                                                ) ?: "Keine Mumble-Verbindung vorhanden"
+                                                            } else {
+                                                                "Mumble-Verbindung hat sich geändert"
+                                                            }
+                                                            android.widget.Toast.makeText(
+                                                                this@MainActivity,
+                                                                result,
+                                                                android.widget.Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
+                                                        .show().also { styleMumbleDialog(it) }
+                                                }
+                                            }
+                                        }
+                                        .show().also { styleMumbleDialog(it) }
+                                }
+                                true
+                            }
+                        }
+
                         treeContainer.addView(userRow)
                     }
 
@@ -4770,6 +5450,19 @@ class MainActivity : Activity() {
             }
         }
 
+        mumbleManager?.onOtherUserRegistrationStatusChanged = { message ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_ROOMS") {
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("🔐 Mumble-Registrierung")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show().also { styleMumbleDialog(it) }
+                    renderTree()
+                }
+            }
+        }
+
         mumbleManager?.onTalkStateChanged = { sessionId, talkState ->
             if (currentPage == "MUMBLE_ROOMS") {
                 mouthViews[sessionId]?.let { mouthView ->
@@ -4787,6 +5480,734 @@ class MainActivity : Activity() {
         }
 
         showGatewayScreen(root)
+    }
+
+
+    private fun showMumbleAdmin() {
+        currentPage = "MUMBLE_ADMIN"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(24), dp(16), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("🛡️ Mumble – Administration", 22f, Color.WHITE, true))
+        root.addView(label(
+            "Verwaltung und Moderation des verbundenen Mumble-Servers.",
+            14f, muted
+        ))
+
+        root.addView(button("👥 Registrierte Benutzer verwalten") {
+            showMumbleRegisteredUsers()
+        })
+
+        root.addView(button("🚫 Bannliste verwalten") {
+            showMumbleBanList()
+        })
+
+        root.addView(label(
+            "Weitere Administratorfunktionen folgen.",
+            14f, muted
+        ))
+
+        showGatewayScreen(ScrollView(this).apply {
+            addView(root)
+        })
+    }
+
+    private fun showMumbleBanList() {
+        currentPage = "MUMBLE_BAN_LIST"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(16))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("🚫 Mumble – Bannliste", 21f, Color.WHITE, true))
+        root.addView(label(
+            "Gesperrte Benutzer des verbundenen Mumble-Servers.",
+            14f, muted
+        ))
+
+        val search = android.widget.EditText(this).apply {
+            hint = "🔎 Name / IP / Sperrgrund"
+            setSingleLine(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(muted)
+        }
+
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+
+        toolbar.addView(
+            search,
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+
+        val refreshButton = button("🔄") {}
+        toolbar.addView(
+            refreshButton,
+            LinearLayout.LayoutParams(dp(52), dp(48))
+        )
+
+        toolbar.addView(
+            button("←") { showMumbleAdmin() },
+            LinearLayout.LayoutParams(dp(52), dp(48))
+        )
+
+        root.addView(toolbar)
+
+        val addBanButton = button("➕ Neue Sperre") {
+            val fields = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(20), dp(8), dp(20), dp(8))
+            }
+
+            fun addField(title: String, hintText: String): android.widget.EditText {
+                fields.addView(label(title, 14f, Color.WHITE, true))
+                return android.widget.EditText(this).apply {
+                    hint = hintText
+                    setSingleLine(true)
+                    setTextColor(Color.WHITE)
+                    setHintTextColor(muted)
+                    setBackgroundColor(panel)
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                    fields.addView(this)
+                }
+            }
+
+            val nameInput = addField("Benutzername (optional)", "Benutzername")
+            val ipInput = addField("IP-Adresse / CIDR", "192.0.2.10/32")
+            val reasonInput = addField("Begründung", "Grund der Sperre")
+            val hashInput = addField("Zertifikat-Hash (optional)", "Zertifikat-Hash")
+
+            fields.addView(label("Sperrdauer", 14f, Color.WHITE, true))
+            val durationOptions = arrayOf(
+                "Dauerhaft", "1 Stunde", "1 Tag", "7 Tage",
+                "30 Tage", "Eigene Dauer (Sekunden)"
+            )
+            val durationSpinner = android.widget.Spinner(this).apply {
+                adapter = object : android.widget.ArrayAdapter<String>(
+                    this@MainActivity,
+                    android.R.layout.simple_spinner_item,
+                    durationOptions
+                ) {
+                    override fun getView(
+                        position: Int,
+                        convertView: android.view.View?,
+                        parent: android.view.ViewGroup
+                    ): android.view.View {
+                        return super.getView(position, convertView, parent).also {
+                            (it as? android.widget.TextView)?.apply {
+                                setTextColor(Color.WHITE)
+                                setBackgroundColor(panel)
+                                setPadding(dp(12), dp(10), dp(12), dp(10))
+                            }
+                        }
+                    }
+
+                    override fun getDropDownView(
+                        position: Int,
+                        convertView: android.view.View?,
+                        parent: android.view.ViewGroup
+                    ): android.view.View {
+                        return super.getDropDownView(position, convertView, parent).also {
+                            (it as? android.widget.TextView)?.apply {
+                                setTextColor(Color.WHITE)
+                                setBackgroundColor(panel)
+                                setPadding(dp(12), dp(12), dp(12), dp(12))
+                            }
+                        }
+                    }
+                }
+            }
+            durationSpinner.setBackgroundColor(panel)
+            fields.addView(durationSpinner)
+
+            val customDurationLabel = label(
+                "Eigene Dauer in Sekunden", 14f, Color.WHITE, true
+            ).apply {
+                visibility = android.view.View.GONE
+            }
+            fields.addView(customDurationLabel)
+
+            val customDuration = android.widget.EditText(this).apply {
+                hint = "3600"
+                setSingleLine(true)
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                setTextColor(Color.WHITE)
+                setHintTextColor(muted)
+                setBackgroundColor(panel)
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                visibility = android.view.View.GONE
+            }
+            fields.addView(customDuration)
+
+            durationSpinner.onItemSelectedListener =
+                object : android.widget.AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(
+                        parent: android.widget.AdapterView<*>?,
+                        view: android.view.View?,
+                        position: Int,
+                        id: Long
+                    ) {
+                        val visibilityValue =
+                            if (position == 5) android.view.View.VISIBLE
+                            else android.view.View.GONE
+                        customDurationLabel.visibility = visibilityValue
+                        customDuration.visibility = visibilityValue
+                    }
+
+                    override fun onNothingSelected(
+                        parent: android.widget.AdapterView<*>?
+                    ) = Unit
+                }
+
+            val dialog = android.app.AlertDialog.Builder(this)
+                .setTitle("Mumble – Sperre hinzufügen")
+                .setView(ScrollView(this).apply { addView(fields) })
+                .setNegativeButton("Abbrechen", null)
+                .setPositiveButton("Prüfen", null)
+                .create()
+
+            dialog.setOnShowListener {
+                dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+                    .setOnClickListener {
+                        val parsed = MumbleBanList.parseBanAddress(
+                            ipInput.text.toString()
+                        )
+                        if (parsed == null) {
+                            ipInput.error = "Ungültige IP-Adresse oder Netzmaske"
+                            return@setOnClickListener
+                        }
+
+                        val duration = when (durationSpinner.selectedItemPosition) {
+                            0 -> 0L
+                            1 -> 3600L
+                            2 -> 86400L
+                            3 -> 604800L
+                            4 -> 2592000L
+                            else -> customDuration.text.toString().toLongOrNull() ?: -1L
+                        }
+
+                        if (duration < 0L || duration > Int.MAX_VALUE) {
+                            customDuration.error = "Ungültige Sperrdauer"
+                            return@setOnClickListener
+                        }
+
+                        val wideNetwork = parsed.mask < 120
+                        val warning = if (wideNetwork) {
+                            "\n\n⚠️ Achtung: Diese Netzsperre kann viele Adressen betreffen."
+                        } else {
+                            ""
+                        }
+
+                        val newBan = se.lublin.humla.protobuf.Mumble.BanList.BanEntry
+                            .newBuilder()
+                            .setAddress(
+                                com.google.protobuf.ByteString.copyFrom(parsed.address)
+                            )
+                            .setMask(parsed.mask)
+                            .setName(nameInput.text.toString().trim())
+                            .setReason(reasonInput.text.toString().trim())
+                            .setHash(hashInput.text.toString().trim())
+                            .setDuration(duration.toInt())
+                            .build()
+
+                        val manager = mumbleManager
+                        val change = manager?.prepareMumbleBanAddition(newBan)
+
+                        if (change == null) {
+                            android.widget.Toast.makeText(
+                                this@MainActivity,
+                                "Bitte die aktuelle Bannliste erneut laden.",
+                                android.widget.Toast.LENGTH_LONG
+                            ).show()
+                            return@setOnClickListener
+                        }
+
+                        showStyledMumbleDialog(
+                            android.app.AlertDialog.Builder(this@MainActivity)
+                                .setTitle("Neue Mumble-Sperre bestätigen")
+                                .setMessage(
+                                    "Benutzer: ${nameInput.text}\\n" +
+                                    "IP/Netz: ${ipInput.text}\\n" +
+                                    "Grund: ${reasonInput.text}\\n" +
+                                    "Dauer: ${if (duration == 0L) "Dauerhaft" else "$duration Sekunden"}" +
+                                    warning +
+                                    "\\n\\nDie vollständige Bannliste wird übertragen. " +
+                                    "Zwischenzeitliche Änderungen anderer Administratoren " +
+                                    "könnten überschrieben werden."
+                                )
+                                .setNegativeButton("Abbrechen", null)
+                                .setPositiveButton("Sperre übertragen") { _, _ ->
+                                    val sent = manager.sendMumblePreparedBanChange(change)
+                                    if (sent) {
+                                        dialog.dismiss()
+                                        showMumbleBanList()
+                                        android.widget.Toast.makeText(
+                                            this@MainActivity,
+                                            "Änderung gesendet. Serverliste wird kontrolliert.",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                        android.widget.Toast.makeText(
+                                            this@MainActivity,
+                                            "Nicht gesendet. Bitte Bannliste neu laden.",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                }
+                        )
+                    }
+            }
+            dialog.show()
+            styleMumbleDialog(dialog)
+        }
+
+        root.addView(addBanButton)
+
+        val status = label("Noch keine Bannliste geladen.", 14f, muted)
+        root.addView(status)
+
+        val listContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        var allBans = emptyList<MumbleBanList.BanEntry>()
+
+        fun formatBanStart(value: String): String {
+            if (value.isBlank()) return "Unbekannt"
+
+            return try {
+                val instant = java.time.Instant.parse(value)
+                val berlin = instant.atZone(
+                    java.time.ZoneId.of("Europe/Berlin")
+                )
+                val formatter = java.time.format.DateTimeFormatter.ofPattern(
+                    "dd.MM.yyyy, HH:mm 'Uhr' z",
+                    java.util.Locale.GERMANY
+                )
+                berlin.format(formatter)
+            } catch (e: Exception) {
+                value
+            }
+        }
+
+        fun renderBans() {
+            listContainer.removeAllViews()
+
+            val filter = search.text.toString().trim()
+            val filtered = allBans.filter {
+                it.name.contains(filter, ignoreCase = true) ||
+                    it.reason.contains(filter, ignoreCase = true) ||
+                    MumbleBanList.formatAddress(it).contains(filter, ignoreCase = true)
+            }
+
+            if (filtered.isEmpty()) {
+                listContainer.addView(label(
+                    if (allBans.isEmpty()) {
+                        "Keine Sperren in der geladenen Liste."
+                    } else {
+                        "Keine passenden Einträge."
+                    },
+                    14f, muted
+                ))
+            }
+
+            filtered.forEach { ban ->
+                val duration = when {
+                    ban.durationSeconds == 0 -> "Dauerhaft"
+                    ban.durationSeconds < 3600 ->
+                        "${ban.durationSeconds / 60} Minuten"
+                    ban.durationSeconds < 86400 ->
+                        "${ban.durationSeconds / 3600} Stunden"
+                    else ->
+                        "${ban.durationSeconds / 86400} Tage"
+                }
+
+                val entry = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(16), dp(14), dp(16), dp(14))
+                    background = GradientDrawable().apply {
+                        setColor(panel)
+                        cornerRadius = dp(16).toFloat()
+                    }
+                }
+
+                entry.addView(label(
+                    ban.name.ifBlank { "Unbekannter Benutzer" },
+                    17f, Color.WHITE, true
+                ))
+                entry.addView(label(
+                    "IP/Netz: ${MumbleBanList.formatAddress(ban)}",
+                    14f, muted
+                ))
+                entry.addView(label(
+                    "Grund: ${ban.reason.ifBlank { "Nicht angegeben" }}",
+                    14f, muted
+                ))
+                entry.addView(label(
+                    "Beginn: ${formatBanStart(ban.start)}",
+                    14f, muted
+                ))
+                entry.addView(label(
+                    "Dauer: $duration",
+                    14f, muted
+                ))
+
+                entry.addView(button("🗑️ Sperre entfernen") {
+                    val manager = mumbleManager
+                    val change = manager?.prepareMumbleBanRemoval(ban.original)
+
+                    if (change == null) {
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            "Bitte die aktuelle Bannliste erneut laden.",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    } else {
+                        showStyledMumbleDialog(
+                            android.app.AlertDialog.Builder(this@MainActivity)
+                                .setTitle("Mumble – Sperre entfernen")
+                                .setMessage(
+                                    "Sperre für „${ban.name.ifBlank {
+                                        MumbleBanList.formatAddress(ban)
+                                    }}“ wirklich entfernen?\\n\\n" +
+                                    "Die gesamte aktualisierte Bannliste wird " +
+                                    "übertragen. Änderungen anderer Administratoren " +
+                                    "könnten überschrieben werden."
+                                )
+                                .setNegativeButton("Abbrechen", null)
+                                .setPositiveButton("Sperre entfernen") { _, _ ->
+                                    val sent = manager.sendMumblePreparedBanChange(change)
+                                    if (sent) {
+                                        showMumbleBanList()
+                                        android.widget.Toast.makeText(
+                                            this@MainActivity,
+                                            "Entbannung gesendet. Serverliste wird kontrolliert.",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                        android.widget.Toast.makeText(
+                                            this@MainActivity,
+                                            "Nicht gesendet. Bitte Bannliste neu laden.",
+                                            android.widget.Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                }
+                        )
+                    }
+                })
+
+                listContainer.addView(
+                    entry,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        setMargins(0, dp(6), 0, dp(10))
+                    }
+                )
+            }
+        }
+
+        search.addTextChangedListener(
+            object : android.text.TextWatcher {
+                override fun beforeTextChanged(
+                    s: CharSequence?, start: Int, count: Int, after: Int
+                ) {}
+                override fun onTextChanged(
+                    s: CharSequence?, start: Int, before: Int, count: Int
+                ) {
+                    renderBans()
+                }
+                override fun afterTextChanged(s: android.text.Editable?) {}
+            }
+        )
+
+        refreshButton.setOnClickListener {
+            allBans = emptyList()
+            listContainer.removeAllViews()
+            status.text = "Bannliste wird angefordert …"
+            if (mumbleManager?.requestMumbleBanList() != true) {
+                status.text =
+                    "Keine Verbindung oder keine bestätigten Bannlistenrechte."
+            }
+        }
+
+        root.addView(
+            ScrollView(this).apply {
+                addView(listContainer)
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+
+        mumbleManager?.onMumbleBanListConnectionLost = {
+            runOnUiThread {
+                if (currentPage == "MUMBLE_BAN_LIST") {
+                    allBans = emptyList()
+                    listContainer.removeAllViews()
+                    status.text = "Mumble-Verbindung getrennt."
+                }
+            }
+        }
+
+        mumbleManager?.onMumbleBansReceived = { bans ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_BAN_LIST") {
+                    allBans = bans
+                    status.text = "${bans.size} Sperren geladen."
+                    renderBans()
+                }
+            }
+        }
+
+        mumbleManager?.onMumbleBanListTimeout = {
+            runOnUiThread {
+                if (currentPage == "MUMBLE_BAN_LIST") {
+                    allBans = emptyList()
+                    listContainer.removeAllViews()
+                    status.text =
+                        "⚠️ Keine Antwort vom Mumble-Server innerhalb von " +
+                        "10 Sekunden. Bitte die Mumble-Verbindung " +
+                        "trennen und neu verbinden."
+                }
+            }
+        }
+
+        showGatewayScreen(root)
+
+        status.text = "Bannliste wird angefordert …"
+        if (mumbleManager?.requestMumbleBanList() != true) {
+            status.text =
+                "Keine Verbindung oder keine bestätigten Bannlistenrechte."
+        }
+    }
+
+    private fun showMumbleRegisteredUsers() {
+        currentPage = "MUMBLE_REGISTERED_USERS"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(16))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label("👥 Registrierte Mumble-Benutzer", 21f, Color.WHITE, true))
+        root.addView(label(
+            "Hier erscheinen auch registrierte Benutzer, die gerade offline sind.",
+            14f, muted
+        ))
+
+        val search = android.widget.EditText(this).apply {
+            hint = "🔎 Name / ID"
+            setSingleLine(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(muted)
+        }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+
+        toolbar.addView(
+            search,
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+
+        val refreshUsersButton = button("🔄") {}
+        toolbar.addView(
+            refreshUsersButton,
+            LinearLayout.LayoutParams(dp(52), dp(48))
+        )
+
+        toolbar.addView(
+            button("←") { showMumbleAdmin() },
+            LinearLayout.LayoutParams(dp(52), dp(48))
+        )
+
+        root.addView(toolbar)
+
+        val status = label("Noch keine Benutzerliste geladen.", 14f, muted)
+        root.addView(status)
+
+        val listContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        var allUsers = emptyList<MumbleRegisteredUsers.RegisteredUser>()
+        var pendingRemovalId: Int? = null
+        var pendingRemovalName: String? = null
+        var removalVerificationRequested = false
+
+        fun renderUsers() {
+            listContainer.removeAllViews()
+            val query = search.text.toString().trim()
+            val visible = allUsers.filter {
+                query.isEmpty() ||
+                    it.name.contains(query, ignoreCase = true) ||
+                    it.id.toString().contains(query)
+            }
+
+            status.text = if (allUsers.isEmpty()) {
+                "Keine registrierten Benutzer empfangen."
+            } else {
+                "${visible.size} von ${allUsers.size} registrierten Benutzern"
+            }
+
+            visible.forEach { user ->
+                val userRow = label(
+                    "👤 ${user.name}  ·  ID ${user.id}",
+                    16f, Color.WHITE
+                ).apply {
+                    setPadding(dp(4), dp(10), dp(4), dp(10))
+                    setOnClickListener {
+                        android.app.AlertDialog.Builder(this@MainActivity)
+                            .setTitle("👤 Registrierter Benutzer")
+                            .setMessage(
+                                "Name: ${user.name}\n" +
+                                "Registrierungs-ID: ${user.id}\n" +
+                                "Zuletzt gesehen: " +
+                                (user.lastSeen.ifBlank { "Unbekannt" })
+                            )
+                            .setNegativeButton("Schließen", null)
+                            .setPositiveButton("Registrierung entfernen") { _, _ ->
+                                android.app.AlertDialog.Builder(this@MainActivity)
+                                    .setTitle("⚠️ Registrierung entfernen?")
+                                    .setMessage(
+                                        "Benutzer: ${user.name}\n" +
+                                        "Registrierungs-ID: ${user.id}\n\n" +
+                                        "Die Registrierung wird dauerhaft vom " +
+                                        "Mumble-Server entfernt.\n\n" +
+                                        "Möchtest du wirklich fortfahren?"
+                                    )
+                                    .setNegativeButton("Abbrechen", null)
+                                    .setPositiveButton("Ja, entfernen") { _, _ ->
+                                        val result = mumbleManager
+                                            ?.unregisterRegisteredUser(user.id)
+                                            ?: "Keine Mumble-Verbindung vorhanden"
+                                        status.text = result
+                                        if (result.startsWith("Deregistrierung für ID")) {
+                                            pendingRemovalId = user.id
+                                            pendingRemovalName = user.name
+                                            removalVerificationRequested = false
+                                            status.postDelayed({
+                                                if (currentPage == "MUMBLE_REGISTERED_USERS") {
+                                                    status.text = "Überprüfe Benutzerliste …"
+                                                    removalVerificationRequested =
+                                                        mumbleManager?.requestRegisteredUsers() == true
+                                                    if (!removalVerificationRequested) {
+                                                        pendingRemovalId = null
+                                                        pendingRemovalName = null
+                                                        status.text = "⚠️ Überprüfung nicht möglich: " +
+                                                            "Keine Verbindung oder Berechtigung."
+                                                    }
+                                                }
+                                            }, 1200L)
+                                        }
+                                    }
+                                    .show().also { styleMumbleDialog(it) }
+                            }
+                            .show().also { styleMumbleDialog(it) }
+                    }
+                }
+                listContainer.addView(userRow)
+                if (user.lastSeen.isNotBlank()) {
+                    listContainer.addView(label(
+                        "Zuletzt gesehen: ${user.lastSeen}",
+                        13f, muted
+                    ))
+                }
+            }
+        }
+
+        search.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(
+                s: CharSequence?, start: Int, count: Int, after: Int
+            ) {}
+            override fun onTextChanged(
+                s: CharSequence?, start: Int, before: Int, count: Int
+            ) {
+                renderUsers()
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+
+        refreshUsersButton.setOnClickListener {
+            status.text = "Benutzerliste wird angefordert …"
+            if (mumbleManager?.requestRegisteredUsers() != true) {
+                status.text = "Keine Verbindung oder keine bestätigten Administratorrechte."
+            }
+        }
+
+        root.addView(
+            ScrollView(this).apply {
+                addView(listContainer)
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+
+        mumbleManager?.onRegisteredUsersConnectionLost = {
+            runOnUiThread {
+                if (currentPage == "MUMBLE_REGISTERED_USERS") {
+                    val wasPending = pendingRemovalId != null
+                    pendingRemovalId = null
+                    pendingRemovalName = null
+                    removalVerificationRequested = false
+                    if (wasPending) {
+                        status.text = "⚠️ Mumble-Verbindung getrennt. " +
+                            "Deregistrierung konnte nicht überprüft werden."
+                    }
+                }
+            }
+        }
+
+        mumbleManager?.onRegisteredUsersReceived = { users ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_REGISTERED_USERS") {
+                    allUsers = users
+                    renderUsers()
+
+                    val removalId = pendingRemovalId
+                    if (removalId != null &&
+                        removalVerificationRequested &&
+                        mumbleManager?.isConnected() == true
+                    ) {
+                        removalVerificationRequested = false
+                        val removalName = pendingRemovalName ?: "Unbekannt"
+                        pendingRemovalId = null
+                        pendingRemovalName = null
+
+                        status.text = if (users.none { it.id == removalId }) {
+                            "✅ Registrierung entfernt: $removalName (ID $removalId)"
+                        } else {
+                            "⚠️ Registrierung weiterhin vorhanden: " +
+                                "$removalName (ID $removalId)"
+                        }
+                    }
+                }
+            }
+        }
+
+        showGatewayScreen(root)
+
+        status.text = "Benutzerliste wird angefordert …"
+        if (mumbleManager?.requestRegisteredUsers() != true) {
+            status.text = "Keine Verbindung oder keine bestätigten Administratorrechte."
+        }
     }
 
     private fun showAboutMobile() {
@@ -5364,6 +6785,55 @@ class MainActivity : Activity() {
             13f, muted
         ))
 
+        val frnMicInitial = prefs.getInt(
+            "frn_microphone_gain", 100
+        ).coerceIn(0, 300)
+        gatewayService?.setFrnMicrophoneGain(frnMicInitial)
+
+        val frnMicLabel = label(
+            "🎙 FRN Mikrofonverstärkung · $frnMicInitial %",
+            19f, accent, true
+        ).apply {
+            setPadding(0, dp(28), 0, dp(12))
+        }
+        root.addView(frnMicLabel)
+
+        root.addView(android.widget.SeekBar(this).apply {
+            max = 300
+            progress = frnMicInitial
+            setOnSeekBarChangeListener(
+                object : android.widget.SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(
+                        bar: android.widget.SeekBar?,
+                        value: Int,
+                        fromUser: Boolean
+                    ) {
+                        if (!fromUser) return
+                        frnMicLabel.text =
+                            "🎙 FRN Mikrofonverstärkung · $value %"
+                        gatewayService?.setFrnMicrophoneGain(value)
+                        prefs.edit()
+                            .putInt("frn_microphone_gain", value)
+                            .apply()
+                    }
+
+                    override fun onStartTrackingTouch(
+                        bar: android.widget.SeekBar?
+                    ) = Unit
+
+                    override fun onStopTrackingTouch(
+                        bar: android.widget.SeekBar?
+                    ) = Unit
+                }
+            )
+        })
+
+        root.addView(label(
+            "100 % = normal. Höhere Werte machen das Mikrofon lauter, " +
+                "können aber auch Rauschen und Verzerrungen verstärken.",
+            13f, muted
+        ))
+
         val mumbleInitial = prefs.getInt("mumble_volume", 100).coerceIn(0, 100)
         gatewayService?.setMumbleVolume(mumbleInitial)
 
@@ -5401,6 +6871,55 @@ class MainActivity : Activity() {
                 }
             )
         })
+
+        val mumbleMicInitial = prefs.getInt(
+            "mumble_microphone_gain", 100
+        ).coerceIn(0, 300)
+
+        val mumbleMicLabel = label(
+            "🎙 Mumble Mikrofon · $mumbleMicInitial %",
+            19f, accent, true
+        ).apply {
+            setPadding(0, dp(28), 0, dp(12))
+        }
+        root.addView(mumbleMicLabel)
+
+        root.addView(android.widget.SeekBar(this).apply {
+            max = 300
+            progress = mumbleMicInitial
+            setOnSeekBarChangeListener(
+                object : android.widget.SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(
+                        bar: android.widget.SeekBar?,
+                        value: Int,
+                        fromUser: Boolean
+                    ) {
+                        if (!fromUser) return
+                        mumbleMicLabel.text =
+                            "🎙 Mumble Mikrofon · $value %"
+                        gatewayService?.setMumbleMicrophoneGain(value)
+                        prefs.edit()
+                            .putInt("mumble_microphone_gain", value)
+                            .apply()
+                    }
+
+                    override fun onStartTrackingTouch(
+                        bar: android.widget.SeekBar?
+                    ) = Unit
+
+                    override fun onStopTrackingTouch(
+                        bar: android.widget.SeekBar?
+                    ) = Unit
+                }
+            )
+        })
+
+        root.addView(label(
+            "100 % = normal. Höhere Werte verstärken auch Rauschen. " +
+                "Änderungen wirken sofort, auch während einer Mumble-Verbindung. " +
+                "VoIP-Verlinkung und Papagei bleiben unverändert.",
+            13f, muted
+        ))
 
         root.addView(label(
             "Die globale Lautsprecher-Stummschaltung gilt für FRN und Mumble.",
@@ -6215,7 +7734,7 @@ class MainActivity : Activity() {
             button("➤") {
                 val text = messageInput.text.toString().trim()
                 if (text.isNotEmpty()) {
-                    val destination = recipientId ?: "0"
+                    val destination = recipientId ?: ""
                     val service = gatewayService
                     if (service == null) {
                         Toast.makeText(
@@ -6434,7 +7953,9 @@ class MainActivity : Activity() {
                 "Start" -> "Start"
                 "FRN", "FRN_ROOMS", "FRN_ROOM", "FRN_REGISTRATION",
                 "FRN-Einstellungen", "FRN_CHAT", "FRN_PARTICIPANTS" -> "FRN"
-                "Mumble", "MUMBLE_ROOMS", "MUMBLE_CERTIFICATES" -> "Mumble"
+                "Mumble", "MUMBLE_ROOMS", "MUMBLE_CERTIFICATES",
+                "MUMBLE_REGISTERED_USERS", "MUMBLE_ADMIN",
+                "MUMBLE_BAN_LIST" -> "Mumble"
                 "Zello" -> "Zello"
                 "Log" -> "Log"
                 else -> "Mehr"
@@ -6502,7 +8023,8 @@ class MainActivity : Activity() {
             frame.addView(subTabs)
         }
 
-        if (currentPage in listOf("Mumble", "MUMBLE_ROOMS", "MUMBLE_CERTIFICATES")) {
+        if (currentPage in listOf("Mumble", "MUMBLE_ROOMS", "MUMBLE_REGISTERED_USERS", "MUMBLE_CERTIFICATES", "MUMBLE_ADMIN",
+            "MUMBLE_BAN_LIST")) {
             val subTabs = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setPadding(dp(8), 0, dp(8), dp(8))
@@ -6511,7 +8033,8 @@ class MainActivity : Activity() {
             val sections = listOf(
                 "Verbindung" to "Mumble",
                 "Räume & Nutzer" to "MUMBLE_ROOMS",
-                "🔐 Zertifikate" to "MUMBLE_CERTIFICATES"
+                "🔐 Zertifikate" to "MUMBLE_CERTIFICATES",
+                "🛡️ Admin" to "MUMBLE_ADMIN"
             )
 
             sections.forEach { (title, page) ->
@@ -6520,21 +8043,33 @@ class MainActivity : Activity() {
                         "Mumble" -> showMumble()
                         "MUMBLE_ROOMS" -> showMumbleRooms()
                         "MUMBLE_CERTIFICATES" -> showMumbleCertificates()
+                        "MUMBLE_ADMIN" -> showMumbleAdmin()
                     }
                 }.apply {
-                    textSize = 12f
+                    textSize = 13f
+                    setPadding(dp(14), 0, dp(14), 0)
+                    isSingleLine = true
                     if (currentPage == page) setTextColor(accent)
                 }
 
                 subTabs.addView(
                     tab,
-                    LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        dp(48)
+                    ).apply {
                         setMargins(dp(2), 0, dp(2), 0)
                     }
                 )
             }
 
-            frame.addView(subTabs)
+            frame.addView(
+                android.widget.HorizontalScrollView(this).apply {
+                    isHorizontalScrollBarEnabled = false
+                    isFillViewport = false
+                    addView(subTabs)
+                }
+            )
         }
 
         frame.addView(
@@ -6727,69 +8262,359 @@ class MainActivity : Activity() {
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(30), dp(20), dp(24))
+            setPadding(dp(18), dp(22), dp(18), dp(24))
         }
 
         content.addView(label(
-            "Willkommen bei FunkGateway Mobile!",
+            "⚓ FunkGateway Mobile",
             24f, Color.WHITE, true
         ))
-
         content.addView(label(
-            "Deine mobile Zentrale für Funk und Sprachkommunikation.",
-            16f, accent
+            "Betriebszentrale · Verbindungen und Sprachdienste",
+            14f, accent
         ).apply {
-            setPadding(0, dp(12), 0, dp(28))
+            setPadding(0, dp(6), 0, dp(18))
         })
 
-        content.addView(label(
-            "Was ist FunkGateway Mobile?",
-            20f, Color.WHITE, true
-        ))
+        val summary = label("", 16f, Color.WHITE, true)
+        val frnDetails = label("", 15f, muted)
+        val mumbleDetails = label("", 15f, muted)
+        val bridgeDetails = label("", 15f, muted)
 
-        content.addView(label(
-            "FunkGateway Mobile ist die Android-Erweiterung unseres " +
-            "FunkGateway-Projekts. Verschiedene Kommunikationsdienste " +
-            "sollen hier über eine gemeinsame Oberfläche bedient werden.",
-            16f, muted
-        ).apply {
-            setPadding(0, dp(12), 0, dp(28))
-        })
-
-        content.addView(label(
-            "Unsere Kommunikationsdienste",
-            20f, Color.WHITE, true
-        ))
-
-        listOf(
-            "📻  FRN – bereits integriert",
-            "🎧  Mumble – in Vorbereitung",
-            "💬  Zello – in Vorbereitung",
-            "🦜  Papageien und Verlinkung – geplant"
-        ).forEach { entry ->
-            content.addView(label(entry, 16f, Color.WHITE).apply {
-                setPadding(0, dp(14), 0, dp(8))
+        fun section(title: String, details: android.widget.TextView) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(16), dp(14), dp(16), dp(16))
+                background = rounded(panel)
+            }
+            card.addView(label(title, 19f, Color.WHITE, true))
+            details.setPadding(0, dp(10), 0, 0)
+            card.addView(details)
+            content.addView(card, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dp(12)
             })
         }
 
-        content.addView(label(
-            "Wähle oben einen Kommunikationsdienst aus, um loszulegen.",
-            15f, accent
-        ).apply {
-            setPadding(0, dp(30), 0, dp(14))
+        section("📡 Gesamtstatus", summary)
+        section("📻 FRN", frnDetails)
+
+        val frnActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        fun frnAction(title: String, action: () -> Unit) {
+            frnActions.addView(
+                button(title, action),
+                LinearLayout.LayoutParams(0, -1, 1f)
+            )
+        }
+
+        frnAction("🔗 Verbinden") {
+            val last = org.funkgateway.mobile.frn.FrnLastConnectionStore.load(this)
+            if (last == null) {
+                showFrn()
+            } else {
+                connectFrnFromSelection(
+                    last.room,
+                    last.profileId,
+                    navigateToParticipants = false
+                )
+            }
+        }
+
+        frnAction("⛔ Trennen") {
+            gatewayService?.disconnectFrn()
+        }
+
+        frnAction("⚙ Öffnen") {
+            showFrn()
+        }
+
+        (frnDetails.parent as? LinearLayout)?.addView(
+            frnActions,
+            LinearLayout.LayoutParams(-1, dp(72)).apply {
+                topMargin = dp(12)
+            }
+        )
+        section("🎧 Mumble", mumbleDetails)
+
+        val mumbleActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        fun mumbleAction(title: String, action: () -> Unit) {
+            mumbleActions.addView(
+                button(title, action),
+                LinearLayout.LayoutParams(0, -1, 1f)
+            )
+        }
+
+        mumbleAction("🔗 Verbinden") {
+            val saved = MumbleConnectionStore.loadLastSuccessful(this)
+                ?: MumbleConnectionStore.load(this)
+            val manager = getOrCreateMumbleManager()
+
+            if (manager.isConnected() || manager.isConnecting()) {
+                android.widget.Toast.makeText(
+                    this, "Mumble ist bereits verbunden oder verbindet.",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+            } else if (saved.host.isBlank() ||
+                       saved.username.isBlank() ||
+                       saved.port !in 1..65535) {
+                showMumble()
+            } else {
+                startForegroundService(
+                    Intent(this, GatewayService::class.java).apply {
+                        action = GatewayService.ACTION_START
+                    }
+                )
+                manager.connect(
+                    saved.host, saved.port,
+                    saved.username, saved.password
+                )
+            }
+        }
+
+        mumbleAction("⛔ Trennen") {
+            mumbleManager?.let { manager ->
+                gatewayService?.onMumbleConnectionLost(manager)
+                manager.disconnect()
+                gatewayService?.stopIfIdle()
+            }
+        }
+
+        mumbleAction("⚙ Öffnen") {
+            showMumble()
+        }
+
+        (mumbleDetails.parent as? LinearLayout)?.addView(
+            mumbleActions,
+            LinearLayout.LayoutParams(-1, dp(72)).apply {
+                topMargin = dp(12)
+            }
+        )
+        section("🔗 Sprachverlinkung und Papagei", bridgeDetails)
+
+        val bridgeButton = button("🔗 Verlinkung starten") {
+            val service = gatewayService
+            if (service?.isVoipBridgeActive() == true) {
+                service.stopVoipBridgeManually()
+            } else if (service != null &&
+                service.getFrnStatus() == GatewayService.FrnStatus.CONNECTED &&
+                mumbleManager?.isConnected() == true &&
+                !service.isMumbleParrotActive()
+            ) {
+                if (!service.startVoipBridge()) {
+                    android.widget.Toast.makeText(
+                        this, "Verlinkung noch nicht bereit.",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+        content.addView(bridgeButton)
+
+        val parrotButton = button("🦜 Mumble-Papagei starten") {
+            val service = gatewayService
+            if (service?.isMumbleParrotActive() == true) {
+                service.stopMumbleParrotManually()
+            } else if (service != null &&
+                mumbleManager?.isConnected() == true &&
+                !service.isVoipBridgeActive()
+            ) {
+                if (!service.startMumbleParrot()) {
+                    android.widget.Toast.makeText(
+                        this, "Papagei noch nicht bereit.",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+        content.addView(parrotButton)
+
+        content.addView(button("🔗 Beide zuletzt verbinden") {
+            val service = gatewayService
+            val lastFrn =
+                org.funkgateway.mobile.frn.FrnLastConnectionStore.load(this)
+            val lastMumble =
+                MumbleConnectionStore.loadLastSuccessful(this)
+                    ?: MumbleConnectionStore.load(this)
+
+            val messages = mutableListOf<String>()
+
+            if (service == null) {
+                messages.add("Gateway-Dienst noch nicht bereit")
+            } else if (
+                service.getFrnStatus() ==
+                GatewayService.FrnStatus.DISCONNECTED
+            ) {
+                if (lastFrn == null) {
+                    messages.add("FRN: Noch kein letzter Raum gespeichert")
+                } else {
+                    connectFrnFromSelection(
+                        lastFrn.room,
+                        lastFrn.profileId,
+                        navigateToParticipants = false
+                    )
+                }
+            }
+
+            val manager = getOrCreateMumbleManager()
+            if (!manager.isConnected() && !manager.hasActiveConnectionAttempt()) {
+                if (
+                    lastMumble.host.isBlank() ||
+                    lastMumble.username.isBlank() ||
+                    lastMumble.port !in 1..65535
+                ) {
+                    messages.add("Mumble: Keine Verbindungsdaten gespeichert")
+                } else {
+                    startForegroundService(
+                        Intent(this, GatewayService::class.java).apply {
+                            action = GatewayService.ACTION_START
+                        }
+                    )
+                    manager.connect(
+                        lastMumble.host,
+                        lastMumble.port,
+                        lastMumble.username,
+                        lastMumble.password
+                    )
+                }
+            }
+
+            if (messages.isNotEmpty()) {
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("Schnellverbindung")
+                    .setMessage(messages.joinToString("\\n"))
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        })
+
+        content.addView(button("⛔ Alle Verbindungen trennen") {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Alle Verbindungen trennen?")
+                .setMessage(
+                    "FRN und Mumble werden getrennt. " +
+                    "Laufende Sprachübertragungen werden beendet."
+                )
+                .setNegativeButton("Abbrechen", null)
+                .setPositiveButton("Alle trennen") { _, _ ->
+                    val service = gatewayService
+                    service?.stopVoipBridgeManually()
+                    service?.stopMumbleParrotManually()
+
+                    mumbleManager?.let { manager ->
+                        service?.onMumbleConnectionLost(manager)
+                        manager.disconnect()
+                    }
+
+                    service?.disconnectFrn()
+                    service?.stopIfIdle()
+                }
+                .show()
         })
 
         content.addView(label(
-            "FunkGateway Mobile · Gemeinsam verbunden",
-            13f, muted
-        ))
+            "Verbindungen verwalten",
+            18f, Color.WHITE, true
+        ).apply {
+            setPadding(0, dp(10), 0, dp(10))
+        })
+        content.addView(button("📻 FRN öffnen") { showFrn() })
+        content.addView(button("🎧 Mumble öffnen") { showMumble() })
+        content.addView(button("🔗 Verlinkung öffnen") {
+            showPage("Verlinkung")
+        })
 
-        showGatewayScreen(
-            ScrollView(this).apply {
-                isFillViewport = true
-                addView(content)
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val updater = object : Runnable {
+            override fun run() {
+                if (currentPage != "Start" || !content.isAttachedToWindow) return
+
+                val service = gatewayService
+                val frnState = service?.getFrnStatus()
+                val frnConnected =
+                    frnState == GatewayService.FrnStatus.CONNECTED
+                val mumbleConnected = mumbleManager?.isConnected() == true
+                val mumbleConnecting = mumbleManager?.isConnecting() == true
+                val bridgeActive = service?.isVoipBridgeActive() == true
+                val parrotActive = service?.isMumbleParrotActive() == true
+                val connectedCount =
+                    (if (frnConnected) 1 else 0) +
+                    (if (mumbleConnected) 1 else 0)
+
+                val bridgeStatus = when {
+                    bridgeActive && frnConnected && mumbleConnected ->
+                        "🟢 Aktiv"
+                    bridgeActive ->
+                        "🟡 Unterbrochen"
+                    else ->
+                        "⚪ Aus"
+                }
+
+                summary.text = "$connectedCount von 2 Sprachdiensten verbunden" +
+                    "\nFRN↔Mumble: " +
+                    bridgeStatus
+
+                val activeRoom = service?.getConnectedFrnRoom()
+                val lastRoom =
+                    org.funkgateway.mobile.frn.FrnLastConnectionStore.load(this@MainActivity)
+                val frnText = when (frnState) {
+                    GatewayService.FrnStatus.CONNECTED -> "🟢 Verbunden"
+                    GatewayService.FrnStatus.CONNECTING -> "🟡 Verbindet …"
+                    else -> "⚪ Getrennt"
+                }
+                val roomText = activeRoom ?: lastRoom?.room
+                frnDetails.text = frnText + "\n" +
+                    (roomText?.let {
+                        "${it.server}:${it.port} · ${it.room}"
+                    } ?: "Noch kein FRN-Raum gespeichert")
+
+                val savedMumble = MumbleConnectionStore.loadLastSuccessful(this@MainActivity)
+                    ?: MumbleConnectionStore.load(this@MainActivity)
+                val mumbleText = when {
+                    mumbleConnected -> "🟢 Verbunden"
+                    mumbleConnecting -> "🟡 Verbindet …"
+                    else -> "⚪ Getrennt"
+                }
+                val connectedServer = mumbleManager?.getConnectedServer()
+                val hostText = connectedServer?.first ?: savedMumble.host
+                val portText = (connectedServer?.second ?: savedMumble.port).toString()
+                mumbleDetails.text = mumbleText + "\n" +
+                    (if (hostText.isNotBlank()) "$hostText:$portText"
+                     else "Noch kein Mumble-Server gespeichert")
+
+                bridgeDetails.text =
+                    "FRN ↔ Mumble: " +
+                    bridgeStatus +
+                    "\nMumble-Papagei: " +
+                    (if (parrotActive) "🟢 Aktiv" else "⚪ Aus")
+
+                bridgeButton.text = if (bridgeActive)
+                    "⛔ FRN↔Mumble-Verlinkung stoppen"
+                else
+                    "🔗 FRN↔Mumble-Verlinkung starten"
+                bridgeButton.isEnabled = bridgeActive ||
+                    (frnConnected && mumbleConnected && !parrotActive)
+
+                parrotButton.text = if (parrotActive)
+                    "⛔ Mumble-Papagei stoppen"
+                else
+                    "🦜 Mumble-Papagei starten"
+                parrotButton.isEnabled = parrotActive ||
+                    (mumbleConnected && !bridgeActive)
+
+                handler.postDelayed(this, 1000L)
             }
-        )
+        }
+
+        showGatewayScreen(ScrollView(this).apply {
+            isFillViewport = true
+            addView(content)
+        })
+        handler.post(updater)
     }
 
     @Deprecated("Back navigation for the current Activity")
