@@ -8105,9 +8105,13 @@ class MainActivity : Activity() {
             targetButton.isEnabled = service != null
             val state = service?.getPttState() ?: GatewayService.PttState.IDLE
             val ready = target != null && target in available
-            val channelBusy =
-                target == GatewayService.PttTarget.FRN &&
-                service?.getFrnParticipants()?.activeIndex != null
+            val channelBusy = when (target) {
+                GatewayService.PttTarget.FRN ->
+                    service?.getFrnParticipants()?.activeIndex != null
+                GatewayService.PttTarget.MUMBLE ->
+                    mumbleManager?.isMumbleChannelBusy() == true
+                else -> false
+            }
             val muted = service?.isGlobalMuted() == true
             val releasePending = service?.isPttReleasePending() == true
             pttButton.isEnabled =

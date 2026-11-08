@@ -1259,6 +1259,16 @@ class GatewayService : Service() {
             val manager = mumbleManager ?: return false
             if (!manager.isConnected()) return false
 
+            // Nur Mumble-Sprecher blockieren die Mumble-PTT.
+            // Die FRN-Belegung bleibt davon unabhängig.
+            if (manager.isMumbleChannelBusy()) {
+                android.util.Log.i(
+                    "FunkGateway-PTT",
+                    "Mumble-PTT belegt: anderer Teilnehmer spricht"
+                )
+                return false
+            }
+
             try {
                 startGatewayForeground(true)
             } catch (e: Exception) {

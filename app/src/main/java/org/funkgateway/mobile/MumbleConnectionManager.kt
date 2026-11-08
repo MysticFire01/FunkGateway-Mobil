@@ -754,6 +754,29 @@ class MumbleConnectionManager(
         }
     }
 
+    fun isMumbleChannelBusy(): Boolean {
+        val activeService = service ?: return false
+        if (!activeService.isConnected) return false
+
+        return try {
+            val session = activeService.HumlaSession()
+            val ownSessionId = session.sessionId
+            val ownChannel = session.sessionChannel
+
+            ownChannel.users.any { user ->
+                user.session != ownSessionId &&
+                    user.talkState.name != "PASSIVE"
+            }
+        } catch (e: Exception) {
+            Log.w(
+                "FGW-Mumble",
+                "Mumble-Kanalbelegung nicht ermittelbar",
+                e
+            )
+            false
+        }
+    }
+
     fun setBridgeAudioEnabled(enabled: Boolean): Boolean {
         val humla = service as? HumlaService ?: return false
         return try {
