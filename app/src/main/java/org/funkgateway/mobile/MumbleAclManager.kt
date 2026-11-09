@@ -41,6 +41,13 @@ class MumbleAclManager {
             524288 to "Sich selbst registrieren"
         )
 
+        /**
+         * Bekannte Berechtigungen für den lokalen ACL-Editor.
+         * Die interne Liste bleibt unveränderbar.
+         */
+        fun editablePermissions(): List<Pair<Int, String>> =
+            permissionLabels.toList()
+
         fun permissionNames(mask: Int): List<String> {
             val names = permissionLabels
                 .filter { (bit, _) -> (mask and bit) != 0 }
@@ -61,42 +68,102 @@ class MumbleAclManager {
 
     var onAclReceived: ((AclSnapshot) -> Unit)? = null
 
+    // Originale Berechtigungsnachricht des Mumble-Servers.
+    var onPermissionQueryReceived: ((Mumble.PermissionQuery) -> Unit)? = null
+
+    private val aclLock = Any()
     private var connection: HumlaConnection? = null
 
-    private val listener = object : HumlaTCPMessageListener.Stub() {
-        override fun messageACL(message: Mumble.ACL) {
-            if (!message.hasChannelId()) {
-                Log.w("FGW-Mumble-ACL", "ACL ohne Kanal-ID ignoriert")
-                return
-            }
+    // Zählt gültige ACL-Nachrichten innerhalb einer Verbindung.
+    // Keine Bestätigung einer bestimmten Serveranfrage.
+    private var aclReceiveVersion = 0L
 
-            val snapshot = AclSnapshot(
-                channelId = message.channelId,
-                inheritAcls = message.inheritAcls,
-                groups = message.groupsList.toList(),
-                rules = message.aclsList.toList()
-            )
+    fun getAclReceiveVersion(): Long =
+        synchronized(aclLock) { aclReceiveVersion }
 
-            Log.i(
-                "FGW-Mumble-ACL",
-                "ACL empfangen: Kanal ${snapshot.channelId}, " +
-                    "${snapshot.groups.size} Gruppen, " +
-                    "${snapshot.rules.size} Regeln"
-            )
-
-            onAclReceived?.invoke(snapshot)
-        }
-    }
+    // Jede Verbindung erhält ihren eigenen Listener.
+    // Alte Callbacks werden nach einem Wechsel verworfen.
+    private var listener: HumlaTCPMessageListener? = null
+    private var connectionGeneration = 0L
 
     fun attach(newConnection: HumlaConnection) {
         detach()
-        connection = newConnection
-        newConnection.addTCPMessageHandlers(listener)
+
+        val generation = synchronized(aclLock) {
+            connection = newConnection
+            aclReceiveVersion = 0L
+            connectionGeneration
+        }
+
+        val newListener = object : HumlaTCPMessageListener.Stub() {
+            private fun isCurrent(): Boolean =
+                synchronized(aclLock) {
+                    connection === newConnection &&
+                        connectionGeneration == generation
+                }
+
+            override fun messagePermissionQuery(message: Mumble.PermissionQuery) {
+                val callback = synchronized(aclLock) {
+                    if (connection === newConnection &&
+                        connectionGeneration == generation
+                    ) onPermissionQueryReceived else null
+                }
+                callback?.invoke(message)
+            }
+
+            override fun messageACL(message: Mumble.ACL) {
+                if (!isCurrent()) return
+
+                if (!message.hasChannelId()) {
+                    Log.w("FGW-Mumble-ACL", "ACL ohne Kanal-ID ignoriert")
+                    return
+                }
+
+                val snapshot = AclSnapshot(
+                    channelId = message.channelId,
+                    inheritAcls = message.inheritAcls,
+                    groups = message.groupsList.toList(),
+                    rules = message.aclsList.toList()
+                )
+
+                if (!isCurrent()) return
+
+                Log.i(
+                    "FGW-Mumble-ACL",
+                    "ACL empfangen: Kanal ${snapshot.channelId}, " +
+                        "${snapshot.groups.size} Gruppen, " +
+                        "${snapshot.rules.size} Regeln"
+                )
+
+                val callback = synchronized(aclLock) {
+                    if (connection === newConnection &&
+                        connectionGeneration == generation
+                    ) {
+                        ++aclReceiveVersion
+                        onAclReceived
+                    } else null
+                }
+                callback?.invoke(snapshot)
+            }
+        }
+
+        listener = newListener
+        newConnection.addTCPMessageHandlers(newListener)
     }
 
     fun detach() {
-        connection?.removeTCPMessageHandler(listener)
-        connection = null
+        val (oldConnection, oldListener) = synchronized(aclLock) {
+            ++connectionGeneration
+            val previous = Pair(connection, listener)
+            connection = null
+            listener = null
+            aclReceiveVersion = 0L
+            previous
+        }
+
+        if (oldListener != null) {
+            oldConnection?.removeTCPMessageHandler(oldListener)
+        }
     }
 
     fun requestAcl(channelId: Int): Boolean {

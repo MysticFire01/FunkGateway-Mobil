@@ -114,12 +114,44 @@ class MumbleConnectionManager(
             }
         }
 
+        mumbleAclManager.onPermissionQueryReceived = { message ->
+            reconnectHandler.post {
+                if (
+                    service === humla &&
+                    service?.isConnected == true &&
+                    moderationConnectionGeneration == generation &&
+                    humla.connection === expectedConnection
+                ) {
+                    if (message.hasFlush() && message.flush) {
+                        clearMumbleAclWritePermission()
+                    } else if (
+                        message.hasChannelId() &&
+                        message.channelId == aclPermissionChannelId &&
+                        aclPermissionGeneration == generation &&
+                        message.hasPermissions()
+                    ) {
+                        // Berechtigungsantwort empfangen.
+                        // Schreibfreigabe bleibt bis zur abschließenden
+                        // Prüfung ausdrücklich deaktiviert.
+                        aclWritePermissionConfirmed = false
+                        Log.i(
+                            "FGW-Mumble-ACL",
+                            "Kanalrechte empfangen: Kanal ${message.channelId}, " +
+                                "Write=${(message.permissions and se.lublin.humla.net.Permissions.Write) != 0}"
+                        )
+                    }
+                }
+            }
+        }
+
         mumbleAclManager.attach(expectedConnection)
     }
 
     private fun detachMumbleAcl() {
         mumbleAclManager.detach()
         mumbleAclManager.onAclReceived = null
+        mumbleAclManager.onPermissionQueryReceived = null
+        clearMumbleAclWritePermission()
         onMumbleAclConnectionLost?.invoke()
     }
 
@@ -421,6 +453,7 @@ class MumbleConnectionManager(
             connectionInProgress = false
             cancelMumbleReconnect()
             ++moderationConnectionGeneration
+            clearMumbleAclWritePermission()
 
             // Registrierungsrechte für jeden Server neu anfordern.
             requestRegistrationPermissions()
@@ -461,6 +494,7 @@ class MumbleConnectionManager(
             otherRegistrationSessionId = null
             ++otherRegistrationRequestId
             rootRegistrationPermissionsConfirmed = false
+            clearMumbleAclWritePermission()
             connectionInProgress = false
 
             // Keine alte Aussendung nach einer Trennung fortsetzen.
@@ -650,6 +684,7 @@ class MumbleConnectionManager(
             detachRegisteredUsers()
             cancelConnectTimeout()
             rootRegistrationPermissionsConfirmed = false
+            clearMumbleAclWritePermission()
             registrationPending = false
             otherRegistrationSessionId = null
             ++otherRegistrationRequestId
@@ -1014,6 +1049,7 @@ class MumbleConnectionManager(
         otherRegistrationSessionId = null
         ++otherRegistrationRequestId
         rootRegistrationPermissionsConfirmed = false
+        clearMumbleAclWritePermission()
 
         // Vor der manuellen Trennung die Gateway-Bridge und PTT
         // synchron über den vorhandenen Sicherheitsstopp beenden.
@@ -1162,6 +1198,42 @@ class MumbleConnectionManager(
             Log.e("FGW-Mumble", "Registrierungsanforderung fehlgeschlagen", e)
             "Registrierung konnte nicht angefordert werden: ${e.message}"
         }
+    }
+
+    // ACL-Berechtigungsanfrage für die aktuelle Verbindung.
+    // Eine Anfrage allein bestätigt ausdrücklich KEIN Schreibrecht.
+    private var aclPermissionChannelId: Int? = null
+    private var aclPermissionGeneration = -1L
+    private var aclWritePermissionConfirmed = false
+
+    fun requestMumbleAclWritePermission(channelId: Int): Boolean {
+        clearMumbleAclWritePermission()
+
+        val activeService = service ?: return false
+        if (!activeService.isConnected || channelId < 0) return false
+
+        aclPermissionChannelId = channelId
+        aclPermissionGeneration = moderationConnectionGeneration
+
+        return runCatching {
+            activeService.HumlaSession().requestPermissions(channelId)
+            true
+        }.getOrElse {
+            clearMumbleAclWritePermission()
+            false
+        }
+    }
+
+    fun hasConfirmedMumbleAclWritePermission(channelId: Int): Boolean =
+        service?.isConnected == true &&
+        aclPermissionChannelId == channelId &&
+        aclPermissionGeneration == moderationConnectionGeneration &&
+        aclWritePermissionConfirmed
+
+    private fun clearMumbleAclWritePermission() {
+        aclPermissionChannelId = null
+        aclPermissionGeneration = -1L
+        aclWritePermissionConfirmed = false
     }
 
     private var rootRegistrationPermissionsConfirmed = false

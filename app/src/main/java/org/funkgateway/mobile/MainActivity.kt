@@ -5520,6 +5520,719 @@ class MainActivity : Activity() {
         })
     }
 
+    private fun createMumbleAclSpinner(
+        options: List<String>,
+        selectedIndex: Int = 0
+    ): Spinner {
+        val darkColor = Color.rgb(31, 43, 57)
+
+        val selector = Spinner(this)
+        selector.adapter = object : android.widget.ArrayAdapter<String>(
+            this,
+            android.R.layout.simple_spinner_item,
+            options
+        ) {
+            override fun getView(
+                position: Int,
+                convertView: android.view.View?,
+                parent: android.view.ViewGroup
+            ): android.view.View {
+                return super.getView(position, convertView, parent).also {
+                    (it as? android.widget.TextView)?.apply {
+                        setTextColor(
+                            if (options.getOrNull(position)?.contains(
+                                    "geerbt", ignoreCase = true
+                                ) == true
+                            ) Color.rgb(155, 165, 177)
+                            else Color.WHITE
+                        )
+                        setBackgroundColor(darkColor)
+                        setPadding(dp(12), dp(12), dp(12), dp(12))
+                    }
+                }
+            }
+
+            override fun getDropDownView(
+                position: Int,
+                convertView: android.view.View?,
+                parent: android.view.ViewGroup
+            ): android.view.View {
+                return super.getDropDownView(
+                    position, convertView, parent
+                ).also {
+                    (it as? android.widget.TextView)?.apply {
+                        setTextColor(
+                            if (options.getOrNull(position)?.contains(
+                                    "geerbt", ignoreCase = true
+                                ) == true
+                            ) Color.rgb(155, 165, 177)
+                            else Color.WHITE
+                        )
+                        setBackgroundColor(darkColor)
+                        setPadding(dp(12), dp(14), dp(12), dp(14))
+                    }
+                }
+            }
+        }
+
+        selector.setPopupBackgroundDrawable(rounded(darkColor))
+        selector.background = rounded(darkColor)
+        selector.minimumHeight = dp(48)
+
+        if (options.isNotEmpty()) {
+            selector.setSelection(
+                selectedIndex.coerceIn(0, options.lastIndex)
+            )
+        }
+
+        return selector
+    }
+
+    private fun showMumbleAclRuleEditor(
+        rule: se.lublin.humla.protobuf.Mumble.ACL.ChanACL?,
+        availableGroups: List<String> = emptyList(),
+        availableRules: List<
+            se.lublin.humla.protobuf.Mumble.ACL.ChanACL
+        > = emptyList(),
+        onEditSelectedRule: ((
+            se.lublin.humla.protobuf.Mumble.ACL.ChanACL
+        ) -> Unit)? = null,
+        onSave: (
+            se.lublin.humla.protobuf.Mumble.ACL.ChanACL
+        ) -> Unit
+    ) {
+        val bgColor = Color.rgb(31, 43, 57)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+            setBackgroundColor(bgColor)
+        }
+
+        content.addView(label(
+            "Regelziel", 17f, Color.WHITE, true
+        ))
+
+        val targetOptions = listOf(
+            "Allgemein", "Benutzer", "Gruppe"
+        )
+
+        val targetIndex = when (
+            rule?.let { MumbleAclRuleEditor.targetType(it) }
+        ) {
+            MumbleAclRuleEditor.TargetType.USER -> 1
+            MumbleAclRuleEditor.TargetType.GROUP -> 2
+            else -> 0
+        }
+
+        val targetSpinner = createMumbleAclSpinner(
+            targetOptions, targetIndex
+        )
+        content.addView(targetSpinner)
+
+        val userIdInput = android.widget.EditText(this).apply {
+            hint = "Registrierte Benutzer-ID"
+            setText(
+                if (rule?.hasUserId() == true)
+                    rule.userId.toString()
+                else ""
+            )
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.LTGRAY)
+            background = rounded(bgColor)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+
+        val groupNameInput = android.widget.EditText(this).apply {
+            hint = "Mumble-Gruppenname"
+            setText(
+                if (rule?.hasGroup() == true) rule.group
+                else ""
+            )
+            setSingleLine(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.LTGRAY)
+            background = rounded(bgColor)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+
+        var onGroupSelectionChanged: ((String, se.lublin.humla.protobuf.Mumble.ACL.ChanACL?) -> Unit)? = null
+        var viewingDifferentGroup = false
+
+        val groupOptions = (
+            listOf("@all", "@in", "@out", "@auth", "@sub") +
+            availableGroups +
+            listOfNotNull(rule?.takeIf { it.hasGroup() }?.group)
+        ).filter { it.isNotBlank() }.distinct()
+
+        val aclGroupEntries = availableRules
+            .filter { it.hasGroup() && it.group.isNotBlank() }
+
+        val groupEntryTargets = groupOptions.flatMap { groupName ->
+            val matchingRules = aclGroupEntries.filter {
+                it.group == groupName
+            }
+            if (matchingRules.isEmpty()) {
+                listOf(groupName to null)
+            } else {
+                matchingRules.map { acl -> groupName to acl }
+            }
+        }
+
+        val groupDisplayOptions = groupEntryTargets.mapIndexed {
+                position, entry ->
+            val (groupName, acl) = entry
+            if (acl == null) {
+                groupName
+            } else {
+                val number = groupEntryTargets.take(position + 1)
+                    .count { it.first == groupName }
+                "$groupName – Regel $number – " +
+                    if (acl.inherited) "geerbt (nur lesen)"
+                    else "direkt"
+            }
+        }
+
+        val groupSpinner = createMumbleAclSpinner(
+            listOf("Gruppe auswählen …") + groupDisplayOptions +
+                listOf("✏️ Gruppenname manuell eingeben"),
+            groupEntryTargets.indexOfFirst {
+                it.second === rule
+            }.let { index ->
+                if (index >= 0) index + 1
+                else groupEntryTargets.indexOfFirst {
+                    it.first == rule?.takeIf { r -> r.hasGroup() }?.group
+                }.let { if (it >= 0) it + 1 else 0 }
+            }
+        )
+
+        groupSpinner.onItemSelectedListener =
+            object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?,
+                    view: View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    if (position in 1..groupEntryTargets.size) {
+                        val (groupName, selectedAcl) =
+                            groupEntryTargets[position - 1]
+                        groupNameInput.setText(groupName)
+                        onGroupSelectionChanged?.invoke(groupName, selectedAcl)
+                    }
+                    groupNameInput.visibility =
+                        if (targetSpinner.selectedItemPosition == 2 &&
+                            position == groupEntryTargets.size + 1)
+                            View.VISIBLE else View.GONE
+                }
+
+                override fun onNothingSelected(
+                    parent: android.widget.AdapterView<*>?
+                ) = Unit
+            }
+
+        content.addView(userIdInput)
+        content.addView(groupSpinner)
+        content.addView(groupNameInput)
+
+        fun refreshTargetFields() {
+            userIdInput.visibility =
+                if (targetSpinner.selectedItemPosition == 1)
+                    View.VISIBLE else View.GONE
+
+            groupSpinner.visibility =
+                if (targetSpinner.selectedItemPosition == 2)
+                    View.VISIBLE else View.GONE
+
+            groupNameInput.visibility =
+                if (targetSpinner.selectedItemPosition == 2 &&
+                    groupSpinner.selectedItemPosition ==
+                        groupEntryTargets.size + 1)
+                    View.VISIBLE else View.GONE
+        }
+
+        targetSpinner.onItemSelectedListener =
+            object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?,
+                    view: View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    refreshTargetFields()
+                }
+
+                override fun onNothingSelected(
+                    parent: android.widget.AdapterView<*>?
+                ) {
+                    refreshTargetFields()
+                }
+            }
+
+        refreshTargetFields()
+
+        content.addView(label(
+            "Berechtigungen", 17f, Color.WHITE, true
+        ))
+
+        val permissionSelectors = mutableListOf<
+            Triple<Int, android.widget.CheckBox, android.widget.CheckBox>
+        >()
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        header.addView(label("Berechtigung", 13f, Color.WHITE, true),
+            LinearLayout.LayoutParams(0, -2, 1f))
+        header.addView(label("Erlauben", 12f, Color.WHITE, true),
+            LinearLayout.LayoutParams(dp(76), -2))
+        header.addView(label("Verweigern", 12f, Color.WHITE, true),
+            LinearLayout.LayoutParams(dp(86), -2))
+        content.addView(header)
+
+        MumbleAclManager.editablePermissions().forEach { (bit, name) ->
+            val currentState = if (rule == null) {
+                MumbleAclPermissionEditor.State.UNSET
+            } else {
+                MumbleAclPermissionEditor.state(rule.grant, rule.deny, bit)
+            }
+
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                minimumHeight = dp(48)
+            }
+
+            row.addView(label(name, 13f, Color.WHITE),
+                LinearLayout.LayoutParams(0, -2, 1f))
+
+            fun checkbox(checked: Boolean): android.widget.CheckBox =
+                android.widget.CheckBox(this).apply {
+                    isChecked = checked
+                    buttonTintList = android.content.res.ColorStateList.valueOf(
+                        Color.rgb(75, 210, 195)
+                    )
+                    gravity = android.view.Gravity.CENTER
+                    minimumHeight = dp(44)
+                    contentDescription = name
+                }
+
+            val allow = checkbox(
+                currentState == MumbleAclPermissionEditor.State.ALLOW
+            )
+            val deny = checkbox(
+                currentState == MumbleAclPermissionEditor.State.DENY
+            )
+
+            allow.setOnCheckedChangeListener { _, checked ->
+                if (checked) deny.isChecked = false
+            }
+            deny.setOnCheckedChangeListener { _, checked ->
+                if (checked) allow.isChecked = false
+            }
+
+            row.addView(allow, LinearLayout.LayoutParams(dp(76), dp(48)))
+            row.addView(deny, LinearLayout.LayoutParams(dp(86), dp(48)))
+            permissionSelectors.add(Triple(bit, allow, deny))
+            content.addView(row)
+        }
+
+        var updateRuleValidity:
+            ((se.lublin.humla.protobuf.Mumble.ACL.ChanACL?) -> Unit)? = null
+
+        var selectedDisplayedRule:
+            se.lublin.humla.protobuf.Mumble.ACL.ChanACL? = rule
+        var onDisplayedRuleChanged: (() -> Unit)? = null
+
+        fun displayRulePermissions(
+            selectedRule: se.lublin.humla.protobuf.Mumble.ACL.ChanACL?
+        ) {
+            selectedDisplayedRule = selectedRule
+            onDisplayedRuleChanged?.invoke()
+            permissionSelectors.forEach { (bit, allow, deny) ->
+                val state = if (selectedRule == null) {
+                    MumbleAclPermissionEditor.State.UNSET
+                } else {
+                    MumbleAclPermissionEditor.state(
+                        selectedRule.grant, selectedRule.deny, bit
+                    )
+                }
+
+                allow.isChecked =
+                    state == MumbleAclPermissionEditor.State.ALLOW
+                deny.isChecked =
+                    state == MumbleAclPermissionEditor.State.DENY
+            }
+            updateRuleValidity?.invoke(selectedRule)
+        }
+
+        val groupRuleInfo = label(
+            "Gruppenregel auswählen, um ihre Berechtigungen anzuzeigen.",
+            13f, Color.LTGRAY
+        )
+        val groupRuleSpinner = createMumbleAclSpinner(
+            listOf("Keine Gruppenregel ausgewählt"), 0
+        )
+
+        var displayedGroupRules =
+            emptyList<se.lublin.humla.protobuf.Mumble.ACL.ChanACL>()
+        var updatingGroupRuleSelection = false
+
+        lateinit var applyHereCheckbox: android.widget.CheckBox
+        lateinit var applySubsCheckbox: android.widget.CheckBox
+        var validityFieldsReady = false
+
+        fun refreshPermissionEditability() {
+            val editable = !viewingDifferentGroup &&
+                rule?.inherited != true
+
+            permissionSelectors.forEach { (_, allow, deny) ->
+                allow.isEnabled = editable
+                deny.isEnabled = editable
+            }
+            if (validityFieldsReady) {
+                applyHereCheckbox.isEnabled = editable
+                applySubsCheckbox.isEnabled = editable
+            }
+        }
+
+        groupRuleSpinner.onItemSelectedListener =
+            object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?,
+                    view: View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    if (updatingGroupRuleSelection) return
+
+                    val selectedRule =
+                        displayedGroupRules.getOrNull(position - 1)
+
+                    if (selectedRule == null) {
+                        viewingDifferentGroup = rule != null &&
+                            (
+                                !rule.hasGroup() ||
+                                groupNameInput.text.toString().trim() !=
+                                    rule.group
+                            )
+                        displayRulePermissions(
+                            if (viewingDifferentGroup) null else rule
+                        )
+                        refreshPermissionEditability()
+                        return
+                    }
+
+                    if (selectedRule != null) {
+                        viewingDifferentGroup =
+                            rule == null || selectedRule !== rule ||
+                                selectedRule.inherited
+                        refreshPermissionEditability()
+                        displayRulePermissions(selectedRule)
+                        groupRuleInfo.text =
+                            if (selectedRule.inherited)
+                                "Geerbte Regel – nur zur Ansicht"
+                            else if (viewingDifferentGroup)
+                                "Direkte Regel – nur zur Ansicht"
+                            else
+                                "Direkte Regel – bearbeitbar"
+                    }
+                }
+
+                override fun onNothingSelected(
+                    parent: android.widget.AdapterView<*>?
+                ) = Unit
+            }
+
+        onGroupSelectionChanged = { groupName, selectedAcl ->
+            viewingDifferentGroup = rule != null &&
+                (!rule.hasGroup() || rule.group != groupName)
+            refreshPermissionEditability()
+
+            displayedGroupRules = MumbleAclRuleEditor.rulesForGroup(
+                availableRules, groupName
+            )
+
+            val options = listOf("Regel auswählen …") +
+                displayedGroupRules.mapIndexed { index, acl ->
+                    "$groupName – Regel ${index + 1} – " +
+                        if (acl.inherited) "geerbt (nur lesen)"
+                        else "direkt"
+                }
+
+            updatingGroupRuleSelection = true
+            val styledSpinner = createMumbleAclSpinner(options, 0)
+            groupRuleSpinner.adapter = styledSpinner.adapter
+
+            val originalRuleIndex =
+                displayedGroupRules.indexOfFirst {
+                    it === (selectedAcl ?: rule)
+                }
+
+            if (originalRuleIndex >= 0) {
+                groupRuleSpinner.setSelection(originalRuleIndex + 1)
+                val shownRule = displayedGroupRules[originalRuleIndex]
+                viewingDifferentGroup =
+                    rule == null || shownRule !== rule ||
+                        shownRule.inherited
+                displayRulePermissions(shownRule)
+                refreshPermissionEditability()
+            } else if (displayedGroupRules.isNotEmpty()) {
+                val selectedRule = displayedGroupRules.first()
+                groupRuleSpinner.setSelection(1)
+                viewingDifferentGroup = true
+                displayRulePermissions(selectedRule)
+                refreshPermissionEditability()
+            } else {
+                viewingDifferentGroup = rule != null
+                displayRulePermissions(null)
+                refreshPermissionEditability()
+            }
+
+            updatingGroupRuleSelection = false
+
+            groupRuleInfo.text =
+                "${displayedGroupRules.size} ACL-Regel(n) für $groupName"
+
+            groupRuleSpinner.visibility =
+                if (displayedGroupRules.isNotEmpty()) View.VISIBLE
+                else View.GONE
+        }
+
+        content.removeView(groupRuleInfo)
+        content.removeView(groupRuleSpinner)
+
+        val groupInputPosition = content.indexOfChild(groupNameInput)
+        content.addView(label(
+            "ACL-Regel auswählen", 17f, Color.WHITE, true
+        ), groupInputPosition + 1)
+        content.addView(groupRuleInfo, groupInputPosition + 2)
+        content.addView(groupRuleSpinner, groupInputPosition + 3)
+
+        content.addView(label(
+            "Gültigkeit der Regel", 17f, Color.WHITE, true
+        ))
+
+        applyHereCheckbox = android.widget.CheckBox(this).apply {
+            text = "Gilt in diesem Kanal"
+            setTextColor(Color.WHITE)
+            buttonTintList = android.content.res.ColorStateList.valueOf(
+                Color.rgb(75, 210, 195)
+            )
+            isChecked = rule?.applyHere ?: true
+            minimumHeight = dp(48)
+        }
+        content.addView(applyHereCheckbox)
+
+        applySubsCheckbox = android.widget.CheckBox(this).apply {
+            text = "Gilt in Unterkanälen"
+            setTextColor(Color.WHITE)
+            buttonTintList = android.content.res.ColorStateList.valueOf(
+                Color.rgb(75, 210, 195)
+            )
+            isChecked = rule?.applySubs ?: false
+            minimumHeight = dp(48)
+        }
+        content.addView(applySubsCheckbox)
+
+        updateRuleValidity = { selectedRule ->
+            applyHereCheckbox.isChecked = selectedRule?.applyHere ?: true
+            applySubsCheckbox.isChecked = selectedRule?.applySubs ?: false
+
+            val editable = !viewingDifferentGroup &&
+                rule?.inherited != true
+
+            applyHereCheckbox.isEnabled = editable
+            applySubsCheckbox.isEnabled = editable
+        }
+        validityFieldsReady = true
+        updateRuleValidity?.invoke(rule)
+
+
+        content.addView(label(
+            "Die Regel wird zunächst nur lokal vorbereitet. " +
+                "Es erfolgt keine Änderung am Mumble-Server.",
+            13f, Color.LTGRAY
+        ))
+
+        var closeEditorForRuleSwitch: (() -> Unit)? = null
+
+        val editSelectedButton = button(
+            "✏️ Diese direkte Regel bearbeiten"
+        ) {
+            val selected = selectedDisplayedRule
+            if (
+                selected != null &&
+                !selected.inherited &&
+                selected !== rule &&
+                onEditSelectedRule != null
+            ) {
+                closeEditorForRuleSwitch?.invoke()
+                onEditSelectedRule.invoke(selected)
+            }
+        }
+
+        fun refreshEditSelectedButton() {
+            val selected = selectedDisplayedRule
+            editSelectedButton.visibility =
+                if (
+                    selected != null &&
+                    !selected.inherited &&
+                    selected !== rule &&
+                    onEditSelectedRule != null
+                ) View.VISIBLE else View.GONE
+        }
+
+        content.addView(
+            editSelectedButton,
+            content.indexOfChild(groupRuleSpinner) + 1
+        )
+        onDisplayedRuleChanged = { refreshEditSelectedButton() }
+        refreshEditSelectedButton()
+
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle(
+                if (rule == null) "Neue ACL-Regel"
+                else "ACL-Regel bearbeiten"
+            )
+            .setView(ScrollView(this).apply {
+                setBackgroundColor(bgColor)
+                addView(content)
+            })
+            .setNegativeButton("Abbrechen", null)
+            .setPositiveButton("Lokal übernehmen", null)
+            .create()
+
+        if (targetSpinner.selectedItemPosition == 2) {
+            val selectedEntry =
+                groupEntryTargets.getOrNull(
+                    groupSpinner.selectedItemPosition - 1
+                )
+            onGroupSelectionChanged?.invoke(
+                groupNameInput.text.toString().trim(),
+                selectedEntry?.second
+            )
+        }
+
+        closeEditorForRuleSwitch = { dialog.dismiss() }
+
+        dialog.show()
+        styleMumbleDialog(dialog)
+
+        dialog.getButton(
+            android.app.AlertDialog.BUTTON_POSITIVE
+        ).setOnClickListener {
+            try {
+                if (viewingDifferentGroup || rule?.inherited == true) {
+                    throw IllegalArgumentException(
+                        "Diese Gruppe wird nur angezeigt. " +
+                            "Bitte ihre eigene ACL-Regel zum Bearbeiten öffnen."
+                    )
+                }
+
+                val base = rule ?:
+                    se.lublin.humla.protobuf.Mumble.ACL.ChanACL
+                        .newBuilder()
+                        .setInherited(false)
+                        .build()
+
+                val type = when (targetSpinner.selectedItemPosition) {
+                    1 -> MumbleAclRuleEditor.TargetType.USER
+                    2 -> MumbleAclRuleEditor.TargetType.GROUP
+                    else -> MumbleAclRuleEditor.TargetType.GENERAL
+                }
+
+                val userId = if (
+                    type == MumbleAclRuleEditor.TargetType.USER
+                ) {
+                    userIdInput.text.toString().trim().toIntOrNull()
+                        ?: throw IllegalArgumentException(
+                            "Bitte eine gültige Benutzer-ID eingeben."
+                        )
+                } else null
+
+                if (
+                    rule != null &&
+                    rule.hasGroup() &&
+                    type == MumbleAclRuleEditor.TargetType.GROUP &&
+                    groupNameInput.text.toString().trim() != rule.group
+                ) {
+                    throw IllegalArgumentException(
+                        "Andere Gruppe ausgewählt. Bitte deren eigene " +
+                            "ACL-Regel zum Bearbeiten öffnen."
+                    )
+                }
+
+                if (
+                    rule == null &&
+                    type == MumbleAclRuleEditor.TargetType.GROUP &&
+                    MumbleAclRuleEditor.rulesForGroup(
+                        availableRules,
+                        groupNameInput.text.toString()
+                    ).isNotEmpty()
+                ) {
+                    throw IllegalArgumentException(
+                        "Für diese Gruppe bestehen bereits ACL-Regeln. " +
+                            "Bitte die gewünschte Regel direkt bearbeiten. " +
+                            "Eine zusätzliche Regel muss ausdrücklich " +
+                            "angelegt werden."
+                    )
+                }
+
+                if (rule != null) {
+                    val originalType = MumbleAclRuleEditor.targetType(rule)
+                    val targetChanged = originalType != type ||
+                        (type == MumbleAclRuleEditor.TargetType.USER &&
+                            userId != rule.userId) ||
+                        (type == MumbleAclRuleEditor.TargetType.GROUP &&
+                            groupNameInput.text.toString().trim() != rule.group)
+
+                    if (targetChanged) {
+                        throw IllegalArgumentException(
+                            "Das Ziel einer bestehenden ACL-Regel darf " +
+                                "hier nicht geändert werden. Bitte eine " +
+                                "neue Regel für das gewünschte Ziel anlegen."
+                        )
+                    }
+                }
+
+                val updatedTarget = MumbleAclRuleEditor.updateTarget(
+                    base,
+                    type,
+                    userId,
+                    groupNameInput.text.toString()
+                )
+
+                val selections = permissionSelectors.associate {
+                    (bit, allow, deny) ->
+                    val state = when {
+                        allow.isChecked -> MumbleAclPermissionEditor.State.ALLOW
+                        deny.isChecked -> MumbleAclPermissionEditor.State.DENY
+                        else -> MumbleAclPermissionEditor.State.UNSET
+                    }
+                    bit to state
+                }
+
+                val updated = MumbleAclRuleEditor.updatePermissions(
+                    updatedTarget, selections
+                ).toBuilder()
+                    .setApplyHere(applyHereCheckbox.isChecked)
+                    .setApplySubs(applySubsCheckbox.isChecked)
+                    .build()
+
+                onSave(updated)
+                dialog.dismiss()
+            } catch (error: IllegalArgumentException) {
+                Toast.makeText(
+                    this,
+                    error.message ?: "Ungültige ACL-Eingabe",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
     private fun showMumbleAcl() {
         currentPage = "MUMBLE_ACL"
 
@@ -5723,6 +6436,145 @@ class MainActivity : Activity() {
         )
         root.addView(aclActionRow)
 
+        val aclCheckButton = button("💾 Änderungen prüfen") {
+            val draft = aclDraft
+
+            if (draft == null || !draft.hasChanges()) {
+                aclStatus.text = "Keine lokalen ACL-Änderungen vorhanden."
+            } else {
+                val summary = MumbleAclChangeSummary.summarize(draft)
+                val errors =
+                    MumbleAclPreparation.validateLocalGroups(draft) +
+                    MumbleAclPreparation.validateLocalRules(draft)
+
+                val details = buildString {
+                    appendLine("Geplante Änderungen:")
+                    appendLine()
+                    appendLine("Neue Gruppen: ${summary.addedGroups.size}")
+                    appendLine("Entfernte Gruppen: ${summary.removedGroups.size}")
+                    appendLine("Geänderte Gruppen: ${summary.modifiedGroups.size}")
+
+                    if (summary.addedGroups.isNotEmpty()) {
+                        appendLine()
+                        appendLine("Hinzugefügte Gruppen:")
+                        summary.addedGroups.forEach {
+                            appendLine("  + $it")
+                        }
+                    }
+
+                    if (summary.removedGroups.isNotEmpty()) {
+                        appendLine()
+                        appendLine("Entfernte Gruppen:")
+                        summary.removedGroups.forEach {
+                            appendLine("  - $it")
+                        }
+                    }
+
+                    if (summary.modifiedGroups.isNotEmpty()) {
+                        appendLine()
+                        appendLine("Geänderte Gruppen:")
+                        summary.modifiedGroups.forEach {
+                            appendLine("  • $it")
+                        }
+                    }
+
+                    appendLine()
+                    appendLine("Neue Regelvorkommen: ${summary.addedRules}")
+                    appendLine("Nicht mehr vorhandene Regelvorkommen: ${summary.removedRules}")
+                    appendLine("Bearbeitungen: nicht eindeutig bestimmbar")
+
+                    if (summary.rulesReordered) {
+                        appendLine()
+                        appendLine(
+                            "🔀 Reihenfolge der Berechtigungsregeln geändert."
+                        )
+                        appendLine(
+                            "Die Reihenfolge vorhandener Regeln wurde " +
+                            "verändert. Zusätzlich können Regeln " +
+                            "hinzugefügt oder entfernt worden sein."
+                        )
+                    }
+
+                    val originalRules =
+                        draft.original.rules.filterNot { it.inherited }
+                    val plannedRules =
+                        MumbleAclPreparation.localRules(draft)
+
+                    if (originalRules != plannedRules) {
+                        appendLine()
+                        appendLine("Geplante lokale Regelreihenfolge:")
+
+                        plannedRules.forEachIndexed { index, rule ->
+                            val target = when {
+                                rule.hasUserId() ->
+                                    "Benutzer-ID ${rule.userId}"
+                                rule.hasGroup() ->
+                                    "Gruppe: ${rule.group}"
+                                else -> "Allgemeine Regel"
+                            }
+
+                            val allowed =
+                                MumbleAclManager.permissionNames(rule.grant)
+                            val denied =
+                                MumbleAclManager.permissionNames(rule.deny)
+
+                            appendLine()
+                            appendLine("${index + 1}. $target")
+                            appendLine(
+                                "  Erlaubt: " +
+                                allowed.ifEmpty { listOf("Keine") }
+                                    .joinToString(", ")
+                            )
+                            appendLine(
+                                "  Verweigert: " +
+                                denied.ifEmpty { listOf("Keine") }
+                                    .joinToString(", ")
+                            )
+                            appendLine(
+                                "  Dieser Kanal: " +
+                                if (rule.applyHere) "Ja" else "Nein"
+                            )
+                            appendLine(
+                                "  Unterkanäle: " +
+                                if (rule.applySubs) "Ja" else "Nein"
+                            )
+                        }
+
+                        appendLine()
+                        appendLine(
+                            "Hinweis: Die Reihenfolge ist verbindlich. " +
+                            "Regelvorkommen werden unabhängig von ihrer Position verglichen."
+                        )
+                    }
+
+                    appendLine(
+                        "Vererbung geändert: " +
+                        if (summary.inheritanceChanged) "Ja" else "Nein"
+                    )
+
+                    if (errors.isNotEmpty()) {
+                        appendLine()
+                        appendLine("Prüffehler:")
+                        errors.forEach { appendLine("• $it") }
+                    }
+
+                    appendLine()
+                    append(
+                        "Nur Vorschau. Es werden keine Änderungen " +
+                        "an den Mumble-Server gesendet."
+                    )
+                }
+
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("🔐 ACL-Änderungen prüfen")
+                    .setMessage(details)
+                    .setPositiveButton("Schließen", null)
+                    .show().also { styleMumbleDialog(it) }
+            }
+        }
+
+        root.addView(aclCheckButton)
+
         // ACL-Reiter: Gruppen, Berechtigungen und Eigenschaften.
         val aclTabs = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -5843,19 +6695,57 @@ class MainActivity : Activity() {
         fun renderAclRights(snapshot: MumbleAclManager.AclSnapshot) {
             aclRightsPage.removeAllViews()
 
+            val displayedRules =
+                aclDraft?.takeIf { it.channelId == snapshot.channelId }
+                    ?.getRules() ?: snapshot.rules
+
             aclRightsPage.addView(label(
-                "🛡️ Berechtigungsregeln (${snapshot.rules.size})",
+                "🛡️ Berechtigungsregeln (${displayedRules.size})",
                 18f, Color.WHITE, true
             ))
 
-            if (snapshot.rules.isEmpty()) {
+            aclRightsPage.addView(button("➕ Neue Regel") {
+                val draft = aclDraft
+                if (draft == null || draft.channelId != snapshot.channelId) {
+                    aclStatus.text =
+                        "⚠️ Kein gültiger lokaler ACL-Entwurf vorhanden."
+                } else {
+                    val expectedDraft = draft
+                    showMumbleAclRuleEditor(null, (
+                        aclDraft?.takeIf {
+                            it.channelId == snapshot.channelId
+                        }?.getGroups() ?: snapshot.groups
+                    ).map { it.name }.filter { it.isNotBlank() }.distinct(), (
+                        aclDraft?.takeIf {
+                            it.channelId == snapshot.channelId
+                        }?.getRules() ?: snapshot.rules
+                    )) { newRule ->
+                        val currentDraft = aclDraft
+                        if (
+                            currentDraft !== expectedDraft ||
+                            currentDraft.channelId != snapshot.channelId
+                        ) {
+                            aclStatus.text =
+                                "⚠️ ACL-Daten haben sich geändert. " +
+                                "Bitte den Editor erneut öffnen."
+                        } else if (currentDraft.addRule(newRule)) {
+                            renderAclRights(snapshot)
+                            aclStatus.text =
+                                "✏️ Neue ACL-Regel lokal hinzugefügt. " +
+                                "Noch nicht auf dem Server gespeichert."
+                        }
+                    }
+                }
+            })
+
+            if (displayedRules.isEmpty()) {
                 aclRightsPage.addView(label(
                     "Keine Berechtigungsregeln vorhanden.",
                     14f, muted
                 ))
             }
 
-            snapshot.rules.forEachIndexed { index, rule ->
+            displayedRules.forEachIndexed { index, rule ->
                 val target = when {
                     rule.hasUserId() -> {
                         val name = mumbleManager
@@ -5881,15 +6771,20 @@ class MainActivity : Activity() {
                 val description = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
                 }
+                val ruleTextColor =
+                    if (rule.inherited) Color.rgb(155, 165, 177)
+                    else Color.WHITE
+
                 description.addView(label(
                     "${index + 1}. $target" +
-                        if (rule.inherited) " · Geerbt" else "",
-                    15f, Color.WHITE, true
+                        if (rule.inherited) " · 🔒 Geerbt · Nur lesen" else "",
+                    15f, ruleTextColor, true
                 ))
                 description.addView(label(
                     "Erlaubt: ${MumbleAclManager.permissionNames(rule.grant).size}" +
                         " · Verweigert: ${MumbleAclManager.permissionNames(rule.deny).size}",
-                    13f, muted
+                    13f,
+                    if (rule.inherited) Color.rgb(135, 145, 157) else muted
                 ))
 
                 entry.addView(
@@ -5939,6 +6834,151 @@ class MainActivity : Activity() {
                         14f, muted
                     ))
 
+                    var ruleDialog: android.app.AlertDialog? = null
+
+                    if (!rule.inherited) {
+                        val actions = LinearLayout(this).apply {
+                            orientation = LinearLayout.VERTICAL
+                        }
+
+                        actions.addView(button("✏️ Regel bearbeiten") {
+                            val draft = aclDraft
+                            if (
+                                draft == null ||
+                                draft.channelId != snapshot.channelId ||
+                                draft.getRules().getOrNull(index) !== rule
+                            ) {
+                                ruleDialog?.dismiss()
+                                aclStatus.text =
+                                    "⚠️ Die Regel hat sich verändert. " +
+                                    "Bitte erneut öffnen."
+                            } else {
+                                val expectedDraft = draft
+
+                                fun openDirectRuleEditor(
+                                    selectedRule: se.lublin.humla.protobuf.Mumble.ACL.ChanACL
+                                ) {
+                                    val currentDraft = aclDraft
+                                    val selectedIndex =
+                                        currentDraft?.getRules()?.indexOfFirst {
+                                            it === selectedRule
+                                        } ?: -1
+
+                                    if (
+                                        currentDraft !== expectedDraft ||
+                                        currentDraft.channelId != snapshot.channelId ||
+                                        selectedRule.inherited ||
+                                        selectedIndex < 0
+                                    ) {
+                                        aclStatus.text =
+                                            "⚠️ Die ausgewählte Regel ist nicht mehr " +
+                                            "gültig. Bitte erneut öffnen."
+                                        return
+                                    }
+
+                                    showMumbleAclRuleEditor(
+                                        selectedRule,
+                                        currentDraft.getGroups()
+                                            .map { it.name }
+                                            .filter { it.isNotBlank() }
+                                            .distinct(),
+                                        currentDraft.getRules(),
+                                        onEditSelectedRule = { nextRule ->
+                                            openDirectRuleEditor(nextRule)
+                                        }
+                                    ) { updated ->
+                                        val latestDraft = aclDraft
+                                        if (
+                                            latestDraft !== expectedDraft ||
+                                            latestDraft.channelId != snapshot.channelId ||
+                                            latestDraft.getRules()
+                                                .getOrNull(selectedIndex) !== selectedRule
+                                        ) {
+                                            aclStatus.text =
+                                                "⚠️ Die Regel wurde zwischenzeitlich " +
+                                                "verändert. Bitte erneut öffnen."
+                                        } else if (
+                                            latestDraft.updateRule(
+                                                selectedIndex, updated
+                                            )
+                                        ) {
+                                            ruleDialog?.dismiss()
+                                            renderAclRights(snapshot)
+                                            aclStatus.text =
+                                                "✏️ ACL-Regel lokal bearbeitet. " +
+                                                "Noch nicht auf dem Server gespeichert."
+                                        }
+                                    }
+                                }
+
+                                openDirectRuleEditor(rule)
+                            }
+                        })
+
+                        fun moveRule(direction: Int) {
+                            val draft = aclDraft ?: return
+                            if (draft.channelId != snapshot.channelId) return
+                            if (draft.getRules().getOrNull(index) !== rule) {
+                                aclStatus.text =
+                                    "⚠️ Die Regelliste wurde verändert. " +
+                                    "Bitte die Regel erneut öffnen."
+                                ruleDialog?.dismiss()
+                                return
+                            }
+
+                            if (draft.moveRule(index, direction)) {
+                                ruleDialog?.dismiss()
+                                renderAclRights(snapshot)
+                                aclStatus.text =
+                                    "✏️ Reihenfolge lokal geändert. " +
+                                    "Noch nicht auf dem Server gespeichert."
+                            }
+                        }
+
+                        val moveRow = LinearLayout(this).apply {
+                            orientation = LinearLayout.HORIZONTAL
+                        }
+
+                        moveRow.addView(
+                            button("↑ Nach oben") { moveRule(-1) },
+                            LinearLayout.LayoutParams(0, dp(48), 1f)
+                        )
+                        moveRow.addView(
+                            button("↓ Nach unten") { moveRule(1) },
+                            LinearLayout.LayoutParams(0, dp(48), 1f)
+                        )
+                        actions.addView(moveRow)
+
+                        actions.addView(button("🗑️ Regel löschen") {
+                            android.app.AlertDialog.Builder(this)
+                                .setTitle("ACL-Regel löschen?")
+                                .setMessage(
+                                    "Diese Berechtigungsregel wird nur " +
+                                    "aus dem lokalen Entwurf entfernt. " +
+                                    "Der Mumble-Server bleibt unverändert."
+                                )
+                                .setNegativeButton("Abbrechen", null)
+                                .setPositiveButton("Lokal löschen") { _, _ ->
+                                    val draft = aclDraft
+                                    if (
+                                        draft != null &&
+                                        draft.channelId == snapshot.channelId &&
+                                        draft.getRules().getOrNull(index) === rule &&
+                                        draft.removeRule(index)
+                                    ) {
+                                        ruleDialog?.dismiss()
+                                        renderAclRights(snapshot)
+                                        aclStatus.text =
+                                            "✏️ Regel lokal entfernt. " +
+                                            "Noch nicht auf dem Server gespeichert."
+                                    }
+                                }
+                                .show().also { styleMumbleDialog(it) }
+                        })
+
+                        details.addView(actions)
+                    }
+
                     val dialog = android.app.AlertDialog.Builder(this)
                         .setTitle("🛡️ ACL-Regel ${index + 1}")
                         .setView(ScrollView(this).apply {
@@ -5948,6 +6988,7 @@ class MainActivity : Activity() {
                         .setPositiveButton("Schließen", null)
                         .create()
 
+                    ruleDialog = dialog
                     dialog.show()
                     styleMumbleDialog(dialog)
                 }
