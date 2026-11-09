@@ -7590,9 +7590,23 @@ class MainActivity : Activity() {
                         aclDraftConnectionGeneration =
                             mumbleManager?.getModerationConnectionGeneration()
                     } else {
-                        aclStatus.text =
-                            "⚠️ Neue Serverdaten empfangen. " +
-                            "Lokale Änderungen bleiben erhalten."
+                        val unchanged =
+                            MumbleAclPreparation.isServerStateUnchanged(
+                                existingDraft.original,
+                                snapshot
+                            )
+
+                        aclStatus.text = if (unchanged) {
+                            "ℹ️ Empfangene ACL-Daten stimmen mit dem " +
+                            "ursprünglichen Stand überein. " +
+                            "Lokale Änderungen bleiben erhalten. " +
+                            "Aktualität nicht garantiert."
+                        } else {
+                            "⚠️ ACL-Konflikt: Empfangene Serverdaten " +
+                            "weichen vom ursprünglichen Stand ab. " +
+                            "Lokale Änderungen bleiben erhalten. " +
+                            "Keine Schreibfreigabe."
+                        }
                     }
                     renderAclGroups(snapshot)
                     renderAclRights(snapshot)
