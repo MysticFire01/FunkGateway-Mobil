@@ -6249,6 +6249,7 @@ class MainActivity : Activity() {
         var selectedChannelId: Int? = null
         var latestAclSnapshot: MumbleAclManager.AclSnapshot? = null
         var aclDraft: MumbleAclDraft? = null
+        var aclDraftConnectionGeneration: Long? = null
         hasPendingMumbleAclChanges = {
             aclDraft?.hasChanges() == true
         }
@@ -6327,6 +6328,7 @@ class MainActivity : Activity() {
                             chosen.second.trim() + " ▾"
                         latestAclSnapshot = null
                         aclDraft = null
+                        aclDraftConnectionGeneration = null
                         groupContainer.removeAllViews()
                         groupContainer.addView(label(
                             "Bitte Kanalrechte abrufen.", 14f, muted
@@ -6442,12 +6444,45 @@ class MainActivity : Activity() {
             if (draft == null || !draft.hasChanges()) {
                 aclStatus.text = "Keine lokalen ACL-Änderungen vorhanden."
             } else {
+                val manager = mumbleManager
+                val generation = manager
+                    ?.getModerationConnectionGeneration()
+
+                val safety = MumbleAclChangeSafety.check(
+                    MumbleAclChangeSafety.Context(
+                        connected = manager?.isConnected() == true,
+                        connectionGeneration = generation ?: -1L,
+                        expectedGeneration =
+                            aclDraftConnectionGeneration ?: -2L,
+                        selectedChannelId = selectedChannelId,
+                        requestedChannelId = draft.channelId,
+                        serverSnapshot = latestAclSnapshot,
+                        draft = draft
+                    )
+                )
+
                 val summary = MumbleAclChangeSummary.summarize(draft)
-                val errors =
-                    MumbleAclPreparation.validateLocalGroups(draft) +
-                    MumbleAclPreparation.validateLocalRules(draft)
 
                 val details = buildString {
+                    if (safety.validForReview) {
+                        appendLine("✅ Lokale Sicherheitsprüfung bestanden.")
+                        appendLine(
+                            "Der Entwurf kann weiter geprüft werden."
+                        )
+                        appendLine("Keine Schreibfreigabe.")
+                    } else {
+                        appendLine("⚠️ Sicherheitsprüfung fehlgeschlagen.")
+                        appendLine(
+                            "Der ACL-Entwurf ist nicht zur weiteren " +
+                            "Prüfung geeignet."
+                        )
+                        appendLine()
+                        safety.reasons.forEach { reason ->
+                            appendLine("• $reason")
+                        }
+                    }
+
+                    appendLine()
                     appendLine("Geplante Änderungen:")
                     appendLine()
                     appendLine("Neue Gruppen: ${summary.addedGroups.size}")
@@ -6552,11 +6587,7 @@ class MainActivity : Activity() {
                         if (summary.inheritanceChanged) "Ja" else "Nein"
                     )
 
-                    if (errors.isNotEmpty()) {
-                        appendLine()
-                        appendLine("Prüffehler:")
-                        errors.forEach { appendLine("• $it") }
-                    }
+
 
                     appendLine()
                     append(
@@ -7556,6 +7587,8 @@ class MainActivity : Activity() {
                         !existingDraft.hasChanges()
                     ) {
                         aclDraft = MumbleAclDraft(snapshot)
+                        aclDraftConnectionGeneration =
+                            mumbleManager?.getModerationConnectionGeneration()
                     } else {
                         aclStatus.text =
                             "⚠️ Neue Serverdaten empfangen. " +
@@ -7588,6 +7621,7 @@ class MainActivity : Activity() {
                     selectedChannelId = null
                     latestAclSnapshot = null
                     aclDraft = null
+                    aclDraftConnectionGeneration = null
                     selectedChannel.text = "Keine Verbindung."
                     aclChannelButton?.text = "📁 Kanal auswählen ▾"
                     resetAclPages()
