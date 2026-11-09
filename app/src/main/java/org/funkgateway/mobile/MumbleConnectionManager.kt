@@ -64,8 +64,64 @@ class MumbleConnectionManager(
 
     private val registeredUsers = MumbleRegisteredUsers()
 
+    // Namen registrierter Benutzer, ausschließlich für die aktuelle Sitzung.
+    private var registeredUserNames: Map<Int, String> = emptyMap()
+
+    fun getRegisteredUserName(userId: Int): String? =
+        registeredUserNames[userId]
+
+    // Registrierte Benutzer für die lokale ACL-Gruppenbearbeitung.
+    // Die Liste gehört ausschließlich zur aktuellen Mumble-Sitzung.
+    fun getAclRegisteredUsers(): List<Pair<Int, String>> =
+        registeredUserNames.entries
+            .map { it.key to it.value }
+            .sortedWith(
+                compareBy(String.CASE_INSENSITIVE_ORDER) { it.second }
+            )
+
+
     // Mumble-Bannliste: zunächst ausschließlich lesen.
     private val mumbleBanList = MumbleBanList()
+
+    // Mumble-Kanalrechte: zunächst ausschließlich lesen.
+    private val mumbleAclManager = MumbleAclManager()
+
+    var onMumbleAclReceived:
+        ((MumbleAclManager.AclSnapshot) -> Unit)? = null
+
+    var onMumbleAclConnectionLost: (() -> Unit)? = null
+
+    fun requestMumbleAcl(channelId: Int): Boolean {
+        if (!isConnected()) return false
+        return mumbleAclManager.requestAcl(channelId)
+    }
+
+    private fun attachMumbleAcl() {
+        val humla = service as? HumlaService ?: return
+        val generation = moderationConnectionGeneration
+        val expectedConnection = humla.connection
+
+        mumbleAclManager.onAclReceived = { snapshot ->
+            reconnectHandler.post {
+                if (
+                    service === humla &&
+                    service?.isConnected == true &&
+                    moderationConnectionGeneration == generation &&
+                    humla.connection === expectedConnection
+                ) {
+                    onMumbleAclReceived?.invoke(snapshot)
+                }
+            }
+        }
+
+        mumbleAclManager.attach(expectedConnection)
+    }
+
+    private fun detachMumbleAcl() {
+        mumbleAclManager.detach()
+        mumbleAclManager.onAclReceived = null
+        onMumbleAclConnectionLost?.invoke()
+    }
 
     var onMumbleBansReceived:
         ((List<MumbleBanList.BanEntry>) -> Unit)? = null
@@ -94,6 +150,13 @@ class MumbleConnectionManager(
 
     fun requestRegisteredUsers(): Boolean {
         if (!canRegisterOtherUsers()) return false
+        return registeredUsers.requestUsers()
+    }
+
+    // Nur lesende Namensauflösung für die ACL-Gruppenanzeige.
+    // Der Mumble-Server entscheidet, ob die Benutzerliste verfügbar ist.
+    fun requestAclUserNames(): Boolean {
+        if (!isConnected()) return false
         return registeredUsers.requestUsers()
     }
 
@@ -143,18 +206,31 @@ class MumbleConnectionManager(
 
     private fun attachRegisteredUsers() {
         val humla = service as? HumlaService ?: return
+        val generation = moderationConnectionGeneration
+        val expectedConnection = humla.connection
+
+        registeredUserNames = emptyMap()
+
         registeredUsers.onUsersReceived = { users ->
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                if (service?.isConnected == true) {
+            reconnectHandler.post {
+                if (
+                    service === humla &&
+                    service?.isConnected == true &&
+                    moderationConnectionGeneration == generation &&
+                    humla.connection === expectedConnection
+                ) {
+                    registeredUserNames = users.associate { it.id to it.name }
                     onRegisteredUsersReceived?.invoke(users)
                 }
             }
         }
-        registeredUsers.attach(humla.connection)
+        registeredUsers.attach(expectedConnection)
     }
 
     private fun detachRegisteredUsers() {
         registeredUsers.detach()
+        registeredUsers.onUsersReceived = null
+        registeredUserNames = emptyMap()
         onRegisteredUsersConnectionLost?.invoke()
         onRegisteredUsersReceived?.invoke(emptyList())
     }
@@ -350,6 +426,7 @@ class MumbleConnectionManager(
             requestRegistrationPermissions()
             attachRegisteredUsers()
             attachMumbleBanList()
+            attachMumbleAcl()
 
             // Nur eine tatsächlich erfolgreiche Verbindung merken.
             try {
@@ -376,6 +453,7 @@ class MumbleConnectionManager(
         }
 
         override fun onDisconnected(error: HumlaException?) {
+            detachMumbleAcl()
             detachMumbleBanList()
             detachRegisteredUsers()
             cancelConnectTimeout()
@@ -567,6 +645,7 @@ class MumbleConnectionManager(
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
+            detachMumbleAcl()
             detachMumbleBanList()
             detachRegisteredUsers()
             cancelConnectTimeout()
@@ -923,6 +1002,7 @@ class MumbleConnectionManager(
     }
 
     fun disconnect() {
+        detachMumbleAcl()
         detachMumbleBanList()
         detachRegisteredUsers()
         cancelConnectTimeout()
@@ -1611,6 +1691,7 @@ class MumbleConnectionManager(
             reconnectTask != null
 
     fun release() {
+        detachMumbleAcl()
         detachMumbleBanList()
         detachRegisteredUsers()
         cancelConnectTimeout()

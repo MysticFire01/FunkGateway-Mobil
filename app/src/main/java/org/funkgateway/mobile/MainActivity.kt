@@ -5506,6 +5506,10 @@ class MainActivity : Activity() {
             showMumbleBanList()
         })
 
+        root.addView(button("🔐 Kanalrechte und Gruppen (ACL)") {
+            showMumbleAcl()
+        })
+
         root.addView(label(
             "Weitere Administratorfunktionen folgen.",
             14f, muted
@@ -5514,6 +5518,1094 @@ class MainActivity : Activity() {
         showGatewayScreen(ScrollView(this).apply {
             addView(root)
         })
+    }
+
+    private fun showMumbleAcl() {
+        currentPage = "MUMBLE_ACL"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(16))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label(
+            "🔐 Mumble – Kanalrechte",
+            18f, Color.WHITE, true
+        ))
+        var selectedChannelId: Int? = null
+        var latestAclSnapshot: MumbleAclManager.AclSnapshot? = null
+        var aclDraft: MumbleAclDraft? = null
+        hasPendingMumbleAclChanges = {
+            aclDraft?.hasChanges() == true
+        }
+
+        val selectedChannel = label(
+            "Noch kein Kanal ausgewählt.",
+            15f, Color.WHITE
+        )
+
+        val aclStatus = label(
+            "Bitte zuerst einen Kanal auswählen.",
+            14f, muted
+        )
+        root.addView(aclStatus)
+
+        val groupContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        val aclGroupsTitle = label(
+            "👥 Gruppen und Mitgliedschaften",
+            18f, Color.WHITE, true
+        )
+
+
+        val aclRightsPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label(
+                "Berechtigungsregeln werden hier angezeigt.",
+                14f, muted
+            ))
+        }
+        val aclPropertiesPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label(
+                "Kanaleigenschaften werden hier angezeigt.",
+                14f, muted
+            ))
+        }
+
+
+        var aclChannelButton: android.widget.Button? = null
+        val channelButton = button("📁 Kanal auswählen ▾") {
+            val tree = mumbleManager?.getChannelTree()
+
+            if (tree == null) {
+                android.widget.Toast.makeText(
+                    this,
+                    "Keine Mumble-Verbindung vorhanden.",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            } else {
+                val channels = mutableListOf<Pair<Int, String>>()
+
+                fun collect(
+                    item: MumbleConnectionManager.MumbleChannelItem,
+                    depth: Int
+                ) {
+                    channels.add(
+                        item.id to ("  ".repeat(depth) + "📁 " + item.name)
+                    )
+                    item.children.forEach { collect(it, depth + 1) }
+                }
+
+                collect(tree, 0)
+
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("Mumble-Kanal auswählen")
+                    .setItems(channels.map { it.second }.toTypedArray()) {
+                        _, index ->
+                        val chosen = channels[index]
+                        fun applyChannelChange() {
+                            selectedChannelId = chosen.first
+                            selectedChannel.text = chosen.second.trim()
+                        aclChannelButton?.text =
+                            chosen.second.trim() + " ▾"
+                        latestAclSnapshot = null
+                        aclDraft = null
+                        groupContainer.removeAllViews()
+                        groupContainer.addView(label(
+                            "Bitte Kanalrechte abrufen.", 14f, muted
+                        ))
+                        aclRightsPage.removeAllViews()
+                        aclPropertiesPage.removeAllViews()
+                        aclRightsPage.addView(label(
+                            "Bitte Kanalrechte abrufen.", 14f, muted
+                        ))
+                        aclPropertiesPage.addView(label(
+                            "Bitte Kanalrechte abrufen.", 14f, muted
+                        ))
+                            aclStatus.text = "Bitte Kanalrechte abrufen."
+                        }
+
+                        if (chosen.first == selectedChannelId) {
+                            return@setItems
+                        }
+
+                        if (aclDraft?.hasChanges() == true) {
+                            android.app.AlertDialog.Builder(this)
+                                .setTitle("Ungespeicherte Änderungen")
+                                .setMessage(
+                                    "Die lokalen ACL-Änderungen sind noch " +
+                                    "nicht gespeichert. Beim Kanalwechsel " +
+                                    "werden sie verworfen."
+                                )
+                                .setNegativeButton(
+                                    "Weiter bearbeiten", null
+                                )
+                                .setPositiveButton(
+                                    "Änderungen verwerfen"
+                                ) { _, _ ->
+                                    applyChannelChange()
+                                }
+                                .show().also {
+                                    styleMumbleDialog(it)
+                                }
+                        } else {
+                            applyChannelChange()
+                        }
+                    }
+                    .setNegativeButton("Abbrechen", null)
+                    .show().also { styleMumbleDialog(it) }
+            }
+        }
+
+
+        aclChannelButton = channelButton
+        root.addView(channelButton)
+
+        val aclActionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val aclRefreshButton = button("🔄 Abrufen") {
+            val channelId = selectedChannelId
+
+            if (channelId == null) {
+                aclStatus.text = "⚠️ Bitte zuerst einen Kanal auswählen."
+            } else {
+                aclStatus.text = "Kanalrechte werden angefordert …"
+
+                mumbleManager?.requestAclUserNames()
+                val sent = mumbleManager?.requestMumbleAcl(channelId) == true
+
+                if (!sent) {
+                    aclStatus.text =
+                        "⚠️ ACL-Abfrage nicht möglich. Mumble-Verbindung prüfen."
+                }
+            }
+        }
+
+
+        aclActionRow.addView(
+            aclRefreshButton,
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+        aclActionRow.addView(
+            button("← Zurück") {
+                if (aclDraft?.hasChanges() == true) {
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("Ungespeicherte Änderungen")
+                        .setMessage(
+                            "Es gibt lokale ACL-Änderungen, die noch " +
+                            "nicht auf dem Server gespeichert wurden. " +
+                            "Möchtest du diese verwerfen?"
+                        )
+                        .setNegativeButton(
+                            "Weiter bearbeiten", null
+                        )
+                        .setPositiveButton(
+                            "Änderungen verwerfen"
+                        ) { _, _ ->
+                            aclDraft = null
+                            showMumbleAdmin()
+                        }
+                        .show().also {
+                            styleMumbleDialog(it)
+                        }
+                } else {
+                    showMumbleAdmin()
+                }
+            },
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+        root.addView(aclActionRow)
+
+        // ACL-Reiter: Gruppen, Berechtigungen und Eigenschaften.
+        val aclTabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setBackgroundColor(bg)
+        }
+
+        val aclGroupPage = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val aclPages = listOf(
+            aclGroupPage, aclRightsPage, aclPropertiesPage
+        )
+        val aclTabButtons = mutableListOf<android.widget.Button>()
+
+        fun selectAclTab(index: Int) {
+            aclPages.forEachIndexed { pageIndex, view ->
+                view.visibility =
+                    if (pageIndex == index)
+                        android.view.View.VISIBLE
+                    else
+                        android.view.View.GONE
+            }
+            aclTabButtons.forEachIndexed { tabIndex, button ->
+                button.setTextColor(
+                    if (tabIndex == index) accent else Color.WHITE
+                )
+            }
+        }
+
+        listOf("Gruppen", "Rechte", "Info").forEachIndexed {
+                index, title ->
+            val tab = button(title) {
+                selectAclTab(index)
+            }.apply {
+                textSize = 12f
+                setPadding(dp(4), 0, dp(4), 0)
+            }
+            aclTabButtons.add(tab)
+            aclTabs.addView(
+                tab,
+                LinearLayout.LayoutParams(0, dp(44), 1f)
+            )
+        }
+
+        aclGroupPage.addView(aclGroupsTitle)
+        aclGroupPage.addView(groupContainer)
+        root.addView(aclTabs)
+        root.addView(aclGroupPage)
+        root.addView(aclRightsPage)
+        root.addView(aclPropertiesPage)
+        selectAclTab(0)
+
+        fun resetAclPages() {
+            groupContainer.removeAllViews()
+            groupContainer.addView(label(
+                "Bitte Kanalrechte abrufen.", 14f, muted
+            ))
+            aclRightsPage.removeAllViews()
+            aclRightsPage.addView(label(
+                "Bitte Kanalrechte abrufen.", 14f, muted
+            ))
+            aclPropertiesPage.removeAllViews()
+            aclPropertiesPage.addView(label(
+                "Bitte Kanalrechte abrufen.", 14f, muted
+            ))
+        }
+
+        fun renderAclInfo(snapshot: MumbleAclManager.AclSnapshot) {
+            aclPropertiesPage.removeAllViews()
+
+            aclPropertiesPage.addView(label(
+                "ℹ️ Kanalinformationen",
+                18f, Color.WHITE, true
+            ))
+
+            val inheritedRules = snapshot.rules.count { it.inherited }
+            val localRules = snapshot.rules.size - inheritedRules
+            val inheritedGroups = snapshot.groups.count { it.inherited }
+
+            val info = listOf(
+                "Kanal" to selectedChannel.text.toString(),
+                "Kanal-ID" to snapshot.channelId.toString(),
+                "Rechte vom übergeordneten Kanal übernehmen" to
+                    if (snapshot.inheritAcls) "Ja" else "Nein",
+                "Gruppen insgesamt" to snapshot.groups.size.toString(),
+                "Davon geerbte Gruppen" to inheritedGroups.toString(),
+                "Berechtigungsregeln insgesamt" to
+                    snapshot.rules.size.toString(),
+                "Eigene Berechtigungsregeln" to localRules.toString(),
+                "Geerbte Berechtigungsregeln" to
+                    inheritedRules.toString()
+            )
+
+            info.forEach { (name, value) ->
+                val entry = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                    background = rounded(panel)
+                }
+                entry.addView(label(name, 13f, muted))
+                entry.addView(label(value, 16f, Color.WHITE, true))
+                aclPropertiesPage.addView(
+                    entry,
+                    LinearLayout.LayoutParams(-1, -2).apply {
+                        topMargin = dp(8)
+                    }
+                )
+            }
+
+            aclPropertiesPage.addView(label(
+                "🔒 Nur lesender Zugriff. Es werden keine " +
+                    "Serverrechte oder Gruppen verändert.",
+                14f, muted
+            ))
+        }
+
+        fun renderAclRights(snapshot: MumbleAclManager.AclSnapshot) {
+            aclRightsPage.removeAllViews()
+
+            aclRightsPage.addView(label(
+                "🛡️ Berechtigungsregeln (${snapshot.rules.size})",
+                18f, Color.WHITE, true
+            ))
+
+            if (snapshot.rules.isEmpty()) {
+                aclRightsPage.addView(label(
+                    "Keine Berechtigungsregeln vorhanden.",
+                    14f, muted
+                ))
+            }
+
+            snapshot.rules.forEachIndexed { index, rule ->
+                val target = when {
+                    rule.hasUserId() -> {
+                        val name = mumbleManager
+                            ?.getRegisteredUserName(rule.userId)
+                        if (name.isNullOrBlank())
+                            "Benutzer-ID ${rule.userId}"
+                        else
+                            "$name (ID ${rule.userId})"
+                    }
+                    rule.hasGroup() -> "Gruppe: ${rule.group}"
+                    else -> "Allgemeine Regel"
+                }
+
+                val entry = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                    background = rounded(panel)
+                    isClickable = true
+                    isFocusable = true
+                }
+
+                val description = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+                description.addView(label(
+                    "${index + 1}. $target" +
+                        if (rule.inherited) " · Geerbt" else "",
+                    15f, Color.WHITE, true
+                ))
+                description.addView(label(
+                    "Erlaubt: ${MumbleAclManager.permissionNames(rule.grant).size}" +
+                        " · Verweigert: ${MumbleAclManager.permissionNames(rule.deny).size}",
+                    13f, muted
+                ))
+
+                entry.addView(
+                    description,
+                    LinearLayout.LayoutParams(0, -2, 1f)
+                )
+                entry.addView(label("›", 24f, accent, true))
+
+                entry.setOnClickListener {
+                    val details = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dp(18), dp(12), dp(18), dp(12))
+                        setBackgroundColor(bg)
+                    }
+
+                    fun addSection(title: String, mask: Int) {
+                        details.addView(label(
+                            title, 16f, accent, true
+                        ))
+                        val names = MumbleAclManager.permissionNames(mask)
+                        details.addView(label(
+                            if (names.isEmpty()) "Keine"
+                            else names.joinToString("\n") { "• $it" },
+                            14f, Color.WHITE
+                        ))
+                    }
+
+                    details.addView(label(
+                        target, 16f, Color.WHITE, true
+                    ))
+                    addSection("Erlaubte Rechte", rule.grant)
+                    addSection("Verweigerte Rechte", rule.deny)
+
+                    details.addView(label(
+                        "Gilt in diesem Kanal: " +
+                            if (rule.applyHere) "Ja" else "Nein",
+                        14f, muted
+                    ))
+                    details.addView(label(
+                        "Gilt in Unterkanälen: " +
+                            if (rule.applySubs) "Ja" else "Nein",
+                        14f, muted
+                    ))
+                    details.addView(label(
+                        "Geerbte Regel: " +
+                            if (rule.inherited) "Ja" else "Nein",
+                        14f, muted
+                    ))
+
+                    val dialog = android.app.AlertDialog.Builder(this)
+                        .setTitle("🛡️ ACL-Regel ${index + 1}")
+                        .setView(ScrollView(this).apply {
+                            setBackgroundColor(bg)
+                            addView(details)
+                        })
+                        .setPositiveButton("Schließen", null)
+                        .create()
+
+                    dialog.show()
+                    styleMumbleDialog(dialog)
+                }
+
+                aclRightsPage.addView(
+                    entry,
+                    LinearLayout.LayoutParams(-1, -2).apply {
+                        topMargin = dp(8)
+                    }
+                )
+            }
+        }
+
+        fun renderAclGroups(snapshot: MumbleAclManager.AclSnapshot) {
+            groupContainer.removeAllViews()
+
+            groupContainer.addView(label(
+                if (snapshot.inheritAcls)
+                    "Kanalrechte werden vom übergeordneten Kanal geerbt."
+                else
+                    "Vererbung übergeordneter Kanalrechte deaktiviert.",
+                14f, muted
+            ))
+
+            if (snapshot.groups.isEmpty()) {
+                groupContainer.addView(label(
+                    "Keine Gruppen vom Server geliefert.",
+                    14f, muted
+                ))
+            }
+
+            fun members(values: List<Int>): String =
+                if (values.isEmpty()) "Keine"
+                else values.joinToString("\n") { userId ->
+                    val name = mumbleManager
+                        ?.getRegisteredUserName(userId)
+                        ?.takeIf { it.isNotBlank() }
+                    if (name != null) "$name (ID $userId)"
+                    else "ID $userId"
+                }
+
+            val displayedGroups =
+                aclDraft?.takeIf { it.channelId == snapshot.channelId }
+                    ?.getGroups() ?: snapshot.groups
+
+            displayedGroups.forEachIndexed { groupIndex, group ->
+                val originalGroup = snapshot.groups.getOrNull(groupIndex)
+                val locallyChanged =
+                    originalGroup != null && originalGroup != group
+
+                val directCount = group.addList.size
+                val inheritedCount = group.inheritedMembersList.size
+                val removedCount = group.removeList.size
+
+                val entry = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                    background = rounded(panel)
+                    isClickable = true
+                    isFocusable = true
+                }
+
+                val description = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+
+                description.addView(label(
+                    "👥 ${group.name}" +
+                        (if (group.inherited) " · Geerbt" else "") +
+                        (if (locallyChanged) " · Nicht gespeichert" else ""),
+                    16f, Color.WHITE, true
+                ))
+
+                description.addView(label(
+                    "$directCount direkt · $inheritedCount geerbt" +
+                        if (removedCount > 0)
+                            " · $removedCount entfernt"
+                        else "",
+                    13f, muted
+                ))
+
+                entry.addView(
+                    description,
+                    LinearLayout.LayoutParams(0, -2, 1f)
+                )
+                entry.addView(label("›", 24f, accent, true))
+
+                entry.setOnClickListener {
+                    val details = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dp(18), dp(12), dp(18), dp(12))
+                        setBackgroundColor(bg)
+                    }
+
+                    fun section(title: String, values: List<Int>) {
+                        details.addView(label(
+                            "$title (${values.size})",
+                            16f, accent, true
+                        ))
+                        details.addView(label(
+                            members(values), 14f, Color.WHITE
+                        ))
+                    }
+
+                    section("Direkte Mitglieder", group.addList)
+                    section("Entfernte Mitglieder", group.removeList)
+                    section(
+                        "Geerbte Mitglieder",
+                        group.inheritedMembersList
+                    )
+
+                    details.addView(label(
+                        "Übernimmt Mitglieder: " +
+                            if (group.inherit) "Ja" else "Nein",
+                        14f, muted
+                    ))
+                    details.addView(label(
+                        "An Unterkanäle vererbbar: " +
+                            if (group.inheritable) "Ja" else "Nein",
+                        14f, muted
+                    ))
+
+                    val dialog = android.app.AlertDialog.Builder(this)
+                        .setTitle("👥 ${group.name}")
+                        .setNeutralButton("Bearbeiten") { _, _ ->
+                            val users = mumbleManager
+                                ?.getAclRegisteredUsers()
+                                .orEmpty()
+
+                            if (users.isEmpty()) {
+                                android.app.AlertDialog.Builder(this)
+                                    .setTitle("Keine Benutzerliste")
+                                    .setMessage(
+                                        "Der Server hat noch keine Liste " +
+                                        "registrierter Benutzer geliefert."
+                                    )
+                                    .setPositiveButton("OK", null)
+                                    .show().also { styleMumbleDialog(it) }
+                            } else {
+                                val original = group.addList.toSet()
+                                val selected = original.toMutableSet()
+
+                                // Ausgeschlossene Mitglieder getrennt verwalten.
+                                val originalExcluded =
+                                    if (group.inherited) {
+                                        aclDraft
+                                            ?.takeIf {
+                                                it.channelId == snapshot.channelId
+                                            }
+                                            ?.getLocalExclusionsForInheritedGroup(
+                                                groupIndex
+                                            )
+                                            ?: group.removeList.toSet()
+                                    } else {
+                                        group.removeList.toSet()
+                                    }
+                                val selectedExcluded =
+                                    originalExcluded.toMutableSet()
+
+                                val localGroupForInheritance =
+                                    if (group.inherited) {
+                                        aclDraft
+                                            ?.takeIf {
+                                                it.channelId == snapshot.channelId
+                                            }
+                                            ?.getGroups()
+                                            ?.firstOrNull {
+                                                !it.inherited &&
+                                                    it.name == group.name
+                                            }
+                                    } else {
+                                        group
+                                    }
+
+                                val initialInheritable =
+                                    localGroupForInheritance?.inheritable ?: false
+
+                                val editor = LinearLayout(this).apply {
+                                    orientation = LinearLayout.VERTICAL
+                                    setPadding(dp(16), dp(8), dp(16), dp(8))
+                                    setBackgroundColor(bg)
+                                }
+
+                                val search = android.widget.EditText(this).apply {
+                                    hint = "Benutzername oder ID suchen"
+                                    setSingleLine(true)
+                                    setTextColor(Color.WHITE)
+                                    setHintTextColor(muted)
+                                    backgroundTintList =
+                                        android.content.res.ColorStateList.valueOf(accent)
+                                }
+                                editor.addView(search)
+                                // Auswahl zwischen direkten und
+                                // ausgeschlossenen Mitgliedern.
+                                var editingExcluded = false
+
+                                val memberModeRow = LinearLayout(this).apply {
+                                    orientation = LinearLayout.HORIZONTAL
+                                    setPadding(0, dp(8), 0, dp(8))
+                                }
+
+                                var refreshMemberList: (() -> Unit)? = null
+
+                                val directModeButton =
+                                    button("Direkte ✓") {
+                                        editingExcluded = false
+                                        refreshMemberList?.invoke()
+                                    }
+
+                                val excludedModeButton =
+                                    button("Ausschlüsse") {
+                                        editingExcluded = true
+                                        refreshMemberList?.invoke()
+                                    }
+
+                                fun updateMemberModeButtons() {
+                                    directModeButton.text =
+                                        if (editingExcluded)
+                                            "Direkte"
+                                        else
+                                            "Direkte ✓"
+
+                                    excludedModeButton.text =
+                                        if (editingExcluded)
+                                            "Ausschlüsse ✓"
+                                        else
+                                            "Ausschlüsse"
+                                }
+
+                                memberModeRow.addView(
+                                    directModeButton,
+                                    LinearLayout.LayoutParams(0, dp(48), 1f)
+                                )
+                                memberModeRow.addView(
+                                    excludedModeButton,
+                                    LinearLayout.LayoutParams(0, dp(48), 1f)
+                                )
+
+                                editor.addView(memberModeRow)
+
+                                val inheritanceSwitch =
+                                    android.widget.CheckBox(this).apply {
+                                        text = "An Unterkanäle vererben"
+                                        setTextColor(Color.WHITE)
+                                        textSize = 15f
+                                        isChecked = initialInheritable
+                                        buttonTintList =
+                                            android.content.res.ColorStateList.valueOf(
+                                                accent
+                                            )
+                                        setPadding(0, dp(8), 0, dp(8))
+                                    }
+
+                                editor.addView(inheritanceSwitch)
+
+                                val resultCount = TextView(this).apply {
+                                    setTextColor(muted)
+                                    textSize = 13f
+                                    setPadding(0, dp(8), 0, dp(4))
+                                }
+                                editor.addView(resultCount)
+
+                                val list = LinearLayout(this).apply {
+                                    orientation = LinearLayout.VERTICAL
+                                }
+
+                                editor.addView(ScrollView(this).apply {
+                                    addView(list)
+                                }, LinearLayout.LayoutParams(
+                                    -1, 0, 1f
+                                ))
+
+                                fun refreshUsers(filter: String) {
+                                    list.removeAllViews()
+                                    val matches = users.filter { (id, name) ->
+                                        name.contains(filter, ignoreCase = true) ||
+                                            id.toString().contains(filter)
+                                    }
+                                    resultCount.text =
+                                        "${matches.size} von ${users.size} Benutzern"
+
+                                    matches.forEach { (id, name) ->
+                                        val inherited =
+                                            id in group.inheritedMembersList
+                                        val check = android.widget.CheckBox(this).apply {
+                                            text = "$name (ID $id)" + when {
+                                                inherited && id in selectedExcluded ->
+                                                    " · geerbt · lokal ausgeschlossen"
+                                                inherited -> " · geerbt"
+                                                else -> ""
+                                            }
+                                            setTextColor(Color.WHITE)
+                                            textSize = 15f
+                                            buttonTintList =
+                                                android.content.res.ColorStateList.valueOf(
+                                                    accent
+                                                )
+                                            isChecked = if (editingExcluded) {
+                                                id in selectedExcluded
+                                            } else {
+                                                id in selected || inherited
+                                            }
+                                            isEnabled =
+                                                editingExcluded || !inherited
+                                            setPadding(0, dp(6), 0, dp(6))
+                                            setOnCheckedChangeListener { _, enabled ->
+                                                val target = if (editingExcluded) {
+                                                    selectedExcluded
+                                                } else {
+                                                    selected
+                                                }
+                                                val opposite = if (editingExcluded) {
+                                                    selected
+                                                } else {
+                                                    selectedExcluded
+                                                }
+                                                if (enabled && id in opposite) {
+                                                    isChecked = false
+                                                    android.widget.Toast.makeText(
+                                                        this@MainActivity,
+                                                        "Benutzer ist bereits in der anderen Liste.",
+                                                        android.widget.Toast.LENGTH_SHORT
+                                                    ).show()
+                                                } else if (enabled) {
+                                                    target.add(id)
+                                                } else {
+                                                    target.remove(id)
+                                                }
+                                            }
+                                        }
+                                        list.addView(check)
+                                    }
+                                }
+
+                                refreshMemberList = {
+                                    updateMemberModeButtons()
+                                    refreshUsers(search.text.toString())
+                                }
+                                refreshUsers("")
+
+                                search.addTextChangedListener(
+                                    object : android.text.TextWatcher {
+                                        override fun beforeTextChanged(
+                                            s: CharSequence?, start: Int,
+                                            count: Int, after: Int
+                                        ) = Unit
+
+                                        override fun onTextChanged(
+                                            s: CharSequence?, start: Int,
+                                            before: Int, count: Int
+                                        ) {
+                                            refreshUsers(s?.toString().orEmpty())
+                                        }
+
+                                        override fun afterTextChanged(
+                                            s: android.text.Editable?
+                                        ) = Unit
+                                    }
+                                )
+
+                                android.app.AlertDialog.Builder(this)
+                                    .setTitle("Mitglieder: ${group.name}")
+                                    .setView(editor)
+                                    .setNegativeButton("Abbrechen", null)
+                                    .setPositiveButton("Änderungen prüfen") {
+                                        _, _ ->
+                                        val added = selected - original
+                                        val removed = original - selected
+                                        val excludedAdded =
+                                            selectedExcluded - originalExcluded
+                                        val excludedRemoved =
+                                            originalExcluded - selectedExcluded
+
+                                        val summary = buildString {
+                                            appendLine(
+                                                "Nur lokale Vorschau – " +
+                                                "keine Serveränderung."
+                                            )
+                                            appendLine()
+                                            val oldInheritance =
+                                                if (initialInheritable) "Ja" else "Nein"
+                                            val newInheritance =
+                                                if (inheritanceSwitch.isChecked) "Ja" else "Nein"
+                                            appendLine(
+                                                "An Unterkanäle vererben: " +
+                                                if (initialInheritable != inheritanceSwitch.isChecked) {
+                                                    "$oldInheritance → $newInheritance"
+                                                } else {
+                                                    "$oldInheritance (unverändert)"
+                                                }
+                                            )
+                                            appendLine()
+                                            appendLine(
+                                                "Hinzufügen: ${added.size}"
+                                            )
+                                            added.forEach { id ->
+                                                appendLine(
+                                                    "+ " +
+                                                    (mumbleManager
+                                                        ?.getRegisteredUserName(id)
+                                                        ?: "ID $id")
+                                                )
+                                            }
+                                            appendLine()
+                                            appendLine(
+                                                "Entfernen: ${removed.size}"
+                                            )
+                                            removed.forEach { id ->
+                                                appendLine(
+                                                    "- " +
+                                                    (mumbleManager
+                                                        ?.getRegisteredUserName(id)
+                                                        ?: "ID $id")
+                                                )
+                                            }
+
+                                            appendLine()
+                                            appendLine(
+                                                "Neu ausgeschlossen: ${excludedAdded.size}"
+                                            )
+                                            excludedAdded.forEach { id ->
+                                                appendLine(
+                                                    "⊖ " +
+                                                    (mumbleManager
+                                                        ?.getRegisteredUserName(id)
+                                                        ?: "ID $id")
+                                                )
+                                            }
+
+                                            appendLine()
+                                            appendLine(
+                                                "Ausschluss aufgehoben: ${excludedRemoved.size}"
+                                            )
+                                            excludedRemoved.forEach { id ->
+                                                appendLine(
+                                                    "⊕ " +
+                                                    (mumbleManager
+                                                        ?.getRegisteredUserName(id)
+                                                        ?: "ID $id")
+                                                )
+                                            }
+                                        }
+
+                                        android.app.AlertDialog.Builder(this)
+                                            .setTitle("Änderungsübersicht")
+                                            .setMessage(summary)
+                                            .setNegativeButton(
+                                                "Zurück", null
+                                            )
+                                            .setPositiveButton(
+                                                "Lokal übernehmen"
+                                            ) { _, _ ->
+                                                val draft = aclDraft
+                                                if (
+                                                    currentPage != "MUMBLE_ACL" ||
+                                                    selectedChannelId != snapshot.channelId ||
+                                                    draft == null ||
+                                                    draft.channelId != snapshot.channelId
+                                                ) {
+                                                    android.widget.Toast.makeText(
+                                                        this,
+                                                        "ACL-Entwurf nicht mehr gültig.",
+                                                        android.widget.Toast.LENGTH_LONG
+                                                    ).show()
+                                                } else {
+                                                    val accepted =
+                                                        if (group.inherited) {
+                                                            if (
+                                                                selected != original ||
+                                                                (
+                                                                    selectedExcluded.isEmpty() &&
+                                                                    localGroupForInheritance == null
+                                                                )
+                                                            ) {
+                                                                false
+                                                            } else {
+                                                                draft.updateInheritedGroupExclusions(
+                                                                    groupIndex,
+                                                                    selectedExcluded,
+                                                                    inheritanceSwitch.isChecked
+                                                                )
+                                                            }
+                                                        } else {
+                                                            draft.updateGroupMembers(
+                                                                groupIndex,
+                                                                selected,
+                                                                selectedExcluded,
+                                                                inheritanceSwitch.isChecked
+                                                            )
+                                                        }
+                                                    if (accepted) {
+                                                        renderAclGroups(snapshot)
+                                                        aclStatus.text =
+                                                            "✏️ Lokale Änderungen vorgemerkt. " +
+                                                            "Noch nicht auf dem Server gespeichert."
+                                                    } else {
+                                                        android.widget.Toast.makeText(
+                                                            this,
+                                                            "Mitglieder konnten nicht übernommen werden.",
+                                                            android.widget.Toast.LENGTH_LONG
+                                                        ).show()
+                                                    }
+                                                }
+                                            }
+                                            .show().also {
+                                                styleMumbleDialog(it)
+                                            }
+                                    }
+                                    .show().also {
+                                        styleMumbleDialog(it)
+                                    }
+                            }
+                        }
+                        .setView(ScrollView(this).apply {
+                            setBackgroundColor(bg)
+                            addView(details)
+                        })
+                        .setPositiveButton("Schließen", null)
+                        .create()
+
+                    dialog.setOnShowListener {
+                        dialog.window?.setBackgroundDrawableResource(
+                            android.R.color.transparent
+                        )
+                        dialog.window?.decorView?.setBackgroundColor(bg)
+                        dialog.getButton(
+                            android.app.AlertDialog.BUTTON_POSITIVE
+                        )?.setTextColor(accent)
+                        dialog.findViewById<android.widget.TextView>(
+                            resources.getIdentifier(
+                                "alertTitle", "id", "android"
+                            )
+                        )?.setTextColor(Color.WHITE)
+                    }
+                    dialog.show()
+                }
+
+                groupContainer.addView(
+                    entry,
+                    LinearLayout.LayoutParams(-1, -2).apply {
+                        topMargin = dp(8)
+                    }
+                )
+            }
+        }
+
+
+
+        mumbleManager?.onMumbleAclReceived = { snapshot ->
+            runOnUiThread {
+                if (
+                    currentPage == "MUMBLE_ACL" &&
+                    selectedChannelId == snapshot.channelId
+                ) {
+                    aclStatus.text =
+                        "✅ Kanal ${snapshot.channelId}: " +
+                        "${snapshot.groups.size} Gruppen, " +
+                        "${snapshot.rules.size} Berechtigungsregeln empfangen."
+                    latestAclSnapshot = snapshot
+                    val existingDraft = aclDraft
+                    if (
+                        existingDraft == null ||
+                        existingDraft.channelId != snapshot.channelId ||
+                        !existingDraft.hasChanges()
+                    ) {
+                        aclDraft = MumbleAclDraft(snapshot)
+                    } else {
+                        aclStatus.text =
+                            "⚠️ Neue Serverdaten empfangen. " +
+                            "Lokale Änderungen bleiben erhalten."
+                    }
+                    renderAclGroups(snapshot)
+                    renderAclRights(snapshot)
+                    renderAclInfo(snapshot)
+                }
+            }
+        }
+
+        // Gemeinsame Benutzerliste aktualisiert die ACL-Namensanzeige.
+        mumbleManager?.onRegisteredUsersReceived = { _ ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_ACL") {
+                    latestAclSnapshot?.let { snapshot ->
+                        if (selectedChannelId == snapshot.channelId) {
+                            renderAclGroups(snapshot)
+                            renderAclRights(snapshot)
+                        }
+                    }
+                }
+            }
+        }
+
+        mumbleManager?.onMumbleAclConnectionLost = {
+            runOnUiThread {
+                if (currentPage == "MUMBLE_ACL") {
+                    selectedChannelId = null
+                    latestAclSnapshot = null
+                    aclDraft = null
+                    selectedChannel.text = "Keine Verbindung."
+                    aclChannelButton?.text = "📁 Kanal auswählen ▾"
+                    resetAclPages()
+                    aclStatus.text = "⚠️ Mumble-Verbindung getrennt."
+                }
+            }
+        }
+
+        // Fester Kopfbereich mit Kanalauswahl und ACL-Steuerung.
+        val fixedHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+
+        // Titel, Kanalauswahl und Abruf bleiben fest sichtbar.
+        // Gruppenüberschrift, Gruppenliste und Zurück-Button
+        // befinden sich im scrollbaren Bereich.
+        val scrollContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(16))
+            setBackgroundColor(bg)
+        }
+
+        // Kopfbereich und Reiter bleiben fest sichtbar.
+        // Nur die Inhalte der ausgewählten ACL-Seite scrollen.
+        val children = (0 until root.childCount).map {
+            root.getChildAt(it)
+        }
+
+        children.forEach { child ->
+            root.removeView(child)
+            when (child) {
+                aclGroupPage, aclRightsPage, aclPropertiesPage -> {
+                    scrollContent.addView(child)
+                }
+                else -> fixedHeader.addView(child)
+            }
+        }
+
+
+
+        // Die ACL-Inhalte bleiben scrollbar.
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+            addView(fixedHeader)
+            addView(
+                ScrollView(this@MainActivity).apply {
+                    addView(scrollContent)
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    0,
+                    1f
+                )
+            )
+        }
+
+        showGatewayScreen(page)
     }
 
     private fun showMumbleBanList() {
@@ -7955,7 +9047,7 @@ class MainActivity : Activity() {
                 "FRN-Einstellungen", "FRN_CHAT", "FRN_PARTICIPANTS" -> "FRN"
                 "Mumble", "MUMBLE_ROOMS", "MUMBLE_CERTIFICATES",
                 "MUMBLE_REGISTERED_USERS", "MUMBLE_ADMIN",
-                "MUMBLE_BAN_LIST" -> "Mumble"
+                "MUMBLE_BAN_LIST", "MUMBLE_ACL" -> "Mumble"
                 "Zello" -> "Zello"
                 "Log" -> "Log"
                 else -> "Mehr"
@@ -8024,7 +9116,7 @@ class MainActivity : Activity() {
         }
 
         if (currentPage in listOf("Mumble", "MUMBLE_ROOMS", "MUMBLE_REGISTERED_USERS", "MUMBLE_CERTIFICATES", "MUMBLE_ADMIN",
-            "MUMBLE_BAN_LIST")) {
+            "MUMBLE_BAN_LIST", "MUMBLE_ACL")) {
             val subTabs = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setPadding(dp(8), 0, dp(8), dp(8))
@@ -8621,8 +9713,29 @@ class MainActivity : Activity() {
         handler.post(updater)
     }
 
+    private var hasPendingMumbleAclChanges: (() -> Boolean)? = null
+
     @Deprecated("Back navigation for the current Activity")
     override fun onBackPressed() {
+        if (
+            currentPage == "MUMBLE_ACL" &&
+            hasPendingMumbleAclChanges?.invoke() == true
+        ) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Ungespeicherte ACL-Änderungen")
+                .setMessage(
+                    "Du hast lokale Änderungen an Mumble-Gruppen " +
+                    "vorgemerkt. Möchtest du diese verwerfen?"
+                )
+                .setNegativeButton("Weiter bearbeiten", null)
+                .setPositiveButton("Änderungen verwerfen") { _, _ ->
+                    hasPendingMumbleAclChanges = null
+                    showHome()
+                }
+                .show().also { styleMumbleDialog(it) }
+            return
+        }
+
         if (currentPage != "Start") {
             showHome()
         } else {
