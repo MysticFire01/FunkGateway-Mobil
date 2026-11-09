@@ -74,6 +74,19 @@ class MumbleAclManager {
     private val aclLock = Any()
     private var connection: HumlaConnection? = null
 
+    // Beobachtung lesender ACL-Abfragen, keine Schreibfreigabe.
+    private val requestState = MumbleAclRequestState()
+    private val timeoutHandler =
+        android.os.Handler(android.os.Looper.getMainLooper())
+    private var timeoutTask: Runnable? = null
+
+    // Meldet nur, dass innerhalb der Frist keine passende
+    // ACL-Nachricht beobachtet wurde.
+    var onAclRequestTimeout: ((Int, Long) -> Unit)? = null
+
+    fun getAclRequestState(): MumbleAclRequestState.Snapshot =
+        requestState.snapshot()
+
     // Zählt gültige ACL-Nachrichten innerhalb einer Verbindung.
     // Keine Bestätigung einer bestimmten Serveranfrage.
     private var aclReceiveVersion = 0L
@@ -140,6 +153,17 @@ class MumbleAclManager {
                         connectionGeneration == generation
                     ) {
                         ++aclReceiveVersion
+                        if (requestState.observe(snapshot.channelId)) {
+                            timeoutTask?.let {
+                                timeoutHandler.removeCallbacks(it)
+                            }
+                            timeoutTask = null
+                            Log.i(
+                                "FGW-Mumble-ACL",
+                                "Passende ACL-Nachricht beobachtet: " +
+                                    "Kanal ${snapshot.channelId}"
+                            )
+                        }
                         onAclReceived
                     } else null
                 }
@@ -158,6 +182,9 @@ class MumbleAclManager {
             connection = null
             listener = null
             aclReceiveVersion = 0L
+            timeoutTask?.let { timeoutHandler.removeCallbacks(it) }
+            timeoutTask = null
+            requestState.reset()
             previous
         }
 
@@ -168,26 +195,122 @@ class MumbleAclManager {
 
     fun requestAcl(channelId: Int): Boolean {
         if (channelId < 0) return false
-        val active = connection ?: return false
-        if (!active.isSynchronized) return false
+
+        val prepared = synchronized(aclLock) {
+            val active = connection ?: return false
+            if (!active.isSynchronized) return false
+
+            timeoutTask?.let { timeoutHandler.removeCallbacks(it) }
+            timeoutTask = null
+
+            Triple(
+                active,
+                connectionGeneration,
+                requestState.start(channelId)
+            )
+        }
+
+        val (active, generation, request) = prepared
+
+        val stillCurrent = synchronized(aclLock) {
+            val current = requestState.snapshot()
+            connection === active &&
+                connectionGeneration == generation &&
+                current.requestId == request.requestId &&
+                current.channelId == channelId &&
+                (
+                    current.status == MumbleAclRequestState.Status.PENDING ||
+                    current.status ==
+                        MumbleAclRequestState.Status.MESSAGE_OBSERVED
+                )
+        }
+        if (!stillCurrent) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Abfrage verworfen: Verbindung oder Anfrage gewechselt"
+            )
+            return false
+        }
 
         return try {
-            val request = Mumble.ACL.newBuilder()
+            val message = Mumble.ACL.newBuilder()
                 .setChannelId(channelId)
                 .setQuery(true)
                 .build()
 
-            active.sendTCPMessage(
-                request,
-                HumlaTCPMessageType.ACL
-            )
+            active.sendTCPMessage(message, HumlaTCPMessageType.ACL)
 
-            Log.i(
-                "FGW-Mumble-ACL",
-                "ACL-Abfrage gesendet: Kanal $channelId"
-            )
-            true
+            val requestStillCurrent = synchronized(aclLock) {
+                val current = requestState.snapshot()
+                val sameRequest =
+                    connection === active &&
+                    connectionGeneration == generation &&
+                    current.requestId == request.requestId &&
+                    current.channelId == channelId
+
+                if (sameRequest &&
+                    current.status == MumbleAclRequestState.Status.PENDING
+                ) {
+                    val task = Runnable {
+                        val notify = synchronized(aclLock) {
+                            if (connection !== active ||
+                                connectionGeneration != generation ||
+                                !requestState.timeout(request.requestId)
+                            ) {
+                                false
+                            } else {
+                                timeoutTask = null
+                                true
+                            }
+                        }
+
+                        if (notify) {
+                            Log.w(
+                                "FGW-Mumble-ACL",
+                                "Keine passende ACL-Nachricht innerhalb " +
+                                    "von 10 Sekunden: Kanal $channelId"
+                            )
+                            onAclRequestTimeout?.invoke(
+                                channelId,
+                                request.requestId
+                            )
+                        }
+                    }
+
+                    timeoutTask = task
+                    timeoutHandler.postDelayed(task, 10_000L)
+                    true
+                } else {
+                    sameRequest &&
+                        current.status ==
+                            MumbleAclRequestState.Status.MESSAGE_OBSERVED
+                }
+            }
+
+            if (requestStillCurrent) {
+                Log.i(
+                    "FGW-Mumble-ACL",
+                    "ACL-Abfrage gesendet: Kanal $channelId"
+                )
+            } else {
+                Log.w(
+                    "FGW-Mumble-ACL",
+                    "ACL-Abfrage nach Versand nicht mehr aktuell: Kanal $channelId"
+                )
+            }
+            requestStillCurrent
         } catch (e: Exception) {
+            synchronized(aclLock) {
+                if (connection === active &&
+                    connectionGeneration == generation &&
+                    requestState.snapshot() == request
+                ) {
+                    requestState.reset()
+                    timeoutTask?.let { timeoutHandler.removeCallbacks(it) }
+                    timeoutTask = null
+                }
+            }
+
             Log.e(
                 "FGW-Mumble-ACL",
                 "ACL-Abfrage fehlgeschlagen: Kanal $channelId",
@@ -196,4 +319,5 @@ class MumbleAclManager {
             false
         }
     }
+
 }

@@ -7618,6 +7618,25 @@ class MainActivity : Activity() {
             }
         }
 
+        mumbleManager?.onMumbleAclRequestTimeout = { channelId, requestId ->
+            runOnUiThread {
+                val request = mumbleManager?.getMumbleAclRequestState()
+                if (
+                    currentPage == "MUMBLE_ACL" &&
+                    selectedChannelId == channelId &&
+                    request?.status == MumbleAclRequestState.Status.TIMED_OUT &&
+                    request.channelId == channelId &&
+                    request.requestId == requestId
+                ) {
+                    aclStatus.text =
+                        "⚠️ Innerhalb von 10 Sekunden wurde keine " +
+                        "passende ACL-Nachricht für Kanal $channelId " +
+                        "beobachtet. Bitte Verbindung und Serverrechte " +
+                        "prüfen. Lokale Änderungen bleiben erhalten."
+                }
+            }
+        }
+
         // Gemeinsame Benutzerliste aktualisiert die ACL-Namensanzeige.
         mumbleManager?.onRegisteredUsersReceived = { _ ->
             runOnUiThread {

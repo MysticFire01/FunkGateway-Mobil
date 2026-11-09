@@ -91,6 +91,12 @@ class MumbleConnectionManager(
 
     var onMumbleAclConnectionLost: (() -> Unit)? = null
 
+    // Keine passende ACL-Nachricht innerhalb der Wartezeit beobachtet.
+    var onMumbleAclRequestTimeout: ((Int, Long) -> Unit)? = null
+
+    fun getMumbleAclRequestState(): MumbleAclRequestState.Snapshot =
+        mumbleAclManager.getAclRequestState()
+
     fun requestMumbleAcl(channelId: Int): Boolean {
         if (!isConnected()) return false
         return mumbleAclManager.requestAcl(channelId)
@@ -110,6 +116,23 @@ class MumbleConnectionManager(
                     humla.connection === expectedConnection
                 ) {
                     onMumbleAclReceived?.invoke(snapshot)
+                }
+            }
+        }
+
+        mumbleAclManager.onAclRequestTimeout = { channelId, requestId ->
+            reconnectHandler.post {
+                val request = mumbleAclManager.getAclRequestState()
+                if (
+                    service === humla &&
+                    service?.isConnected == true &&
+                    moderationConnectionGeneration == generation &&
+                    humla.connection === expectedConnection &&
+                    request.status == MumbleAclRequestState.Status.TIMED_OUT &&
+                    request.channelId == channelId &&
+                    request.requestId == requestId
+                ) {
+                    onMumbleAclRequestTimeout?.invoke(channelId, requestId)
                 }
             }
         }
@@ -151,6 +174,7 @@ class MumbleConnectionManager(
         mumbleAclManager.detach()
         mumbleAclManager.onAclReceived = null
         mumbleAclManager.onPermissionQueryReceived = null
+        mumbleAclManager.onAclRequestTimeout = null
         clearMumbleAclWritePermission()
         onMumbleAclConnectionLost?.invoke()
     }
