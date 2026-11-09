@@ -6391,7 +6391,10 @@ class MainActivity : Activity() {
             if (channelId == null) {
                 aclStatus.text = "⚠️ Bitte zuerst einen Kanal auswählen."
             } else {
-                aclStatus.text = "Kanalrechte werden angefordert …"
+                aclStatus.text =
+                    "🔄 ACL-Abfrage wird gesendet. " +
+                    "Eine Serverantwort ist noch nicht bestätigt. " +
+                    "Lokale Änderungen bleiben erhalten."
 
                 mumbleManager?.requestAclUserNames()
                 val sent = mumbleManager?.requestMumbleAcl(channelId) == true
