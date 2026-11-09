@@ -28,6 +28,66 @@ class MumbleAclDraft(
     fun getRules(): List<Mumble.ACL.ChanACL> =
         rules.toList()
 
+
+    /**
+     * Fügt eine neue lokale ACL-Regel am Ende hinzu.
+     * Geerbte Regeln dürfen nicht eingefügt werden.
+     */
+    fun addRule(rule: Mumble.ACL.ChanACL): Boolean {
+        if (rule.inherited) return false
+        rules.add(rule)
+        return true
+    }
+
+    /**
+     * Bearbeitet ausschließlich eine lokale ACL-Regel.
+     * Ihre Position innerhalb der Regelliste bleibt erhalten.
+     */
+    fun updateRule(
+        index: Int,
+        rule: Mumble.ACL.ChanACL
+    ): Boolean {
+        if (index !in rules.indices) return false
+        if (rules[index].inherited) return false
+        if (rule.inherited) return false
+
+        rules[index] = rule
+        return true
+    }
+
+    /**
+     * Entfernt ausschließlich eine lokale ACL-Regel.
+     */
+    fun removeRule(index: Int): Boolean {
+        if (index !in rules.indices) return false
+        if (rules[index].inherited) return false
+
+        rules.removeAt(index)
+        return true
+    }
+
+
+    /**
+     * Verschiebt eine lokale ACL-Regel um genau eine Position.
+     *
+     * Geerbte Regeln dürfen weder verschoben
+     * noch durch eine lokale Regel verdrängt werden.
+     */
+    fun moveRule(index: Int, direction: Int): Boolean {
+        if (direction != -1 && direction != 1) return false
+        if (index !in rules.indices) return false
+
+        val target = index + direction
+        if (target !in rules.indices) return false
+
+        if (rules[index].inherited) return false
+        if (rules[target].inherited) return false
+
+        val rule = rules.removeAt(index)
+        rules.add(target, rule)
+        return true
+    }
+
     fun setInheritance(enabled: Boolean) {
         inheritAcls = enabled
     }
