@@ -74,16 +74,25 @@ object FrnChatBubble {
             orientation = LinearLayout.HORIZONTAL
             gravity = if (outgoing) Gravity.END else Gravity.START
             setPadding(0, dp(4), 0, dp(4))
+            // Chatblase so breit wie nötig, maximal 85 %.
             addView(
                 bubble,
                 LinearLayout.LayoutParams(
-                    0,
                     LinearLayout.LayoutParams.WRAP_CONTENT,
-                    0.85f
-                ).apply {
-                    width = LinearLayout.LayoutParams.WRAP_CONTENT
-                }
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
             )
+
+            post {
+                val maxBubbleWidth = (width * 0.85f).toInt()
+                if (maxBubbleWidth > 0) {
+                    if (bubble.width > maxBubbleWidth) {
+                        bubble.layoutParams = bubble.layoutParams.apply {
+                            width = maxBubbleWidth
+                        }
+                    }
+                }
+            }
         }
     }
 }

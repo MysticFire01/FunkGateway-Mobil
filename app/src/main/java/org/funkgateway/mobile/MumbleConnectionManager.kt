@@ -17,6 +17,7 @@ import se.lublin.humla.model.IMessage
 import se.lublin.humla.util.VoiceTargetMode
 import java.security.cert.X509Certificate
 import se.lublin.humla.protobuf.Mumble
+import se.lublin.humla.net.HumlaTCPMessageType
 
 class MumbleConnectionManager(
     context: Context,
@@ -52,7 +53,155 @@ class MumbleConnectionManager(
     var onTalkStateChanged: ((Int, String) -> Unit)? = null
     var onParrotTalkStateChanged: ((Int, String) -> Unit)? = null
     var onChannelMembershipChanged: (() -> Unit)? = null
+    // Ein Kanal-Erstellungsauftrag pro aktiver Mumble-Verbindung.
+    // Erst eine passende Servermeldung bestätigt die Erstellung.
+    private data class PendingChannelCreation(
+        val parentId: Int,
+        val name: String,
+        val temporary: Boolean,
+        val connectionGeneration: Long,
+        val startedAt: Long
+    )
+
+    private var pendingChannelCreation: PendingChannelCreation? = null
+
+    var onMumbleChannelCreationStatusChanged: ((String) -> Unit)? = null
+
+    // Erwartete Serverwerte nach dem Bearbeiten eines vorhandenen Kanals.
+    private data class PendingChannelEdit(
+        val channelId: Int,
+        val name: String,
+        val description: String,
+        val position: Int,
+        val connectionGeneration: Long,
+        val startedAt: Long
+    )
+
+    private var pendingChannelEdit: PendingChannelEdit? = null
+
+    data class MumbleChatMessage(
+        val senderSessionId: Int,
+        val senderName: String,
+        val text: String,
+        val receivedAt: Long,
+        val targetChannelIds: List<Int>,
+        val targetTreeIds: List<Int>,
+        val targetUserSessionIds: List<Int>
+    )
+
+    var onMumbleChatMessageReceived: ((MumbleChatMessage) -> Unit)? = null
+
+    private data class PendingChannelDeletion(
+        val channelId: Int,
+        val name: String,
+        val connectionGeneration: Long,
+        val startedAt: Long
+    )
+
+    private var pendingChannelDeletion: PendingChannelDeletion? = null
+
+    private data class PendingChannelMove(
+        val channelId: Int,
+        val parentId: Int,
+        val name: String,
+        val generation: Long
+    )
+
+    private var pendingChannelMove: PendingChannelMove? = null
+
+    var onMumbleChannelMoveStatusChanged: ((String) -> Unit)? = null
+
+    var onMumbleChannelDeletionStatusChanged: ((String) -> Unit)? = null
+
+
+    // Eigene Berechtigungsanfrage für die Kanalbearbeitung.
+    // Getrennt von der bereits funktionierenden ACL-Schreibfreigabe.
+    private data class ChannelEditPermissionRequest(
+        val channelId: Int,
+        val connectionGeneration: Long,
+        val startedAt: Long,
+        val confirmed: Boolean = false
+    )
+
+    private var channelEditPermissionRequest:
+        ChannelEditPermissionRequest? = null
+
+    // Schutzfrist gegen verspätete Antworten nach einem Abbruch.
+    private var channelEditPermissionCancelledAt = 0L
+    private var channelEditPermissionCancelledGeneration = -1L
+
+
+    var onMumbleChannelEditStatusChanged: ((String) -> Unit)? = null
+
+    private fun cancelPendingChannelEdit(reason: String) {
+        val pending = pendingChannelEdit ?: return
+        pendingChannelEdit = null
+
+        Log.w("FGW-Mumble", "Kanalbearbeitung abgebrochen: $reason")
+
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            onMumbleChannelEditStatusChanged?.invoke(
+                "⚠️ Kanalbearbeitung '${pending.name}': $reason"
+            )
+        }
+    }
+
+    private fun scheduleChannelEditTimeout(request: PendingChannelEdit) {
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (pendingChannelEdit === request) {
+                pendingChannelEdit = null
+
+                onMumbleChannelEditStatusChanged?.invoke(
+                    "⏳ Keine Serverbestätigung für '${request.name}' " +
+                        "innerhalb von 15 Sekunden. Bitte Kanal erneut " +
+                        "abrufen, bevor du Änderungen wiederholst."
+                )
+            }
+        }, 15000L)
+    }
+
+    private fun cancelPendingChannelCreation(reason: String) {
+        val pending = pendingChannelCreation ?: return
+        pendingChannelCreation = null
+
+        Log.w(
+            "FGW-Mumble",
+            "Kanalerstellung abgebrochen: ${pending.name} – $reason"
+        )
+
+        android.os.Handler(
+            android.os.Looper.getMainLooper()
+        ).post {
+            onMumbleChannelCreationStatusChanged?.invoke(
+                "⚠️ Kanalerstellung '${pending.name}': $reason"
+            )
+        }
+    }
+
     var onRegistrationStatusChanged: ((String) -> Unit)? = null
+    private fun scheduleChannelCreationTimeout(
+        request: PendingChannelCreation
+    ) {
+        android.os.Handler(
+            android.os.Looper.getMainLooper()
+        ).postDelayed({
+            if (pendingChannelCreation === request) {
+                pendingChannelCreation = null
+
+                Log.w(
+                    "FGW-Mumble",
+                    "Keine Serverbestätigung für Kanalerstellung: ${request.name}"
+                )
+
+                onMumbleChannelCreationStatusChanged?.invoke(
+                    "⏳ Keine Serverbestätigung für '${request.name}' " +
+                        "innerhalb von 15 Sekunden. Bitte Kanalbaum prüfen, " +
+                        "bevor du die Erstellung wiederholst."
+                )
+            }
+        }, 15000L)
+    }
+
     private var registrationPending = false
     private var registrationRequestId = 0L
 
@@ -86,10 +235,166 @@ class MumbleConnectionManager(
     // Mumble-Kanalrechte: zunächst ausschließlich lesen.
     private val mumbleAclManager = MumbleAclManager()
 
+    // Getrennte Zustandsverwaltung für spätere ACL-Nachkontrollen.
+    // Noch keine Verbindung zum Netzwerkempfang oder Schreibtransport.
+    private val aclWriteVerificationState =
+        MumbleAclWriteVerificationState()
+
+    // Erwarteter ACL-Entwurf für genau einen Nachkontrollvorgang.
+    // Die ID verhindert eine Zuordnung zu einem älteren Vorgang.
+    private data class PendingAclWriteVerification(
+        val verificationId: Long,
+        val expectedContent: MumbleAclWriteVerification.ExpectedContent
+    )
+
+    private var pendingAclWriteVerification:
+        PendingAclWriteVerification? = null
+
+    fun getMumbleAclWriteVerificationState():
+        MumbleAclWriteVerificationState.Snapshot =
+        aclWriteVerificationState.snapshot()
+
+    private fun scheduleMumbleAclWriteVerificationTimeout(
+        verificationId: Long
+    ) {
+        reconnectHandler.postDelayed({
+            if (aclWriteVerificationState.timeout(verificationId)) {
+                pendingAclWriteVerification = null
+
+                onMumbleAclWriteVerificationTimeout?.invoke(verificationId)
+
+                Log.w(
+                    "FGW-Mumble-ACL",
+                    "ACL-Nachkontrolle abgelaufen: " +
+                        "keine passende Serverantwort innerhalb von 15 Sekunden."
+                )
+            }
+        }, 15000L)
+    }
+
+    private fun startMumbleAclWriteVerification(
+        expectedContent: MumbleAclWriteVerification.ExpectedContent,
+        expectedGeneration: Long,
+        expectedAclVersion: Long
+    ): Long? {
+        if (!isConnected()) return null
+
+        if (aclWriteVerificationState.snapshot().status in setOf(
+                MumbleAclWriteVerificationState.Status.ARMED,
+                MumbleAclWriteVerificationState.Status.PENDING
+            )
+        ) return null
+
+        val generation =
+            getModerationConnectionGeneration() ?: return null
+
+        val version =
+            getMumbleAclReceiveVersion() ?: return null
+
+        if (generation < 0L ||
+            generation != expectedGeneration ||
+            expectedContent.channelId < 0 ||
+            version <= 0L ||
+            version != expectedAclVersion
+        ) return null
+
+        val verification = aclWriteVerificationState.start(
+            generation,
+            expectedContent.channelId,
+            version
+        )
+
+        pendingAclWriteVerification = PendingAclWriteVerification(
+            verification.verificationId,
+            expectedContent
+        )
+
+        // Zeitüberwachung erst nach erfolgreicher
+        // Übergabe der Schreibnachricht starten.
+        return verification.verificationId
+    }
+
+    /**
+     * Bricht ausschließlich die angegebene ACL-Nachkontrolle ab.
+     * Andere oder bereits abgeschlossene Vorgänge bleiben unberührt.
+     */
+    private fun cancelMumbleAclWriteVerification(
+        verificationId: Long
+    ) {
+        val current = aclWriteVerificationState.snapshot()
+        if (current.status !in setOf(
+                MumbleAclWriteVerificationState.Status.ARMED,
+                MumbleAclWriteVerificationState.Status.PENDING
+            ) ||
+            current.verificationId != verificationId
+        ) return
+
+        aclWriteVerificationState.reset()
+
+        if (pendingAclWriteVerification?.verificationId ==
+            verificationId
+        ) {
+            pendingAclWriteVerification = null
+        }
+
+        Log.w(
+            "FGW-Mumble-ACL",
+            "ACL-Nachkontrolle abgebrochen: Schreibvorgang nicht abgeschlossen."
+        )
+    }
+
+    /**
+     * Wertet eine empfangene ACL nur bei laufender Nachkontrolle aus.
+     * Eine Inhaltsübereinstimmung ist keine eindeutige
+     * Bestätigung eines bestimmten Schreibvorgangs.
+     */
+    private fun observeMumbleAclWriteVerification(
+        received: MumbleAclManager.AclSnapshot,
+        receivedVersion: Long,
+        expectedContent: MumbleAclWriteVerification.ExpectedContent
+    ): Boolean {
+        val pending = aclWriteVerificationState.snapshot()
+
+        if (pending.status !=
+            MumbleAclWriteVerificationState.Status.PENDING
+        ) return false
+
+        if (receivedVersion <= 0L) return false
+
+        val context = MumbleAclWriteVerification.Context(
+            connected = isConnected(),
+            expectedGeneration = pending.connectionGeneration,
+            currentGeneration =
+                getModerationConnectionGeneration() ?: -1L,
+            expectedChannelId = pending.channelId,
+            receivedChannelId = received.channelId,
+            versionBeforeWrite = pending.versionBeforeWrite,
+            receivedVersion = receivedVersion
+        )
+
+        val completed = aclWriteVerificationState.observe(
+            pending.verificationId,
+            context,
+            MumbleAclWriteVerification.matchesExpectedContent(
+                expectedContent,
+                received
+            )
+        )
+
+        if (completed) {
+            pendingAclWriteVerification = null
+        }
+
+        return completed
+    }
+
     var onMumbleAclReceived:
-        ((MumbleAclManager.AclSnapshot) -> Unit)? = null
+        ((MumbleAclManager.VersionedAclSnapshot) -> Unit)? = null
 
     var onMumbleAclConnectionLost: (() -> Unit)? = null
+
+    // Rückmeldung nur für eine tatsächlich abgelaufene Schreibnachkontrolle.
+    var onMumbleAclWriteVerificationTimeout: ((Long) -> Unit)? = null
 
     // Keine passende ACL-Nachricht innerhalb der Wartezeit beobachtet.
     var onMumbleAclRequestTimeout: ((Int, Long) -> Unit)? = null
@@ -107,7 +412,8 @@ class MumbleConnectionManager(
         val generation = moderationConnectionGeneration
         val expectedConnection = humla.connection
 
-        mumbleAclManager.onAclReceived = { snapshot ->
+        mumbleAclManager.onAclReceived = { received ->
+            val snapshot = received.snapshot
             reconnectHandler.post {
                 if (
                     service === humla &&
@@ -115,7 +421,23 @@ class MumbleConnectionManager(
                     moderationConnectionGeneration == generation &&
                     humla.connection === expectedConnection
                 ) {
-                    onMumbleAclReceived?.invoke(snapshot)
+                    val pending = aclWriteVerificationState.snapshot()
+                    val expected = pendingAclWriteVerification
+
+                    if (
+                        pending.status ==
+                            MumbleAclWriteVerificationState.Status.PENDING &&
+                        expected != null &&
+                        expected.verificationId == pending.verificationId
+                    ) {
+                        observeMumbleAclWriteVerification(
+                            snapshot,
+                            received.version,
+                            expected.expectedContent
+                        )
+                    }
+
+                    onMumbleAclReceived?.invoke(received)
                 }
             }
         }
@@ -146,21 +468,86 @@ class MumbleConnectionManager(
                     humla.connection === expectedConnection
                 ) {
                     if (message.hasFlush() && message.flush) {
+                        channelEditPermissionRequest = null
                         clearMumbleAclWritePermission()
+                    } else {
+                        val editRequest = channelEditPermissionRequest
+
+                        if (editRequest != null &&
+                            message.hasChannelId() &&
+                            message.channelId == editRequest.channelId &&
+                            message.hasPermissions() &&
+                            editRequest.connectionGeneration == generation
+                        ) {
+                            val age =
+                                android.os.SystemClock.elapsedRealtime() -
+                                    editRequest.startedAt
+
+                            channelEditPermissionRequest =
+                                if (age in 0L..15000L) {
+                                    editRequest.copy(
+                                        confirmed = (
+                                            message.permissions and
+                                                se.lublin.humla.net.Permissions.Write
+                                            ) != 0
+                                    )
+                                } else {
+                                    null
+                                }
+
+                            Log.i(
+                                "FGW-Mumble",
+                                "Kanalbearbeitung: Write-Recht vom Server " +
+                                    "geprüft für Kanal ${editRequest.channelId}"
+                            )
+                        }
+                    }
+
+                    if (message.hasFlush() && message.flush) {
+                        // ACL-Berechtigung bereits zurückgesetzt.
                     } else if (
                         message.hasChannelId() &&
                         message.channelId == aclPermissionChannelId &&
                         aclPermissionGeneration == generation &&
                         message.hasPermissions()
                     ) {
-                        // Berechtigungsantwort empfangen.
-                        // Schreibfreigabe bleibt bis zur abschließenden
-                        // Prüfung ausdrücklich deaktiviert.
-                        aclWritePermissionConfirmed = false
+                        val age = android.os.SystemClock.elapsedRealtime() -
+                            aclPermissionRequestedAt
+
+                        if (aclPermissionRequestedAt <= 0L ||
+                            age !in 0L..15000L
+                        ) {
+                            clearMumbleAclWritePermission()
+                            Log.w(
+                                "FGW-Mumble-ACL",
+                                "Verspätete ACL-Berechtigungsantwort verworfen."
+                            )
+                            return@post
+                        }
+
+                        val permissionCheck = MumbleAclWritePermissionSafety.check(
+                            MumbleAclWritePermissionSafety.Context(
+                                connected = service?.isConnected == true,
+                                connectionGeneration = moderationConnectionGeneration,
+                                expectedGeneration = aclPermissionGeneration,
+                                requestedChannelId = aclPermissionChannelId ?: -1,
+                                responseChannelId = message.channelId,
+                                hasPermissionMask = message.hasPermissions(),
+                                permissionMask = message.permissions,
+                                flush = message.hasFlush() && message.flush
+                            )
+                        )
+
+                        // Zeitlich begrenzter Berechtigungsstatus.
+                        // Keine automatische Freigabe einer ACL-Änderung:
+                        // PermissionQuery besitzt keine Anfragekennung.
+                        aclWritePermissionConfirmed =
+                            permissionCheck.permissionReported
+
                         Log.i(
                             "FGW-Mumble-ACL",
-                            "Kanalrechte empfangen: Kanal ${message.channelId}, " +
-                                "Write=${(message.permissions and se.lublin.humla.net.Permissions.Write) != 0}"
+                            "ACL-Schreibrecht gemeldet: ${permissionCheck.permissionReported}; " +
+                                "Gruende: ${permissionCheck.reasons.joinToString()}"
                         )
                     }
                 }
@@ -171,6 +558,14 @@ class MumbleConnectionManager(
     }
 
     private fun detachMumbleAcl() {
+        channelEditPermissionRequest = null
+        channelEditPermissionCancelledAt = 0L
+        channelEditPermissionCancelledGeneration = -1L
+
+        // Laufende ACL-Nachkontrollen bei Verbindungswechsel
+        // oder Trennung sofort ungültig machen.
+        aclWriteVerificationState.reset()
+        pendingAclWriteVerification = null
         mumbleAclManager.detach()
         mumbleAclManager.onAclReceived = null
         mumbleAclManager.onPermissionQueryReceived = null
@@ -372,6 +767,8 @@ class MumbleConnectionManager(
 
             stopTalking()
             stopBridgeAudio()
+            mumbleChatSessionGeneration.incrementAndGet()
+            onMumbleChatSessionEnded?.invoke()
             onConnectionLost?.invoke()
 
             // Einen eventuell noch laufenden Humla-Verbindungsaufbau abbrechen.
@@ -392,6 +789,14 @@ class MumbleConnectionManager(
     // Benachrichtigt den GatewayService bei Verbindungsverlust.
     // Keine dauerhafte Referenz auf eine Activity speichern.
     var onConnectionLost: (() -> Unit)? = null
+
+    // Unabhängiger Callback zum Beenden der Mumble-Chat-Sitzung.
+    var onMumbleChatSessionEnded: (() -> Unit)? = null
+
+    // Eindeutige Generation jeder Mumble-Chat-Sitzung.
+    private val mumbleChatSessionGeneration =
+        java.util.concurrent.atomic.AtomicLong(0L)
+
 
 
     private var pendingCertificate: X509Certificate? = null
@@ -464,6 +869,8 @@ class MumbleConnectionManager(
                 Log.w("FGW-Mumble", "Unerwartete Mumble-Verbindungsbestätigung")
                 stopTalking()
                 stopBridgeAudio()
+                mumbleChatSessionGeneration.incrementAndGet()
+                onMumbleChatSessionEnded?.invoke()
                 onConnectionLost?.invoke()
                 try {
                     service?.disconnect()
@@ -475,6 +882,7 @@ class MumbleConnectionManager(
 
             cancelConnectTimeout()
             connectionInProgress = false
+            mumbleChatSessionGeneration.incrementAndGet()
             cancelMumbleReconnect()
             ++moderationConnectionGeneration
             clearMumbleAclWritePermission()
@@ -510,6 +918,11 @@ class MumbleConnectionManager(
         }
 
         override fun onDisconnected(error: HumlaException?) {
+            pendingChannelMove = null
+            pendingChannelDeletion = null
+            channelEditPermissionRequest = null
+            cancelPendingChannelEdit("Verbindung getrennt")
+            cancelPendingChannelCreation("Mumble-Verbindung getrennt")
             detachMumbleAcl()
             detachMumbleBanList()
             detachRegisteredUsers()
@@ -524,6 +937,8 @@ class MumbleConnectionManager(
             // Keine alte Aussendung nach einer Trennung fortsetzen.
             stopTalking()
             stopBridgeAudio()
+            mumbleChatSessionGeneration.incrementAndGet()
+            onMumbleChatSessionEnded?.invoke()
             onConnectionLost?.invoke()
 
             Log.e("FGW-Mumble", "Verbindung getrennt", error)
@@ -585,14 +1000,95 @@ class MumbleConnectionManager(
         }
 
         override fun onChannelAdded(channel: IChannel) {
+            val pending = pendingChannelCreation
+
+            if (pending != null &&
+                service?.isConnected == true &&
+                pending.connectionGeneration == moderationConnectionGeneration &&
+                channel.id > 0 &&
+                channel.parent?.id == pending.parentId &&
+                channel.name == pending.name &&
+                channel.isTemporary == pending.temporary
+            ) {
+                pendingChannelCreation = null
+
+                Log.i(
+                    "FGW-Mumble",
+                    "Kanalerstellung vom Server bestätigt: " +
+                        "${channel.name} (ID ${channel.id})"
+                )
+
+                android.os.Handler(
+                    android.os.Looper.getMainLooper()
+                ).post {
+                    onMumbleChannelCreationStatusChanged?.invoke(
+                        "✅ Kanal '${channel.name}' wurde vom Server bestätigt."
+                    )
+                }
+            }
+
             notifyRoomTreeChanged()
         }
 
         override fun onChannelStateUpdated(channel: IChannel) {
+            val move = pendingChannelMove
+            if (move != null &&
+                service?.isConnected == true &&
+                move.generation == moderationConnectionGeneration &&
+                channel.id == move.channelId &&
+                channel.parent?.id == move.parentId
+            ) {
+                pendingChannelMove = null
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    onMumbleChannelMoveStatusChanged?.invoke(
+                        "✅ Kanal '${move.name}' wurde verschoben."
+                    )
+                }
+            }
+
+            val pending = pendingChannelEdit
+
+            if (pending != null &&
+                service?.isConnected == true &&
+                pending.connectionGeneration == moderationConnectionGeneration &&
+                channel.id == pending.channelId &&
+                channel.name == pending.name &&
+                channel.description == pending.description &&
+                channel.position == pending.position
+            ) {
+                pendingChannelEdit = null
+
+                Log.i(
+                    "FGW-Mumble",
+                    "Kanalbearbeitung vom Server bestätigt: " +
+                        "${channel.name} (ID ${channel.id})"
+                )
+
+                android.os.Handler(
+                    android.os.Looper.getMainLooper()
+                ).post {
+                    onMumbleChannelEditStatusChanged?.invoke(
+                        "✅ Kanal '${channel.name}' wurde erfolgreich geändert."
+                    )
+                }
+            }
+
             notifyRoomTreeChanged()
         }
 
         override fun onChannelRemoved(channel: IChannel) {
+            val pending = pendingChannelDeletion
+            if (pending != null &&
+                pending.channelId == channel.id &&
+                pending.connectionGeneration == moderationConnectionGeneration
+            ) {
+                pendingChannelDeletion = null
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    onMumbleChannelDeletionStatusChanged?.invoke(
+                        "✅ Kanal '${pending.name}' wurde gelöscht."
+                    )
+                }
+            }
             notifyRoomTreeChanged()
         }
 
@@ -667,7 +1163,56 @@ class MumbleConnectionManager(
                 onRegistrationStatusChanged?.invoke(message)
             }
         }
-        override fun onMessageLogged(message: IMessage) {}
+        override fun onMessageLogged(message: IMessage) {
+            // Generation vor der Verarbeitung festhalten.
+            val messageGeneration = mumbleChatSessionGeneration.get()
+            val messageConnection =
+                (service as? HumlaService)?.connection ?: return
+
+            if (manualDisconnect ||
+                connectionInProgress ||
+                service?.isConnected != true
+            ) return
+
+            val received = MumbleChatMessage(
+                senderSessionId = message.actor,
+                senderName = message.actorName ?: "Unbekannt",
+                text = android.text.Html.fromHtml(
+                    message.message ?: "",
+                    android.text.Html.FROM_HTML_MODE_COMPACT
+                ).toString().trimEnd(),
+                receivedAt = message.receivedTime,
+                targetChannelIds = message.targetChannels
+                    ?.map { it.id }.orEmpty(),
+                targetTreeIds = message.targetTrees
+                    ?.map { it.id }.orEmpty(),
+                targetUserSessionIds = message.targetUsers
+                    ?.map { it.session }.orEmpty()
+            )
+
+            // Erst auf dem Hauptthread die Sitzung erneut prüfen.
+            // Dadurch kann ein alter Empfang nicht nach der
+            // Chat-Bereinigung erneut im Speicher landen.
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                if (messageGeneration != mumbleChatSessionGeneration.get() ||
+                    (service as? HumlaService)?.connection !== messageConnection ||
+                    manualDisconnect ||
+                    connectionInProgress ||
+                    service?.isConnected != true
+                ) {
+                    Log.d(
+                        "FGW-Mumble-Chat",
+                        "Veraltete Mumble-Nachricht verworfen"
+                    )
+                    return@post
+                }
+
+                org.funkgateway.mobile.mumble.MumbleChatStore
+                    .addIncoming(received)
+
+                onMumbleChatMessageReceived?.invoke(received)
+            }
+        }
         override fun onVoiceTargetChanged(mode: VoiceTargetMode) {}
         override fun onLogInfo(message: String?) { Log.i("FGW-Mumble", "INFO: $message") }
         override fun onLogWarning(message: String?) { Log.w("FGW-Mumble", "WARNUNG: $message") }
@@ -717,6 +1262,8 @@ class MumbleConnectionManager(
             service = null
             connectionInProgress = false
             pendingConnectIntent = null
+            mumbleChatSessionGeneration.incrementAndGet()
+            onMumbleChatSessionEnded?.invoke()
             onConnectionLost?.invoke()
 
             onStatusChanged("Mumble-Dienst getrennt")
@@ -989,6 +1536,610 @@ class MumbleConnectionManager(
         }
     }
 
+    fun deleteMumbleChannel(
+        channelId: Int,
+        expectedGeneration: Long
+    ): String {
+        val activeService = service ?: return "Keine Mumble-Verbindung"
+
+        if (!activeService.isConnected ||
+            moderationConnectionGeneration != expectedGeneration
+        ) return "Mumble-Verbindung hat sich geändert"
+
+        if (channelId <= 0) return "Root-Kanal darf nicht gelöscht werden"
+
+        return try {
+            val session = activeService.HumlaSession()
+            val channel = session.getChannel(channelId)
+                ?: return "Kanal nicht mehr vorhanden"
+
+            if (channel.subchannels.isNotEmpty()) {
+                return "Kanal enthält Unterkanäle. Bitte zuerst diese löschen."
+            }
+
+            if (pendingChannelDeletion != null) {
+                return "Eine Kanallöschung läuft bereits"
+            }
+
+            val request = PendingChannelDeletion(
+                channelId = channelId,
+                name = channel.name,
+                connectionGeneration = expectedGeneration,
+                startedAt = android.os.SystemClock.elapsedRealtime()
+            )
+
+            pendingChannelDeletion = request
+            reconnectHandler.postDelayed({
+                if (pendingChannelDeletion === request) {
+                    pendingChannelDeletion = null
+                    onMumbleChannelDeletionStatusChanged?.invoke(
+                        "⏳ Keine Serverbestätigung für die Löschung von " +
+                            "'${request.name}' erhalten. Bitte Kanalbestand prüfen."
+                    )
+                }
+            }, 15000L)
+
+            try {
+                session.removeChannel(channelId)
+                "Kanallöschung angefordert – Serverbestätigung steht aus"
+            } catch (error: Exception) {
+                pendingChannelDeletion = null
+                Log.e("FGW-Mumble", "Kanallöschung fehlgeschlagen", error)
+                "Kanallöschung konnte nicht gesendet werden"
+            }
+        } catch (error: Exception) {
+            Log.e("FGW-Mumble", "Kanallöschung fehlgeschlagen", error)
+            "Kanallöschung fehlgeschlagen"
+        }
+    }
+
+    fun createMumbleChannel(
+        parentId: Int,
+        channelName: String,
+        description: String,
+        temporary: Boolean,
+        expectedGeneration: Long
+    ): String {
+        val activeService = service ?: return "Keine Mumble-Verbindung"
+        if (!activeService.isConnected ||
+            moderationConnectionGeneration != expectedGeneration
+        ) {
+            return "Mumble-Verbindung hat sich geändert"
+        }
+
+        val name = channelName.trim()
+        if (name.isEmpty() || name.length > 128) {
+            return "Kanalname muss zwischen 1 und 128 Zeichen lang sein"
+        }
+
+        if (parentId < 0) return "Ungültiger übergeordneter Kanal"
+
+        return try {
+            val session = activeService.HumlaSession()
+            val parent = session.getChannel(parentId)
+                ?: return "Übergeordneter Kanal nicht vorhanden"
+
+            val requiredPermission = if (temporary) {
+                se.lublin.humla.net.Permissions.MakeTempChannel
+            } else {
+                se.lublin.humla.net.Permissions.MakeChannel
+            }
+
+            val ownUser = session.sessionUser
+            val superUser = ownUser.userId == 0 &&
+                ownUser.session == session.sessionId
+
+            if (!superUser &&
+                parent.permissions and requiredPermission == 0
+            ) {
+                return "Keine Berechtigung zum Erstellen dieses Kanaltyps"
+            }
+
+            if (service !== activeService ||
+                !activeService.isConnected ||
+                moderationConnectionGeneration != expectedGeneration
+            ) {
+                return "Mumble-Verbindung hat sich geändert"
+            }
+
+            if (pendingChannelCreation != null) {
+                return "Eine Kanalerstellung läuft bereits"
+            }
+
+            val request = PendingChannelCreation(
+                parentId = parentId,
+                name = name,
+                temporary = temporary,
+                connectionGeneration = expectedGeneration,
+                startedAt = android.os.SystemClock.elapsedRealtime()
+            )
+
+            pendingChannelCreation = request
+            scheduleChannelCreationTimeout(request)
+
+            try {
+                session.createChannel(
+                    parentId,
+                    name,
+                    description,
+                    0,
+                    temporary
+                )
+            } catch (e: Exception) {
+                if (pendingChannelCreation === request) {
+                    pendingChannelCreation = null
+                }
+                throw e
+            }
+
+            "Kanalerstellung angefordert – Serverbestätigung steht aus"
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble", "Kanalerstellung fehlgeschlagen", e)
+            "Kanalerstellung fehlgeschlagen: ${e.message}"
+        }
+    }
+
+    data class MumbleChannelDetails(
+        val id: Int,
+        val name: String,
+        val description: String,
+        val position: Int,
+        val temporary: Boolean,
+        val parentId: Int?
+    )
+
+    fun getMumbleChannelDetails(channelId: Int): MumbleChannelDetails? {
+        val activeService = service ?: return null
+        if (!activeService.isConnected || channelId < 0) return null
+
+        return runCatching {
+            val channel = activeService.HumlaSession()
+                .getChannel(channelId) ?: return null
+
+            MumbleChannelDetails(
+                id = channel.id,
+                name = channel.name,
+                description = channel.description ?: "",
+                position = channel.position,
+                temporary = channel.isTemporary,
+                parentId = channel.parent?.id
+            )
+        }.getOrElse { error ->
+            Log.w(
+                "FGW-Mumble",
+                "Kanaleigenschaften konnten nicht gelesen werden",
+                error
+            )
+            null
+        }
+    }
+
+    fun cancelMumbleChannelEditPermission(channelId: Int) {
+        val request = channelEditPermissionRequest ?: return
+
+        if (request.channelId == channelId) {
+            channelEditPermissionCancelledAt =
+                android.os.SystemClock.elapsedRealtime()
+            channelEditPermissionCancelledGeneration =
+                request.connectionGeneration
+            channelEditPermissionRequest = null
+            Log.i(
+                "FGW-Mumble",
+                "Berechtigungsanfrage für Kanal $channelId verworfen."
+            )
+        }
+    }
+
+    fun requestMumbleChannelEditPermission(channelId: Int): Boolean {
+        val activeService = service ?: return false
+        if (!activeService.isConnected || channelId <= 0) return false
+
+        val now = android.os.SystemClock.elapsedRealtime()
+        val generation = moderationConnectionGeneration
+
+        // Nach einem Abbruch keine sofortige Wiederverwendung
+        // möglicherweise noch eintreffender Serverantworten.
+        if (channelEditPermissionCancelledGeneration == generation &&
+            now - channelEditPermissionCancelledAt in 0L..15000L
+        ) {
+            Log.w(
+                "FGW-Mumble",
+                "Neue Kanalberechtigungsanfrage während Schutzfrist abgewiesen."
+            )
+            return false
+        }
+
+        // PermissionQuery besitzt keine Anfragekennung.
+        // Deshalb keine überlappenden Kanalbearbeitungsanfragen.
+        val previous = channelEditPermissionRequest
+        if (previous != null &&
+            previous.connectionGeneration == generation &&
+            now - previous.startedAt in 0L..15000L
+        ) {
+            return false
+        }
+
+        // Auch ACL-Schreibanfragen nicht überlagern.
+        if (aclPermissionChannelId != null &&
+            aclPermissionGeneration == generation &&
+            aclPermissionRequestedAt > 0L &&
+            now - aclPermissionRequestedAt in 0L..15000L
+        ) {
+            return false
+        }
+
+        channelEditPermissionRequest = null
+
+        return try {
+            val session = activeService.HumlaSession()
+            if (session.getChannel(channelId) == null) return false
+
+            if (service !== activeService ||
+                !activeService.isConnected ||
+                moderationConnectionGeneration != generation
+            ) return false
+
+            val request = ChannelEditPermissionRequest(
+                channelId = channelId,
+                connectionGeneration = generation,
+                startedAt = now
+            )
+
+            channelEditPermissionRequest = request
+            session.requestPermissions(channelId)
+
+            Log.i(
+                "FGW-Mumble",
+                "Schreibberechtigung für Kanal $channelId angefragt."
+            )
+            true
+        } catch (e: Exception) {
+            channelEditPermissionRequest = null
+            Log.e(
+                "FGW-Mumble",
+                "Berechtigungsabfrage für Kanalbearbeitung fehlgeschlagen",
+                e
+            )
+            false
+        }
+    }
+
+    fun editMumbleChannel(
+        channelId: Int,
+        channelName: String,
+        description: String,
+        position: Int,
+        expectedGeneration: Long
+    ): String {
+        val activeService = service as? HumlaService
+            ?: return "Keine Mumble-Verbindung"
+
+        if (!activeService.isConnected ||
+            moderationConnectionGeneration != expectedGeneration
+        ) return "Mumble-Verbindung hat sich geändert"
+
+        if (channelId <= 0) return "Dieser Kanal darf nicht bearbeitet werden"
+
+        val name = channelName.trim()
+        if (name.isEmpty() || name.length > 128) {
+            return "Kanalname muss zwischen 1 und 128 Zeichen lang sein"
+        }
+
+        if (position < 0) return "Ungültige Sortierposition"
+
+        return try {
+            val expectedConnection = activeService.connection
+            val session = activeService.HumlaSession()
+            val channel = session.getChannel(channelId)
+                ?: return "Kanal nicht mehr vorhanden"
+
+            val ownUser = session.sessionUser
+            val superUser = ownUser.userId == 0 &&
+                ownUser.session == session.sessionId
+
+            val permissionRequest = channelEditPermissionRequest
+            val now = android.os.SystemClock.elapsedRealtime()
+
+            val permissionConfirmed = permissionRequest != null &&
+                permissionRequest.channelId == channelId &&
+                permissionRequest.connectionGeneration == expectedGeneration &&
+                permissionRequest.confirmed &&
+                now - permissionRequest.startedAt in 0L..15000L
+
+            if (!superUser && !permissionConfirmed) {
+                return "Keine bestätigte Schreibberechtigung. " +
+                    "Bitte Berechtigung erneut anfragen."
+            }
+
+            val builder = Mumble.ChannelState.newBuilder()
+                .setChannelId(channelId)
+
+            var changed = false
+
+            if (name != channel.name) {
+                builder.setName(name)
+                changed = true
+            }
+
+            if (description != channel.description) {
+                builder.setDescription(description)
+                changed = true
+            }
+
+            if (position != channel.position) {
+                builder.setPosition(position)
+                changed = true
+            }
+
+            if (!changed) return "Keine Änderungen vorhanden"
+
+            if (service !== activeService ||
+                !activeService.isConnected ||
+                activeService.connection !== expectedConnection ||
+                moderationConnectionGeneration != expectedGeneration ||
+                !expectedConnection.isSynchronized
+            ) return "Mumble-Verbindung hat sich geändert"
+
+            if (pendingChannelEdit != null) {
+                return "Eine Kanalbearbeitung läuft bereits"
+            }
+
+            val request = PendingChannelEdit(
+                channelId = channelId,
+                name = name,
+                description = description,
+                position = position,
+                connectionGeneration = expectedGeneration,
+                startedAt = android.os.SystemClock.elapsedRealtime()
+            )
+
+            // Berechtigung unmittelbar vor dem Versand verbrauchen.
+            // Ein erneuter Schreibversuch braucht eine neue Abfrage.
+            if (!superUser) {
+                val currentPermission = channelEditPermissionRequest
+                if (currentPermission !== permissionRequest ||
+                    !permissionConfirmed
+                ) {
+                    return "Schreibberechtigung nicht mehr gültig"
+                }
+            }
+
+            channelEditPermissionRequest = null
+
+            pendingChannelEdit = request
+            scheduleChannelEditTimeout(request)
+
+            try {
+                expectedConnection.sendTCPMessage(
+                    builder.build(),
+                    HumlaTCPMessageType.ChannelState
+                )
+            } catch (e: Exception) {
+                if (pendingChannelEdit === request) {
+                    pendingChannelEdit = null
+                }
+                throw e
+            }
+
+            "Kanaländerung gesendet – Serverbestätigung steht aus"
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble", "Kanalbearbeitung fehlgeschlagen", e)
+            "Kanalbearbeitung fehlgeschlagen: ${e.message}"
+        }
+    }
+
+    fun moveMumbleChannel(
+        channelId: Int,
+        newParentId: Int,
+        expectedGeneration: Long
+    ): String {
+        val activeService = service as? HumlaService
+            ?: return "Keine Mumble-Verbindung"
+
+        if (!activeService.isConnected ||
+            moderationConnectionGeneration != expectedGeneration
+        ) return "Mumble-Verbindung hat sich geändert"
+
+        if (channelId <= 0) return "Root-Kanal darf nicht verschoben werden"
+        if (newParentId < 0) return "Ungültiger Zielkanal"
+
+        return try {
+            val connection = activeService.connection
+            val session = activeService.HumlaSession()
+            val channel = session.getChannel(channelId)
+                ?: return "Quellkanal nicht vorhanden"
+            val parent = session.getChannel(newParentId)
+                ?: return "Zielkanal nicht vorhanden"
+
+            if (channel.parent?.id == newParentId) {
+                return "Kanal befindet sich bereits dort"
+            }
+
+            // Zyklen im Kanalbaum verhindern.
+            var ancestor: IChannel? = parent
+            while (ancestor != null) {
+                if (ancestor.id == channelId) {
+                    return "Verschieben in eigenen Unterkanal nicht erlaubt"
+                }
+                ancestor = ancestor.parent
+            }
+
+            val ownUser = session.sessionUser
+            val superUser = ownUser.userId == 0 &&
+                ownUser.session == session.sessionId
+
+            val permission = channelEditPermissionRequest
+            val now = android.os.SystemClock.elapsedRealtime()
+            val confirmed = permission != null &&
+                permission.channelId == channelId &&
+                permission.connectionGeneration == expectedGeneration &&
+                permission.confirmed &&
+                now - permission.startedAt in 0L..15000L
+
+            if (!superUser && !confirmed) {
+                return "Keine bestätigte Schreibberechtigung"
+            }
+
+            if (pendingChannelMove != null || pendingChannelEdit != null) {
+                return "Eine Kanaländerung läuft bereits"
+            }
+
+            if (service !== activeService ||
+                !activeService.isConnected ||
+                activeService.connection !== connection ||
+                !connection.isSynchronized ||
+                moderationConnectionGeneration != expectedGeneration
+            ) return "Mumble-Verbindung hat sich geändert"
+
+            val request = PendingChannelMove(
+                channelId, newParentId, channel.name, expectedGeneration
+            )
+
+            channelEditPermissionRequest = null
+            pendingChannelMove = request
+
+            reconnectHandler.postDelayed({
+                if (pendingChannelMove === request) {
+                    pendingChannelMove = null
+                    onMumbleChannelMoveStatusChanged?.invoke(
+                        "⏳ Keine Serverbestätigung. Kanalposition bitte prüfen."
+                    )
+                }
+            }, 15000L)
+
+            try {
+                connection.sendTCPMessage(
+                    Mumble.ChannelState.newBuilder()
+                        .setChannelId(channelId)
+                        .setParent(newParentId)
+                        .build(),
+                    HumlaTCPMessageType.ChannelState
+                )
+            } catch (error: Exception) {
+                if (pendingChannelMove === request) {
+                    pendingChannelMove = null
+                }
+                throw error
+            }
+
+            "Kanalverschiebung angefordert – Serverbestätigung steht aus"
+        } catch (error: Exception) {
+            Log.e("FGW-Mumble", "Kanalverschiebung fehlgeschlagen", error)
+            "Kanalverschiebung fehlgeschlagen: ${error.message}"
+        }
+    }
+
+    fun sendMumblePrivateMessage(
+        targetSessionId: Int,
+        text: String
+    ): String {
+        val activeService = service
+            ?: return "Keine Mumble-Verbindung"
+
+        if (!activeService.isConnected) {
+            return "Mumble ist nicht verbunden"
+        }
+
+        val messageText = text.trim()
+        if (messageText.isEmpty()) {
+            return "Bitte eine Nachricht eingeben"
+        }
+
+        if (messageText.length > 5000) {
+            return "Nachricht ist zu lang (maximal 5000 Zeichen)"
+        }
+
+        return try {
+            val session = activeService.HumlaSession()
+            val target = session.getUser(targetSessionId)
+                ?: return "Benutzer ist nicht mehr verbunden"
+
+            if (service !== activeService ||
+                !activeService.isConnected
+            ) {
+                return "Mumble-Verbindung hat sich geändert"
+            }
+
+            session.sendUserTextMessage(
+                target.session,
+                messageText
+            )
+
+            Log.i(
+                "FGW-Mumble-Chat",
+                "Private Textnachricht an Session $targetSessionId übergeben."
+            )
+
+            "Nachricht an Mumble übergeben"
+        } catch (error: Exception) {
+            Log.e(
+                "FGW-Mumble-Chat",
+                "Private Nachricht konnte nicht gesendet werden",
+                error
+            )
+            "Private Nachricht konnte nicht gesendet werden"
+        }
+    }
+
+    fun sendMumbleChatMessage(
+        text: String,
+        serverWide: Boolean
+    ): String {
+        val activeService = service
+            ?: return "Keine Mumble-Verbindung"
+
+        if (!activeService.isConnected) {
+            return "Mumble ist nicht verbunden"
+        }
+
+        val messageText = text.trim()
+        if (messageText.isEmpty()) {
+            return "Bitte eine Nachricht eingeben"
+        }
+
+        if (messageText.length > 5000) {
+            return "Nachricht ist zu lang (maximal 5000 Zeichen)"
+        }
+
+        return try {
+            val session = activeService.HumlaSession()
+
+            val channelId = if (serverWide) {
+                0
+            } else {
+                session.sessionChannel?.id
+                    ?: return "Aktueller Kanal nicht verfügbar"
+            }
+
+            if (!activeService.isConnected ||
+                service !== activeService
+            ) {
+                return "Mumble-Verbindung hat sich geändert"
+            }
+
+            session.sendChannelTextMessage(
+                channelId,
+                messageText,
+                serverWide
+            )
+
+            Log.i(
+                "FGW-Mumble-Chat",
+                "Textnachricht gesendet: Kanal=$channelId, " +
+                    "Serverweit=$serverWide"
+            )
+
+            "Nachricht an Mumble übergeben"
+        } catch (error: Exception) {
+            Log.e(
+                "FGW-Mumble-Chat",
+                "Nachrichtenversand fehlgeschlagen",
+                error
+            )
+            "Nachricht konnte nicht gesendet werden"
+        }
+    }
+
     fun getChannelTree(): MumbleChannelItem? {
         val activeService = service ?: return null
         if (!activeService.isConnected) return null
@@ -1061,6 +2212,14 @@ class MumbleConnectionManager(
     }
 
     fun disconnect() {
+        pendingChannelMove = null
+        pendingChannelDeletion = null
+        channelEditPermissionRequest = null
+        cancelPendingChannelEdit("Manuell getrennt")
+        cancelPendingChannelCreation("Verbindung manuell getrennt")
+        // Alle bisherigen Moderations- und ACL-Freigaben
+        // bereits vor dem eigentlichen Trennen ungültig machen.
+        ++moderationConnectionGeneration
         detachMumbleAcl()
         detachMumbleBanList()
         detachRegisteredUsers()
@@ -1077,6 +2236,8 @@ class MumbleConnectionManager(
 
         // Vor der manuellen Trennung die Gateway-Bridge und PTT
         // synchron über den vorhandenen Sicherheitsstopp beenden.
+        mumbleChatSessionGeneration.incrementAndGet()
+            onMumbleChatSessionEnded?.invoke()
         onConnectionLost?.invoke()
 
         stopTalking()
@@ -1228,9 +2389,51 @@ class MumbleConnectionManager(
     // Eine Anfrage allein bestätigt ausdrücklich KEIN Schreibrecht.
     private var aclPermissionChannelId: Int? = null
     private var aclPermissionGeneration = -1L
+    private var aclPermissionRequestedAt = 0L
     private var aclWritePermissionConfirmed = false
 
+    // SuperUser wird vom Mumble-Server mit Benutzer-ID 0 identifiziert.
+    // Die Identität muss aus der aktuell verbundenen Sitzung stammen.
+    private fun isCurrentMumbleSuperUser(expectedGeneration: Long = aclPermissionGeneration): Boolean {
+        val activeService = service ?: return false
+        if (!activeService.isConnected) return false
+
+        return runCatching {
+            val session = activeService.HumlaSession()
+            val ownUser = session.sessionUser
+
+            MumbleAclSuperUserSafety.check(
+                MumbleAclSuperUserSafety.Context(
+                    connected = activeService.isConnected &&
+                        service === activeService,
+                    connectionGeneration = moderationConnectionGeneration,
+                    expectedGeneration = expectedGeneration,
+                    ownSessionId = session.sessionId,
+                    reportedSessionId = ownUser.session,
+                    reportedUserId = ownUser.userId
+                )
+            )
+        }.getOrDefault(false)
+    }
+
     fun requestMumbleAclWritePermission(channelId: Int): Boolean {
+        // Eine laufende Anfrage darf nicht überschrieben werden.
+        // PermissionQuery besitzt keine eindeutige Anfragekennung.
+        val requestAge = android.os.SystemClock.elapsedRealtime() -
+            aclPermissionRequestedAt
+
+        if (aclPermissionChannelId != null &&
+            aclPermissionGeneration == moderationConnectionGeneration &&
+            aclPermissionRequestedAt > 0L &&
+            requestAge in 0L..15000L
+        ) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "Weitere ACL-Berechtigungsanfrage blockiert: Anfrage läuft."
+            )
+            return false
+        }
+
         clearMumbleAclWritePermission()
 
         val activeService = service ?: return false
@@ -1238,26 +2441,342 @@ class MumbleConnectionManager(
 
         aclPermissionChannelId = channelId
         aclPermissionGeneration = moderationConnectionGeneration
+        aclPermissionRequestedAt = android.os.SystemClock.elapsedRealtime()
+
+        Log.i("FGW-Mumble-ACL", "PermissionQuery an Humla übergeben: Kanal=$channelId, Generation=$aclPermissionGeneration")
 
         return runCatching {
             activeService.HumlaSession().requestPermissions(channelId)
+            Log.i("FGW-Mumble-ACL", "PermissionQuery-Aufruf abgeschlossen: Kanal=$channelId (Serverantwort noch ausstehend)")
             true
-        }.getOrElse {
+        }.getOrElse { error ->
+            Log.e("FGW-Mumble-ACL", "PermissionQuery-Aufruf fehlgeschlagen: Kanal=$channelId", error)
             clearMumbleAclWritePermission()
             false
         }
     }
 
-    fun hasConfirmedMumbleAclWritePermission(channelId: Int): Boolean =
-        service?.isConnected == true &&
-        aclPermissionChannelId == channelId &&
-        aclPermissionGeneration == moderationConnectionGeneration &&
-        aclWritePermissionConfirmed
+    /**
+     * Zentraler Einstiegspunkt für spätere ACL-Schreibzugriffe.
+     *
+     * Bis zum Abschluss der Sicherheitsprüfung absichtlich gesperrt.
+     * Es wird keine Nachricht an den Server übertragen.
+     */
+    private val aclWriteAuthorization =
+        MumbleAclWriteAuthorization()
+
+    fun authorizeMumbleAclWrite(
+        token: MumbleAclWriteGuard.Token,
+        draft: MumbleAclDraft
+    ): Boolean {
+        // Eine frühere Bestätigung darf nicht erhalten bleiben.
+        aclWriteAuthorization.clear()
+
+        if (draft.channelId != token.channelId) return false
+
+        val latest = mumbleAclManager.getLatestAclSnapshot(
+            token.channelId
+        ) ?: return false
+
+        val fingerprint = MumbleAclWriteGuard.fingerprint(
+            draft, latest.snapshot
+        ) ?: return false
+
+        val valid = MumbleAclWriteGuard.check(
+            token,
+            MumbleAclWriteGuard.Context(
+                connected = isConnected(),
+                connectionGeneration =
+                    getModerationConnectionGeneration() ?: -1L,
+                channelId = latest.snapshot.channelId,
+                aclReceiveVersion = latest.version,
+                draftFingerprint = fingerprint
+            )
+        )
+
+        if (!valid ||
+            !hasConfirmedMumbleAclWritePermission(token.channelId)
+        ) {
+            return false
+        }
+
+        aclWriteAuthorization.authorize(token)
+        return true
+    }
+
+    fun submitMumbleAclChanges(
+        draft: MumbleAclDraft,
+        snapshot: MumbleAclManager.AclSnapshot,
+        token: MumbleAclWriteGuard.Token
+    ): Boolean {
+        if (aclWriteVerificationState.snapshot().status in setOf(
+                MumbleAclWriteVerificationState.Status.ARMED,
+                MumbleAclWriteVerificationState.Status.PENDING
+            )
+        ) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: Nachkontrolle läuft bereits."
+            )
+            return false
+        }
+
+        val currentFingerprint = MumbleAclWriteGuard.fingerprint(
+            draft, snapshot
+        ).orEmpty()
+
+        // Berechtigung vor dem einmaligen Verbrauch erfassen.
+        val permissionWasConfirmed =
+            hasConfirmedMumbleAclWritePermission(draft.channelId)
+        val permissionConfirmedByServer =
+            permissionWasConfirmed && aclWritePermissionConfirmed
+
+        val authorizationAccepted = aclWriteAuthorization.consume(
+            token,
+            MumbleAclWriteGuard.Context(
+                connected = isConnected(),
+                connectionGeneration =
+                    getModerationConnectionGeneration() ?: -1L,
+                channelId = draft.channelId,
+                aclReceiveVersion =
+                    getMumbleAclReceiveVersion() ?: -1L,
+                draftFingerprint = currentFingerprint
+            )
+        )
+
+        // Jede Prüfung verbraucht auch die zuvor gemeldete
+        // Schreibberechtigung. Ein erneuter Versuch erfordert
+        // eine neue Berechtigungsanfrage beim Server.
+        clearMumbleAclWritePermission()
+
+        if (!authorizationAccepted) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: keine gültige " +
+                    "einmalige Benutzerbestätigung."
+            )
+            return false
+        }
+
+        val latest = mumbleAclManager.getLatestAclSnapshot(
+            draft.channelId
+        ) ?: return false
+
+        if (latest.version != token.aclReceiveVersion ||
+            latest.snapshot != snapshot
+        ) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: Server-Snapshot veraltet."
+            )
+            return false
+        }
+
+        if (!MumbleAclPreparation.canPrepareChanges(
+                draft, latest.snapshot
+            )
+        ) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: Entwurf nicht mehr gültig."
+            )
+            return false
+        }
+
+        val fingerprint = MumbleAclWriteGuard.fingerprint(
+            draft, latest.snapshot
+        ) ?: return false
+
+        val valid = MumbleAclWriteGuard.check(
+            token,
+            MumbleAclWriteGuard.Context(
+                connected = isConnected(),
+                connectionGeneration =
+                    getModerationConnectionGeneration() ?: -1L,
+                channelId = draft.channelId,
+                aclReceiveVersion =
+                    getMumbleAclReceiveVersion() ?: -1L,
+                draftFingerprint = fingerprint
+            )
+        )
+
+        if (!valid || !permissionWasConfirmed) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: Sicherheitsprüfung fehlgeschlagen."
+            )
+            return false
+        }
+
+        // Ausschließlich geprüfte lokale ACL-Änderungen vorbereiten.
+        val preparedMessage = MumbleAclPreparation.prepareWriteMessage(
+            draft, latest.snapshot
+        ) ?: return false
+
+        val expectedContent =
+            MumbleAclWriteVerification.captureExpectedContent(draft)
+
+        if (preparedMessage.channelId != expectedContent.channelId ||
+            preparedMessage.query ||
+            preparedMessage.inheritAcls != expectedContent.inheritAcls ||
+            preparedMessage.groupsList != expectedContent.groups ||
+            preparedMessage.aclsList != expectedContent.rules
+        ) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: vorbereitete Daten ungültig."
+            )
+            return false
+        }
+
+        // Die konkrete Verbindung der geprüften Freigabe festhalten.
+        val activeService = service as? HumlaService ?: return false
+        if (!activeService.isConnected ||
+            moderationConnectionGeneration != token.connectionGeneration
+        ) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: Verbindung gewechselt."
+            )
+            return false
+        }
+
+        val expectedConnection = activeService.connection
+
+        // Nachkontrolle an die geprüfte Verbindung und ACL-Version binden.
+        // Noch kein Versand: Die Freischaltung erfolgt separat.
+        val verificationId = startMumbleAclWriteVerification(
+            expectedContent = expectedContent,
+            expectedGeneration = token.connectionGeneration,
+            expectedAclVersion = token.aclReceiveVersion
+        ) ?: return false
+
+        // Vor dem Versand nochmals dieselbe Verbindung prüfen.
+        if (service !== activeService ||
+            !activeService.isConnected ||
+            activeService.connection !== expectedConnection ||
+            moderationConnectionGeneration != token.connectionGeneration
+        ) {
+            cancelMumbleAclWriteVerification(verificationId)
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch abgebrochen: Verbindung gewechselt."
+            )
+            return false
+        }
+
+        // Die Berechtigung unmittelbar vor dem Versand erneut prüfen.
+        // SuperUser muss weiterhin eindeutig zur aktiven Sitzung gehören.
+        val permissionStillValid =
+            if (permissionWasConfirmed && token.connectionGeneration ==
+                moderationConnectionGeneration
+            ) {
+                if (permissionConfirmedByServer) {
+                    true
+                } else {
+                    isCurrentMumbleSuperUser(token.connectionGeneration)
+                }
+            } else {
+                false
+            }
+
+        if (!permissionStillValid) {
+            cancelMumbleAclWriteVerification(verificationId)
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch blockiert: Berechtigung vor Versand ungültig."
+            )
+            return false
+        }
+
+        val sent = mumbleAclManager.sendPreparedAclWrite(
+            preparedMessage,
+            expectedConnection
+        )
+
+        if (!sent) {
+            cancelMumbleAclWriteVerification(verificationId)
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibversuch fehlgeschlagen: kein Versand."
+            )
+            return false
+        }
+
+        // Erst nach erfolgreicher Übergabe die Nachkontrolle aktivieren.
+        if (!aclWriteVerificationState.activate(verificationId)) {
+            Log.w(
+                "FGW-Mumble-ACL",
+                "ACL-Nachkontrolle konnte nach Versand nicht aktiviert werden."
+            )
+            return false
+        }
+
+        scheduleMumbleAclWriteVerificationTimeout(verificationId)
+
+        // Versand ist keine Serverbestätigung.
+        // Den tatsächlichen ACL-Zustand erneut anfordern.
+        val readbackRequested = requestMumbleAcl(draft.channelId)
+
+        if (!readbackRequested) {
+            val failed = aclWriteVerificationState.readbackFailed(
+                verificationId
+            )
+
+            if (failed) {
+                pendingAclWriteVerification = null
+            }
+
+            Log.e(
+                "FGW-Mumble-ACL",
+                "ACL-Schreibnachricht möglicherweise übertragen, " +
+                    "aber Rückleseanfrage fehlgeschlagen. " +
+                    "Serverübernahme nicht bestätigt."
+            )
+            return false
+        }
+
+        Log.i(
+            "FGW-Mumble-ACL",
+            "ACL-Schreibnachricht gesendet; Server-Nachkontrolle läuft."
+        )
+        return true
+    }
+
+    fun hasConfirmedMumbleAclWritePermission(channelId: Int): Boolean {
+        val requestValid =
+            service?.isConnected == true &&
+            channelId >= 0 &&
+            aclPermissionChannelId == channelId &&
+            aclPermissionGeneration == moderationConnectionGeneration &&
+            aclPermissionRequestedAt > 0L &&
+            android.os.SystemClock.elapsedRealtime() - aclPermissionRequestedAt in 0L..15000L
+
+        if (!requestValid) return false
+
+        // Normale Administratoren benötigen die Serverbestätigung.
+        if (aclWritePermissionConfirmed) return true
+
+        // Mumble sendet dem SuperUser keine PermissionQuery-Antwort.
+        // Ausschließlich die eigene Benutzer-ID 0 erlaubt diesen Sonderweg.
+        return isCurrentMumbleSuperUser()
+    }
+
+    fun cancelMumbleAclWritePermission() {
+        // Abgebrochene Freigaben dürfen nicht erneut verwendet werden.
+        clearMumbleAclWritePermission()
+        Log.i(
+            "FGW-Mumble-ACL",
+            "ACL-Schreibfreigabe durch Benutzer abgebrochen."
+        )
+    }
 
     private fun clearMumbleAclWritePermission() {
         aclPermissionChannelId = null
         aclPermissionGeneration = -1L
+        aclPermissionRequestedAt = 0L
         aclWritePermissionConfirmed = false
+        aclWriteAuthorization.clear()
     }
 
     private var rootRegistrationPermissionsConfirmed = false
@@ -1771,6 +3290,9 @@ class MumbleConnectionManager(
 
     fun getModerationConnectionGeneration(): Long? =
         if (isConnected()) moderationConnectionGeneration else null
+
+    fun getMumbleAclReceiveVersion(): Long? =
+        if (isConnected()) mumbleAclManager.getAclReceiveVersion() else null
 
     fun getConnectedServer(): Pair<String, Int>? =
         if (isConnected() && !currentHost.isNullOrBlank() && currentPort in 1..65535)

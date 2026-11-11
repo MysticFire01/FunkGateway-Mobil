@@ -530,6 +530,27 @@ class MainActivity : Activity() {
     private val frnOpenChatContacts =
         linkedMapOf<String, String>()
     private val frnClosedChatIds = mutableSetOf<String>()
+
+    // Mumble-Privatchats: ein schwebendes Fenster je Gesprächspartner.
+    private val mumblePrivateDialogs =
+        mutableMapOf<Int, android.app.AlertDialog>()
+
+    private val mumbleUnreadPrivateChats =
+        mutableMapOf<Int, Int>()
+
+    // Gesprächspartner für die Privatchat-Übersicht.
+    // Session-IDs gelten nur für die aktuelle Mumble-Verbindung.
+    private val mumblePrivateContacts =
+        linkedMapOf<Int, String>()
+
+    private var mumbleChatTabButton: TextView? = null
+
+    private fun updateMumbleChatUnreadIndicator() {
+        val unread = mumbleUnreadPrivateChats.values.sum()
+        mumbleChatTabButton?.text =
+            if (unread > 0) "💬 Chat ($unread)" else "💬 Chat"
+    }
+
     private val frnHiddenGroupIds = mutableSetOf<String>()
 
     private val frnUnreadChats = mutableMapOf<String, Int>()
@@ -3496,6 +3517,8 @@ class MainActivity : Activity() {
         })
     }
 
+    private var refreshMumbleChatUi: (() -> Unit)? = null
+
     private var mumbleStatusView: android.widget.TextView? = null
     private var mumbleConnectButton: android.widget.Button? = null
     private var mumbleDisconnectButton: android.widget.Button? = null
@@ -3524,6 +3547,67 @@ class MainActivity : Activity() {
     private fun attachMumbleUiCallbacks(
         manager: MumbleConnectionManager
     ) {
+        manager.onMumbleChatSessionEnded = {
+            runOnUiThread {
+                if (mumbleManager === manager) {
+                    // Alte Sitzungs-IDs dürfen nicht weiterverwendet werden.
+                    val dialogs = mumblePrivateDialogs.values.toList()
+                    mumblePrivateDialogs.clear()
+                    dialogs.forEach { dialog ->
+                        dialog.dismiss()
+                    }
+
+                    mumblePrivateContacts.clear()
+                    mumbleUnreadPrivateChats.clear()
+                    org.funkgateway.mobile.mumble.MumbleChatStore.clear()
+
+                    updateMumbleChatUnreadIndicator()
+
+                    if (currentPage == "MUMBLE_CHAT") {
+                        refreshMumbleChatUi?.invoke()
+                    }
+
+                    android.util.Log.i(
+                        "FGW-Mumble-Chat",
+                        "Chat-Sitzung und alte Gesprächszuordnungen zurückgesetzt"
+                    )
+                }
+            }
+        }
+
+        manager.onMumbleChatMessageReceived = { message ->
+            runOnUiThread {
+                if (mumbleManager === manager) {
+                    if (message.targetUserSessionIds.isNotEmpty() &&
+                        message.senderSessionId >= 0
+                    ) {
+                        val contactId = message.senderSessionId
+
+                        mumblePrivateContacts[contactId] =
+                            message.senderName
+
+                        if (mumblePrivateDialogs[contactId]?.isShowing == true) {
+                            // Bereits geöffnete Gespräche direkt aktualisieren.
+                            showMumblePrivateChat(
+                                contactId,
+                                message.senderName
+                            )
+                        } else {
+                            // Geschlossene Gespräche nicht ungefragt öffnen.
+                            mumbleUnreadPrivateChats[contactId] =
+                                (mumbleUnreadPrivateChats[contactId] ?: 0) + 1
+                        }
+
+                        updateMumbleChatUnreadIndicator()
+                    }
+
+                    if (currentPage == "MUMBLE_CHAT") {
+                        refreshMumbleChatUi?.invoke()
+                    }
+                }
+            }
+        }
+
         manager.setUiCallbacks(
             statusCallback = { message ->
                 runOnUiThread {
@@ -5076,20 +5160,515 @@ class MainActivity : Activity() {
                         renderTree()
                     }
                     setOnLongClickListener {
+                        val actions = arrayOf(
+                            "🚪 Raum betreten",
+                            "📁 Unterkanal erstellen",
+                            "✏️ Kanal bearbeiten",
+                            "🛡️ Kanalberechtigungen (ACL)",
+                            "🗑️ Kanal löschen",
+                            "📂 Kanal verschieben"
+                        )
+
                         android.app.AlertDialog.Builder(this@MainActivity)
-                            .setTitle("Mumble-Raum betreten")
-                            .setMessage("Möchtest du den Raum \"${channel.name}\" betreten?")
-                            .setPositiveButton("Raum betreten") { _, _ ->
-                                if (mumbleManager?.joinChannel(channel.id) == true) {
-                                    android.widget.Toast.makeText(
-                                        this@MainActivity,
-                                        "Raumwechsel angefordert: ${channel.name}",
-                                        android.widget.Toast.LENGTH_SHORT
-                                    ).show()
+                            .setTitle("📁 ${channel.name}")
+                            .setItems(actions) { _, selected ->
+                                when (selected) {
+                                    0 -> {
+                                        if (mumbleManager?.joinChannel(channel.id) == true) {
+                                            android.widget.Toast.makeText(
+                                                this@MainActivity,
+                                                "Raumwechsel angefordert: ${channel.name}",
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    }
+                                    1 -> {
+                                        val manager = mumbleManager
+                                        val generation =
+                                            manager?.getModerationConnectionGeneration()
+
+                                        val form = LinearLayout(this@MainActivity).apply {
+                                            orientation = LinearLayout.VERTICAL
+                                            setPadding(dp(20), dp(12), dp(20), dp(8))
+                                        }
+
+                                        val nameInput =
+                                            android.widget.EditText(this@MainActivity).apply {
+                                                hint = "Kanalname"
+                                                setSingleLine(true)
+                                                setTextColor(Color.WHITE)
+                                                setHintTextColor(muted)
+                                            }
+
+                                        val descriptionInput =
+                                            android.widget.EditText(this@MainActivity).apply {
+                                                hint = "Beschreibung (optional)"
+                                                minLines = 2
+                                                setTextColor(Color.WHITE)
+                                                setHintTextColor(muted)
+                                            }
+
+                                        val temporaryCheck =
+                                            android.widget.CheckBox(this@MainActivity).apply {
+                                                text = "Temporärer Kanal"
+                                                isChecked = false
+                                                setTextColor(Color.WHITE)
+                                                buttonTintList =
+                                                    android.content.res.ColorStateList.valueOf(
+                                                        Color.rgb(65, 190, 185)
+                                                    )
+                                            }
+
+                                        form.addView(nameInput)
+                                        form.addView(descriptionInput)
+                                        form.addView(temporaryCheck)
+
+                                        android.app.AlertDialog.Builder(this@MainActivity)
+                                            .setTitle("📁 Unterkanal in ${channel.name} erstellen")
+                                            .setView(form)
+                                            .setNegativeButton("Abbrechen", null)
+                                            .setPositiveButton("Erstellen", null)
+                                            .create().also { dialog ->
+                                                dialog.setOnShowListener {
+                                                    dialog.getButton(
+                                                        android.app.AlertDialog.BUTTON_POSITIVE
+                                                    ).setOnClickListener {
+                                                        val name = nameInput.text.toString().trim()
+                                                        if (name.isEmpty()) {
+                                                            nameInput.error = "Bitte Kanalnamen eingeben"
+                                                        } else {
+                                                            val result = if (
+                                                                generation != null &&
+                                                                manager != null
+                                                            ) {
+                                                                manager.createMumbleChannel(
+                                                                    parentId = channel.id,
+                                                                    channelName = name,
+                                                                    description =
+                                                                        descriptionInput.text.toString(),
+                                                                    temporary = temporaryCheck.isChecked,
+                                                                    expectedGeneration = generation
+                                                                )
+                                                            } else {
+                                                                "Keine Mumble-Verbindung vorhanden"
+                                                            }
+
+                                                            android.widget.Toast.makeText(
+                                                                this@MainActivity,
+                                                                result,
+                                                                android.widget.Toast.LENGTH_LONG
+                                                            ).show()
+
+                                                            if (result.startsWith("Kanalerstellung angefordert")) {
+                                                                dialog.dismiss()
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                dialog.show()
+                                                styleMumbleDialog(dialog)
+                                            }
+                                    }
+                                    2 -> {
+                                        val manager = mumbleManager
+                                        val generation =
+                                            manager?.getModerationConnectionGeneration()
+                                        val details =
+                                            manager?.getMumbleChannelDetails(channel.id)
+
+                                        if (details == null || generation == null ||
+                                            details.id <= 0
+                                        ) {
+                                            android.widget.Toast.makeText(
+                                                this@MainActivity,
+                                                "Kanaleigenschaften nicht verfügbar.",
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                        } else {
+                                            val form = LinearLayout(this@MainActivity).apply {
+                                                orientation = LinearLayout.VERTICAL
+                                                setPadding(dp(20), dp(12), dp(20), dp(8))
+                                            }
+
+                                            val nameInput =
+                                                android.widget.EditText(this@MainActivity).apply {
+                                                    setText(details.name)
+                                                    hint = "Kanalname"
+                                                    setSingleLine(true)
+                                                    setTextColor(Color.WHITE)
+                                                    setHintTextColor(muted)
+                                                }
+
+                                            val descriptionInput =
+                                                android.widget.EditText(this@MainActivity).apply {
+                                                    setText(details.description)
+                                                    hint = "Beschreibung"
+                                                    minLines = 2
+                                                    setTextColor(Color.WHITE)
+                                                    setHintTextColor(muted)
+                                                }
+
+                                            val positionInput =
+                                                android.widget.EditText(this@MainActivity).apply {
+                                                    setText(details.position.toString())
+                                                    hint = "Sortierposition"
+                                                    inputType =
+                                                        android.text.InputType.TYPE_CLASS_NUMBER
+                                                    setTextColor(Color.WHITE)
+                                                    setHintTextColor(muted)
+                                                }
+
+                                            val typeText = label(
+                                                "Kanaltyp: " +
+                                                    if (details.temporary) "Temporär"
+                                                    else "Permanent",
+                                                14f,
+                                                muted
+                                            )
+
+                                            form.addView(typeText)
+                                            form.addView(nameInput)
+                                            form.addView(descriptionInput)
+                                            form.addView(positionInput)
+
+                                            android.app.AlertDialog.Builder(this@MainActivity)
+                                                .setTitle("✏️ Kanal bearbeiten")
+                                                .setView(form)
+                                                .setNegativeButton("Abbrechen", null)
+                                                .setPositiveButton("Änderungen senden", null)
+                                                .create().also { dialog ->
+                                                    dialog.setOnShowListener {
+                                                        dialog.getButton(
+                                                            android.app.AlertDialog.BUTTON_POSITIVE
+                                                        ).setOnClickListener {
+                                                            val name =
+                                                                nameInput.text.toString().trim()
+                                                            val position =
+                                                                positionInput.text.toString()
+                                                                    .toIntOrNull()
+
+                                                            when {
+                                                                name.isEmpty() -> {
+                                                                    nameInput.error =
+                                                                        "Kanalname erforderlich"
+                                                                }
+                                                                position == null -> {
+                                                                    positionInput.error =
+                                                                        "Ungültige Position"
+                                                                }
+                                                                else -> {
+                                                                    val current =
+                                                                        manager.getMumbleChannelDetails(
+                                                                            channel.id
+                                                                        )
+
+                                                                    val description =
+                                                                        descriptionInput.text.toString()
+
+                                                                    when {
+                                                                        current != details -> {
+                                                                            android.widget.Toast.makeText(
+                                                                                this@MainActivity,
+                                                                                "Kanaleigenschaften haben sich geändert. Bitte erneut öffnen.",
+                                                                                android.widget.Toast.LENGTH_LONG
+                                                                            ).show()
+                                                                        }
+                                                                        name == details.name &&
+                                                                            description == details.description &&
+                                                                            position == details.position -> {
+                                                                            dialog.dismiss()
+                                                                        }
+                                                                        else -> {
+                                                                            val requested =
+                                                                                manager.requestMumbleChannelEditPermission(
+                                                                                    details.id
+                                                                                )
+
+                                                                            if (!requested) {
+                                                                                android.widget.Toast.makeText(
+                                                                                    this@MainActivity,
+                                                                                    "Berechtigungsanfrage nicht möglich. Bitte später erneut versuchen.",
+                                                                                    android.widget.Toast.LENGTH_LONG
+                                                                                ).show()
+                                                                            } else {
+                                                                                android.app.AlertDialog.Builder(
+                                                                                    this@MainActivity
+                                                                                )
+                                                                                    .setTitle("🔐 Kanaländerung bestätigen")
+                                                                                    .setMessage(
+                                                                                        "Die Schreibberechtigung wurde beim Server angefragt. " +
+                                                                                            "Eine positive Antwort kann noch ausstehen.\n\n" +
+                                                                                            "Kanal: ${details.name}\n" +
+                                                                                            "Neuer Name: $name\n" +
+                                                                                            "Position: $position\n\n" +
+                                                                                            "Änderungen wirklich an den Mumble-Server senden?"
+                                                                                    )
+                                                                                    .setNegativeButton("Abbrechen", null)
+                                                                                    .setPositiveButton("Bestätigen", null)
+                                                                                    .create().also { confirmation ->
+                                                                                        confirmation.setOnDismissListener {
+                                                                                            manager.cancelMumbleChannelEditPermission(
+                                                                                                details.id
+                                                                                            )
+                                                                                        }
+                                                                                        confirmation.setOnShowListener {
+                                                                                            confirmation.getButton(
+                                                                                                android.app.AlertDialog.BUTTON_POSITIVE
+                                                                                            ).setOnClickListener {
+                                                                                                val latest =
+                                                                                                    manager.getMumbleChannelDetails(
+                                                                                                        details.id
+                                                                                                    )
+
+                                                                                                val result = if (
+                                                                                                    latest == details
+                                                                                                ) {
+                                                                                                    manager.editMumbleChannel(
+                                                                                                        channelId = details.id,
+                                                                                                        channelName = name,
+                                                                                                        description = description,
+                                                                                                        position = position,
+                                                                                                        expectedGeneration = generation
+                                                                                                    )
+                                                                                                } else {
+                                                                                                    "Kanaleigenschaften haben sich geändert. Bitte erneut öffnen."
+                                                                                                }
+
+                                                                                                android.widget.Toast.makeText(
+                                                                                                    this@MainActivity,
+                                                                                                    result,
+                                                                                                    android.widget.Toast.LENGTH_LONG
+                                                                                                ).show()
+
+                                                                                                if (result.startsWith("Kanaländerung gesendet")) {
+                                                                                                    confirmation.dismiss()
+                                                                                                    dialog.dismiss()
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                        confirmation.show()
+                                                                                        styleMumbleDialog(confirmation)
+                                                                                    }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    dialog.show()
+                                                    styleMumbleDialog(dialog)
+                                                }
+                                        }
+                                    }
+                                    3 -> {
+                                        showMumbleAcl(channel.id)
+                                    }
+                                    4 -> {
+                                        val manager = mumbleManager
+                                        val generation =
+                                            manager?.getModerationConnectionGeneration()
+                                        val details =
+                                            manager?.getMumbleChannelDetails(channel.id)
+
+                                        if (manager == null || generation == null ||
+                                            details == null || details.id <= 0
+                                        ) {
+                                            android.widget.Toast.makeText(
+                                                this@MainActivity,
+                                                "Kanal kann nicht gelöscht werden.",
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                        } else {
+                                            android.app.AlertDialog.Builder(
+                                                this@MainActivity
+                                            )
+                                                .setTitle("🗑️ Mumble-Kanal löschen")
+                                                .setMessage(
+                                                    "Möchtest du den Kanal " +
+                                                        "'${details.name}' wirklich löschen?\n\n" +
+                                                        "Dieser Vorgang kann nicht rückgängig " +
+                                                        "gemacht werden."
+                                                )
+                                                .setNegativeButton("Abbrechen", null)
+                                                .setPositiveButton("Kanal löschen") { _, _ ->
+                                                    val current =
+                                                        manager.getMumbleChannelDetails(
+                                                            details.id
+                                                        )
+
+                                                    val result = if (current == details) {
+                                                        manager.deleteMumbleChannel(
+                                                            details.id,
+                                                            generation
+                                                        )
+                                                    } else {
+                                                        "Kanaleigenschaften haben sich geändert. " +
+                                                            "Bitte erneut öffnen."
+                                                    }
+
+                                                    android.widget.Toast.makeText(
+                                                        this@MainActivity,
+                                                        result,
+                                                        android.widget.Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
+                                                .show().also {
+                                                    styleMumbleDialog(it)
+                                                }
+                                        }
+                                    }
+                                    5 -> {
+                                        val manager = mumbleManager
+                                        val generation =
+                                            manager?.getModerationConnectionGeneration()
+                                        val details =
+                                            manager?.getMumbleChannelDetails(channel.id)
+                                        val tree = manager?.getChannelTree()
+
+                                        if (manager == null || generation == null ||
+                                            details == null || details.id <= 0 ||
+                                            tree == null
+                                        ) {
+                                            android.widget.Toast.makeText(
+                                                this@MainActivity,
+                                                "Kanalverschiebung nicht verfügbar.",
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                        } else {
+                                            val targets =
+                                                mutableListOf<Pair<Int, String>>()
+
+                                            fun collectTargets(
+                                                item: MumbleConnectionManager.MumbleChannelItem,
+                                                depth: Int
+                                            ) {
+                                                // Den Quellkanal einschließlich
+                                                // seiner Unterkanäle ausschließen.
+                                                if (item.id == details.id) return
+
+                                                if (item.id != details.parentId) {
+                                                    targets.add(
+                                                        item.id to (
+                                                            "  ".repeat(depth) +
+                                                                "📁 " + item.name
+                                                            )
+                                                    )
+                                                }
+                                                item.children.forEach {
+                                                    collectTargets(it, depth + 1)
+                                                }
+                                            }
+
+                                            collectTargets(tree, 0)
+
+                                            if (targets.isEmpty()) {
+                                                android.widget.Toast.makeText(
+                                                    this@MainActivity,
+                                                    "Kein anderer Zielkanal vorhanden.",
+                                                    android.widget.Toast.LENGTH_LONG
+                                                ).show()
+                                            } else {
+                                                android.app.AlertDialog.Builder(
+                                                    this@MainActivity
+                                                )
+                                                    .setTitle(
+                                                        "📂 '${details.name}' verschieben nach"
+                                                    )
+                                                    .setItems(
+                                                        targets.map { it.second }
+                                                            .toTypedArray()
+                                                    ) { _, index ->
+                                                        val target = targets[index]
+                                                        val requested =
+                                                            manager.requestMumbleChannelEditPermission(
+                                                                details.id
+                                                            )
+
+                                                        if (!requested) {
+                                                            android.widget.Toast.makeText(
+                                                                this@MainActivity,
+                                                                "Berechtigungsabfrage nicht möglich.",
+                                                                android.widget.Toast.LENGTH_LONG
+                                                            ).show()
+                                                        } else {
+                                                            android.app.AlertDialog.Builder(
+                                                                this@MainActivity
+                                                            )
+                                                                .setTitle("Kanalverschiebung bestätigen")
+                                                                .setMessage(
+                                                                    "'${details.name}' nach " +
+                                                                        "'${target.second.trim()}' " +
+                                                                        "verschieben?"
+                                                                )
+                                                                .setNegativeButton(
+                                                                    "Abbrechen", null
+                                                                )
+                                                                .setPositiveButton(
+                                                                    "Verschieben", null
+                                                                )
+                                                                .create().also { confirmation ->
+                                                                    confirmation.setOnDismissListener {
+                                                                        manager.cancelMumbleChannelEditPermission(
+                                                                            details.id
+                                                                        )
+                                                                    }
+                                                                    confirmation.setOnShowListener {
+                                                                        confirmation.getButton(
+                                                                            android.app.AlertDialog.BUTTON_POSITIVE
+                                                                        ).setOnClickListener {
+                                                                            val current =
+                                                                                manager.getMumbleChannelDetails(
+                                                                                    details.id
+                                                                                )
+                                                                            val result =
+                                                                                if (current == details) {
+                                                                                    manager.moveMumbleChannel(
+                                                                                        details.id,
+                                                                                        target.first,
+                                                                                        generation
+                                                                                    )
+                                                                                } else {
+                                                                                    "Kanaleigenschaften haben sich geändert."
+                                                                                }
+
+                                                                            android.widget.Toast.makeText(
+                                                                                this@MainActivity,
+                                                                                result,
+                                                                                android.widget.Toast.LENGTH_LONG
+                                                                            ).show()
+
+                                                                            if (result.startsWith(
+                                                                                    "Kanalverschiebung angefordert"
+                                                                                )
+                                                                            ) {
+                                                                                confirmation.dismiss()
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    confirmation.show()
+                                                                    styleMumbleDialog(confirmation)
+                                                                }
+                                                        }
+                                                    }
+                                                    .setNegativeButton("Abbrechen", null)
+                                                    .show().also {
+                                                        styleMumbleDialog(it)
+                                                    }
+                                            }
+                                        }
+                                    }
+                                    else -> {
+                                        android.widget.Toast.makeText(
+                                            this@MainActivity,
+                                            "Diese Kanalverwaltung wird vorbereitet.",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
                                 }
                             }
                             .setNegativeButton("Abbrechen", null)
-                            .show()
+                            .show().also { styleMumbleDialog(it) }
                         true
                     }
                 }
@@ -5171,6 +5750,10 @@ class MainActivity : Activity() {
                                     manager?.getModerationConnectionGeneration()
 
                                 val actions = mutableListOf<String>()
+
+                                // Privatchat steht jedem verbundenen Benutzer offen.
+                                actions.add("💬 Privatnachricht senden")
+
                                 if (!user.registered && manager?.canRegisterOtherUsers() == true) {
                                     actions.add("🔐 Benutzer registrieren")
                                 }
@@ -5209,6 +5792,12 @@ class MainActivity : Activity() {
                                         .setTitle("👤 ${user.name}")
                                         .setItems(actions.toTypedArray()) { _, selected ->
                                             when (actions[selected]) {
+                                                "💬 Privatnachricht senden" -> {
+                                                    showMumblePrivateChat(
+                                                        user.sessionId,
+                                                        user.name
+                                                    )
+                                                }
                                                 "🔐 Benutzer registrieren" -> {
                                                     android.app.AlertDialog.Builder(this@MainActivity)
                                                         .setTitle("Benutzer registrieren?")
@@ -5450,6 +6039,62 @@ class MainActivity : Activity() {
             }
         }
 
+        mumbleManager?.onMumbleChannelMoveStatusChanged = { message ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_ROOMS") {
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("📂 Mumble-Kanal verschieben")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show().also { styleMumbleDialog(it) }
+
+                    renderTree()
+                }
+            }
+        }
+
+        mumbleManager?.onMumbleChannelDeletionStatusChanged = { message ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_ROOMS") {
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("🗑️ Mumble-Kanallöschung")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show().also { styleMumbleDialog(it) }
+
+                    renderTree()
+                }
+            }
+        }
+
+        mumbleManager?.onMumbleChannelEditStatusChanged = { message ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_ROOMS") {
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("✏️ Mumble-Kanal bearbeiten")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show().also { styleMumbleDialog(it) }
+
+                    renderTree()
+                }
+            }
+        }
+
+        mumbleManager?.onMumbleChannelCreationStatusChanged = { message ->
+            runOnUiThread {
+                if (currentPage == "MUMBLE_ROOMS") {
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("📁 Mumble-Kanalerstellung")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show().also { styleMumbleDialog(it) }
+
+                    renderTree()
+                }
+            }
+        }
+
         mumbleManager?.onOtherUserRegistrationStatusChanged = { message ->
             runOnUiThread {
                 if (currentPage == "MUMBLE_ROOMS") {
@@ -5482,6 +6127,473 @@ class MainActivity : Activity() {
         showGatewayScreen(root)
     }
 
+
+    private fun showMumblePrivateChat(
+        sessionId: Int,
+        userName: String
+    ) {
+        mumblePrivateContacts[sessionId] = userName
+
+        val existing = mumblePrivateDialogs[sessionId]
+        if (existing?.isShowing == true) {
+            val messageList = existing.findViewById<LinearLayout>(16006)
+
+            messageList?.let { container ->
+                container.removeAllViews()
+
+                org.funkgateway.mobile.mumble.MumbleChatStore
+                    .privateWith(sessionId)
+                    .forEach { entry ->
+                        container.addView(
+                            org.funkgateway.mobile.frn.FrnChatBubble.create(
+                                this@MainActivity,
+                                entry.asBubble()
+                            )
+                        )
+                    }
+
+                (container.parent as? ScrollView)?.let { scroll ->
+                    scroll.post {
+                        scroll.smoothScrollTo(
+                            0,
+                            (container.height - scroll.height).coerceAtLeast(0)
+                        )
+                    }
+                }
+            }
+
+            mumbleUnreadPrivateChats.remove(sessionId)
+            updateMumbleChatUnreadIndicator()
+            return
+        }
+
+        val store = org.funkgateway.mobile.mumble.MumbleChatStore
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(12))
+            setBackgroundColor(Color.rgb(31, 42, 56))
+        }
+
+        content.addView(label(
+            "💬 Privat: $userName",
+            19f,
+            Color.WHITE,
+            true
+        ))
+
+        val messageList = LinearLayout(this).apply {
+            id = 16006
+            orientation = LinearLayout.VERTICAL
+        }
+
+        val messageScroll = ScrollView(this).apply {
+            addView(messageList)
+            isFillViewport = true
+        }
+
+        fun refreshMessages() {
+            messageList.removeAllViews()
+
+            store.privateWith(sessionId).forEach { entry ->
+                messageList.addView(
+                    org.funkgateway.mobile.frn.FrnChatBubble.create(
+                        this@MainActivity,
+                        entry.asBubble()
+                    )
+                )
+            }
+
+            messageScroll.post {
+                messageScroll.smoothScrollTo(
+                    0,
+                    (messageList.height - messageScroll.height).coerceAtLeast(0)
+                )
+            }
+        }
+
+        val messageScrollParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(280)
+        )
+        content.addView(messageScroll, messageScrollParams)
+
+        // Nachrichtenbereich an den sichtbaren Platz anpassen,
+        // auch wenn die Bildschirmtastatur geöffnet wird.
+        content.viewTreeObserver.addOnGlobalLayoutListener {
+            val visible = android.graphics.Rect()
+            content.getWindowVisibleDisplayFrame(visible)
+
+            if (visible.height() > 0) {
+                val available = visible.height()
+                val desired = (available * 0.38f).toInt()
+                    .coerceIn(dp(120), dp(360))
+
+                if (messageScrollParams.height != desired) {
+                    messageScrollParams.height = desired
+                    messageScroll.layoutParams = messageScrollParams
+                }
+            }
+        }
+
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val messageInput = android.widget.EditText(this).apply {
+            hint = "Private Nachricht schreiben ..."
+            setTextColor(Color.WHITE)
+            setHintTextColor(muted)
+            textSize = 15f
+            setSingleLine(true)
+            filters = arrayOf(
+                android.text.InputFilter.LengthFilter(500)
+            )
+            background = rounded(panel)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+
+        inputRow.addView(
+            messageInput,
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+
+        inputRow.addView(
+            button("➤") {
+                val text = messageInput.text.toString().trim()
+
+                if (text.isNotEmpty()) {
+                    val result = mumbleManager
+                        ?.sendMumblePrivateMessage(sessionId, text)
+                        ?: "Keine Mumble-Verbindung"
+
+                    if (result == "Nachricht an Mumble übergeben") {
+                        store.add(
+                            org.funkgateway.mobile.mumble.MumbleChatStore.Entry(
+                                time = System.currentTimeMillis(),
+                                sender = "Du",
+                                senderSessionId = -1,
+                                text = text,
+                                scope =
+                                    org.funkgateway.mobile.mumble.MumbleChatStore.Scope.PRIVATE,
+                                userSessionIds = listOf(sessionId),
+                                outgoing = true
+                            )
+                        )
+
+                        messageInput.text.clear()
+                        refreshMessages()
+                    } else {
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            result,
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            },
+            LinearLayout.LayoutParams(dp(54), dp(48)).apply {
+                marginStart = dp(8)
+            }
+        )
+
+        content.addView(
+            inputRow,
+            LinearLayout.LayoutParams(-1, -2).apply {
+                topMargin = dp(12)
+            }
+        )
+
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setView(content)
+            .setPositiveButton("Schließen", null)
+            .create()
+
+        dialog.setOnDismissListener {
+            if (mumblePrivateDialogs[sessionId] === dialog) {
+                mumblePrivateDialogs.remove(sessionId)
+            }
+        }
+
+        mumblePrivateDialogs[sessionId] = dialog
+        mumbleUnreadPrivateChats.remove(sessionId)
+            updateMumbleChatUnreadIndicator()
+
+        dialog.show()
+        styleMumbleDialog(dialog)
+
+        // Beim Öffnen der Tastatur Dialoggröße anpassen.
+        dialog.window?.setSoftInputMode(
+            android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        )
+
+        refreshMessages()
+    }
+
+    private fun showMumbleChat() {
+        currentPage = "MUMBLE_CHAT"
+
+        val store = org.funkgateway.mobile.mumble.MumbleChatStore
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(12))
+            setBackgroundColor(bg)
+        }
+
+        root.addView(label(
+            "💬 Mumble – Chat",
+            22f,
+            Color.WHITE,
+            true
+        ))
+
+        val targetInfo = label(
+            "Nachrichtenziel auswählen",
+            14f,
+            muted
+        )
+        root.addView(targetInfo)
+
+        val messagesContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+
+        val messagesScroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(messagesContainer)
+        }
+
+        var serverChat = false
+
+        val privateContactsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        fun renderPrivateContacts() {
+            privateContactsContainer.removeAllViews()
+
+            val onlineUsers = mutableSetOf<Int>()
+
+            fun collectUsers(
+                item: MumbleConnectionManager.MumbleChannelItem
+            ) {
+                item.users.forEach { user ->
+                    onlineUsers.add(user.sessionId)
+                }
+                item.children.forEach { collectUsers(it) }
+            }
+
+            mumbleManager?.getChannelTree()?.let { collectUsers(it) }
+
+            if (mumblePrivateContacts.isNotEmpty()) {
+                privateContactsContainer.addView(
+                    label("💬 Privatgespräche", 16f, Color.WHITE, true)
+                )
+            }
+
+            mumblePrivateContacts.forEach { (sessionId, userName) ->
+                val online = sessionId in onlineUsers
+                val unread = mumbleUnreadPrivateChats[sessionId] ?: 0
+
+                val title = (if (online) "🟢 " else "⚪ ") +
+                    userName +
+                    (if (unread > 0) " ($unread neu)" else "") +
+                    (if (!online) " · Offline" else "")
+
+                privateContactsContainer.addView(
+                    button(title) {
+                        showMumblePrivateChat(sessionId, userName)
+                        renderPrivateContacts()
+                    }.apply {
+                        isEnabled = online
+                    }
+                )
+            }
+        }
+
+        fun renderMessages() {
+            renderPrivateContacts()
+            if (currentPage != "MUMBLE_CHAT") return
+
+            val ownChannelId =
+                mumbleManager?.getOwnPosition()?.channelId
+
+            val entries = if (serverChat) {
+                targetInfo.text = "🌐 Gesamter Mumble-Server"
+                store.server()
+            } else {
+                val channelName = ownChannelId?.let { channelId ->
+                    mumbleManager?.getMumbleChannelDetails(channelId)?.name
+                }
+
+                targetInfo.text = if (channelName != null) {
+                    "📁 Aktueller Kanal: $channelName"
+                } else {
+                    "📁 Aktueller Kanal nicht verfügbar"
+                }
+
+                if (ownChannelId != null) {
+                    store.channel(ownChannelId)
+                } else {
+                    emptyList()
+                }
+            }
+
+            messagesContainer.removeAllViews()
+
+            if (entries.isEmpty()) {
+                messagesContainer.addView(label(
+                    "Noch keine Nachrichten vorhanden.",
+                    14f,
+                    muted
+                ))
+            } else {
+                entries.forEach { entry ->
+                    messagesContainer.addView(
+                        org.funkgateway.mobile.frn.FrnChatBubble.create(
+                            this@MainActivity,
+                            entry.asBubble()
+                        )
+                    )
+                }
+            }
+
+            messagesScroll.post {
+                if (currentPage == "MUMBLE_CHAT") {
+                    messagesScroll.fullScroll(
+                        android.view.View.FOCUS_DOWN
+                    )
+                }
+            }
+        }
+
+        val targetRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+
+        targetRow.addView(
+            button("📁 Kanal") {
+                serverChat = false
+                renderMessages()
+            },
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+
+        targetRow.addView(
+            button("🌐 Server") {
+                serverChat = true
+                renderMessages()
+            },
+            LinearLayout.LayoutParams(0, dp(48), 1f)
+        )
+
+        root.addView(targetRow)
+        root.addView(privateContactsContainer)
+
+        root.addView(
+            messagesScroll,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+
+        val messageInput = android.widget.EditText(this).apply {
+            hint = "Nachricht schreiben ..."
+            setSingleLine(false)
+            maxLines = 4
+            setTextColor(Color.WHITE)
+            setHintTextColor(muted)
+            inputType =
+                android.text.InputType.TYPE_CLASS_TEXT or
+                    android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+
+        inputRow.addView(
+            messageInput,
+            LinearLayout.LayoutParams(0, dp(56), 1f)
+        )
+
+        inputRow.addView(
+            button("➤ Senden") {
+                val text = messageInput.text.toString().trim()
+
+                if (text.isEmpty()) {
+                    messageInput.error = "Bitte Nachricht eingeben"
+                } else {
+                    val manager = mumbleManager
+                    val result = manager?.sendMumbleChatMessage(
+                        text,
+                        serverChat
+                    ) ?: "Keine Mumble-Verbindung"
+
+                    if (result == "Nachricht an Mumble übergeben") {
+                        val channelId =
+                            manager?.getOwnPosition()?.channelId
+
+                        store.add(
+                            org.funkgateway.mobile.mumble.MumbleChatStore.Entry(
+                                time = System.currentTimeMillis(),
+                                sender = "Du",
+                                senderSessionId = -1,
+                                text = text,
+                                scope = if (serverChat) {
+                                    org.funkgateway.mobile.mumble.MumbleChatStore.Scope.SERVER
+                                } else {
+                                    org.funkgateway.mobile.mumble.MumbleChatStore.Scope.CHANNEL
+                                },
+                                channelIds = if (!serverChat && channelId != null) {
+                                    listOf(channelId)
+                                } else {
+                                    emptyList()
+                                },
+                                treeIds = if (serverChat) listOf(0) else emptyList(),
+                                outgoing = true
+                            )
+                        )
+
+                        messageInput.text.clear()
+                        renderMessages()
+                    } else {
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            result,
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            },
+            LinearLayout.LayoutParams(
+                dp(112),
+                dp(56)
+            )
+        )
+
+        root.addView(inputRow)
+
+        root.addView(button("🔄 Nachrichten aktualisieren") {
+            renderMessages()
+        })
+
+        // Der zentrale Mumble-Callback ruft diese Funktion auf,
+        // solange die Chatseite angezeigt wird.
+        refreshMumbleChatUi = { renderMessages() }
+
+        showGatewayScreen(root)
+        renderMessages()
+    }
 
     private fun showMumbleAdmin() {
         currentPage = "MUMBLE_ADMIN"
@@ -6233,7 +7345,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showMumbleAcl() {
+    private fun showMumbleAcl(initialChannelId: Int? = null) {
         currentPage = "MUMBLE_ACL"
 
         val root = LinearLayout(this).apply {
@@ -6246,7 +7358,10 @@ class MainActivity : Activity() {
             "🔐 Mumble – Kanalrechte",
             18f, Color.WHITE, true
         ))
-        var selectedChannelId: Int? = null
+        val initialChannel =
+            initialChannelId?.let { mumbleManager?.getMumbleChannelDetails(it) }
+
+        var selectedChannelId: Int? = initialChannel?.id
         var latestAclSnapshot: MumbleAclManager.AclSnapshot? = null
         var aclDraft: MumbleAclDraft? = null
         var aclDraftConnectionGeneration: Long? = null
@@ -6292,7 +7407,9 @@ class MainActivity : Activity() {
 
 
         var aclChannelButton: android.widget.Button? = null
-        val channelButton = button("📁 Kanal auswählen ▾") {
+        val channelButton = button(
+            initialChannel?.let { "📁 ${it.name} ▾" } ?: "📁 Kanal auswählen ▾"
+        ) {
             val tree = mumbleManager?.getChannelTree()
 
             if (tree == null) {
@@ -6466,7 +7583,47 @@ class MainActivity : Activity() {
 
                 val summary = MumbleAclChangeSummary.summarize(draft)
 
+                val draftFingerprint = if (safety.validForReview) {
+                    latestAclSnapshot?.let { snapshot ->
+                        MumbleAclWriteGuard.fingerprint(draft, snapshot)
+                    }
+                } else {
+                    null
+                }
+
+                val writeReviewToken = if (
+                    safety.validForReview &&
+                    draftFingerprint != null &&
+                    generation != null &&
+                    selectedChannelId != null
+                ) {
+                    val receiveVersion =
+                        manager?.getMumbleAclReceiveVersion()
+
+                    if (receiveVersion != null && receiveVersion > 0L) {
+                        MumbleAclWriteGuard.Token(
+                            connectionGeneration = generation,
+                            channelId = draft.channelId,
+                            aclReceiveVersion = receiveVersion,
+                            draftFingerprint = draftFingerprint
+                        )
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
+
                 val details = buildString {
+                    appendLine(
+                        if (draftFingerprint != null) {
+                            "🔐 ACL-Entwurf technisch vorbereitet."
+                        } else {
+                            "⚠️ ACL-Entwurf nicht zur Übertragung vorbereitet."
+                        }
+                    )
+                    appendLine("Schreibfreigabe weiterhin gesperrt.")
+                    appendLine()
                     if (safety.validForReview) {
                         appendLine("✅ Lokale Sicherheitsprüfung bestanden.")
                         appendLine(
@@ -6602,7 +7759,161 @@ class MainActivity : Activity() {
                 android.app.AlertDialog.Builder(this)
                     .setTitle("🔐 ACL-Änderungen prüfen")
                     .setMessage(details)
-                    .setPositiveButton("Schließen", null)
+                    .setNegativeButton("Schließen", null)
+                    .setPositiveButton("Freigabe prüfen") { _, _ ->
+                        val currentManager = mumbleManager
+                        val currentDraft = aclDraft
+                        val currentSnapshot = latestAclSnapshot
+                        val currentFingerprint = if (
+                            currentDraft != null &&
+                            currentSnapshot != null
+                        ) {
+                            MumbleAclWriteGuard.fingerprint(
+                                currentDraft, currentSnapshot
+                            )
+                        } else null
+
+                        val currentSafety = if (currentDraft != null) {
+                            MumbleAclChangeSafety.check(
+                                MumbleAclChangeSafety.Context(
+                                    connected = currentManager?.isConnected() == true,
+                                    connectionGeneration =
+                                        currentManager?.getModerationConnectionGeneration()
+                                            ?: -1L,
+                                    expectedGeneration =
+                                        aclDraftConnectionGeneration ?: -2L,
+                                    selectedChannelId = selectedChannelId,
+                                    requestedChannelId = currentDraft.channelId,
+                                    serverSnapshot = currentSnapshot,
+                                    draft = currentDraft
+                                )
+                            )
+                        } else null
+
+                        val accepted =
+                            currentSafety?.validForReview == true &&
+                            writeReviewToken != null &&
+                            currentFingerprint != null &&
+                            MumbleAclWriteGuard.check(
+                                writeReviewToken,
+                                MumbleAclWriteGuard.Context(
+                                    connected = currentManager?.isConnected() == true,
+                                    connectionGeneration =
+                                        currentManager?.getModerationConnectionGeneration()
+                                            ?: -1L,
+                                    channelId = selectedChannelId ?: -1,
+                                    aclReceiveVersion =
+                                        currentManager?.getMumbleAclReceiveVersion()
+                                            ?: -1L,
+                                    draftFingerprint = currentFingerprint
+                                )
+                            )
+
+                        aclStatus.text = if (accepted) {
+                            val channelId = selectedChannelId
+                            val requested = channelId != null &&
+                                currentManager?.requestMumbleAclWritePermission(
+                                    channelId
+                                ) == true
+
+                            if (requested) {
+                                android.app.AlertDialog.Builder(this)
+                                    .setTitle("🔐 ACL-Freigabe bestätigen")
+                                    .setMessage(
+                                        "Die ACL-Schreibberechtigung wurde " +
+                                            "beim Server angefragt. Eine " +
+                                            "positive Antwort ist noch nicht " +
+                                            "nachgewiesen.\n\n" +
+                                            "ACHTUNG: Mit deiner Bestätigung " +
+                                            "können die Berechtigungen auf dem " +
+                                            "Mumble-Server tatsächlich geändert " +
+                                            "werden.\n\n" +
+                                            "Möchtest du den zuvor geprüften " +
+                                            "ACL-Entwurf einmalig an den Server " +
+                                            "übertragen?\n\n" +
+                                            "Die Übernahme gilt erst nach " +
+                                            "erfolgreicher Server-Nachkontrolle " +
+                                            "als bestätigt."
+                                    )
+                                    .setNegativeButton("Abbrechen", null)
+                                    .setPositiveButton("Freigabe bestätigen", null)
+                                    .create().also { dialog ->
+                                        dialog.setOnShowListener {
+                                            dialog.getButton(
+                                                android.app.AlertDialog.BUTTON_POSITIVE
+                                            ).setOnClickListener {
+                                                val confirmedManager = mumbleManager
+                                                val confirmedDraft = aclDraft
+                                                val confirmed = confirmedManager != null &&
+                                                    confirmedDraft != null &&
+                                                    writeReviewToken != null &&
+                                                    confirmedManager.authorizeMumbleAclWrite(
+                                                        writeReviewToken,
+                                                        confirmedDraft
+                                                    )
+
+                                                if (confirmed) {
+                                                    val approvedSnapshot = latestAclSnapshot
+                                                    val approvedToken = writeReviewToken
+
+                                                    val submitted =
+                                                        approvedSnapshot != null &&
+                                                        approvedToken != null &&
+                                                        confirmedManager != null &&
+                                                        confirmedDraft != null &&
+                                                        confirmedManager.submitMumbleAclChanges(
+                                                            confirmedDraft,
+                                                            approvedSnapshot,
+                                                            approvedToken
+                                                        )
+
+                                                    aclStatus.text = if (submitted) {
+                                                        "⏳ ACL-Schreibnachricht gesendet. " +
+                                                            "Server-Nachkontrolle läuft."
+                                                    } else {
+                                                        "⚠️ ACL-Schreibvorgang nicht bestätigt. " +
+                                                            "Eine Änderung könnte bereits beim " +
+                                                            "Server angekommen sein. " +
+                                                            "Bitte Serverzustand erneut abrufen " +
+                                                            "und nicht ungeprüft erneut schreiben."
+                                                    }
+
+                                                    dialog.dismiss()
+                                                } else {
+                                                    val message =
+                                                        "⏳ ACL-Freigabe noch nicht möglich.\n\n" +
+                                                            "Mögliche Ursachen:\n" +
+                                                            "• Serverberechtigung noch nicht eingetroffen\n" +
+                                                            "• Berechtigung abgelaufen oder verweigert\n" +
+                                                            "• Verbindung oder ACL-Entwurf verändert\n\n" +
+                                                            "Bitte gegebenenfalls abbrechen " +
+                                                            "und die Änderungen erneut prüfen."
+
+                                                    aclStatus.text =
+                                                        "⏳ ACL-Freigabe nicht möglich. " +
+                                                            "Bitte Hinweise im Dialog beachten."
+                                                    dialog.setMessage(message)
+                                                }
+                                            }
+                                        }
+                                        dialog.setOnDismissListener {
+                                            currentManager?.cancelMumbleAclWritePermission()
+                                        }
+                                        dialog.show()
+                                        styleMumbleDialog(dialog)
+                                    }
+
+                                "🔐 ACL-Berechtigung angefragt. " +
+                                    "Bitte abschließende Freigabe prüfen."
+                            } else {
+                                "⚠️ ACL-Prüfung bestanden, aber die " +
+                                    "Berechtigungsabfrage ist fehlgeschlagen."
+                            }
+                        } else {
+                            "⚠️ ACL-Zustand verändert oder ungültig. " +
+                            "Bitte Änderungen erneut prüfen."
+                        }
+                    }
                     .show().also { styleMumbleDialog(it) }
             }
         }
@@ -7572,19 +8883,85 @@ class MainActivity : Activity() {
 
 
 
-        mumbleManager?.onMumbleAclReceived = { snapshot ->
+        var displayedAclGeneration = -1L
+        var displayedAclChannelId = -1
+        var displayedAclVersion = -1L
+
+        mumbleManager?.onMumbleAclReceived = { received ->
+            val snapshot = received.snapshot
+            val aclMessageVersion = received.version
+            val aclMessageGeneration =
+                mumbleManager?.getModerationConnectionGeneration() ?: -1L
             runOnUiThread {
                 if (
                     currentPage == "MUMBLE_ACL" &&
-                    selectedChannelId == snapshot.channelId
+                    selectedChannelId == snapshot.channelId &&
+                    aclMessageGeneration >= 0L
                 ) {
-                    aclStatus.text =
-                        "✅ Kanal ${snapshot.channelId}: " +
-                        "${snapshot.groups.size} Gruppen, " +
-                        "${snapshot.rules.size} Berechtigungsregeln empfangen."
+                    val currentGeneration =
+                        mumbleManager?.getModerationConnectionGeneration()
+                    if (currentGeneration == aclMessageGeneration) {
+                        if (
+                            displayedAclGeneration != aclMessageGeneration ||
+                            displayedAclChannelId != snapshot.channelId
+                        ) {
+                            displayedAclGeneration = aclMessageGeneration
+                            displayedAclChannelId = snapshot.channelId
+                            displayedAclVersion = -1L
+                        }
+                        if (aclMessageVersion > displayedAclVersion) {
+                            displayedAclVersion = aclMessageVersion
+                    val writeVerification =
+                        mumbleManager?.getMumbleAclWriteVerificationState()
+                    val receivedVersion = aclMessageVersion
+                    val completedForThisResponse =
+                        writeVerification != null &&
+                        writeVerification.channelId == snapshot.channelId &&
+                        writeVerification.completedReceiveVersion > 0L &&
+                        writeVerification.completedReceiveVersion == receivedVersion
+
+                    aclStatus.text = when {
+                        writeVerification?.channelId == snapshot.channelId &&
+                            writeVerification.status ==
+                                MumbleAclWriteVerificationState.Status.READBACK_FAILED ->
+                            "⚠️ ACL-Änderung möglicherweise übertragen, " +
+                                "aber Rückleseanfrage fehlgeschlagen. " +
+                                "Serverübernahme nicht bestätigt. " +
+                                "Bitte Serverzustand neu abrufen und " +
+                                "nicht ungeprüft erneut schreiben."
+
+                        completedForThisResponse &&
+                            writeVerification?.status ==
+                                MumbleAclWriteVerificationState.Status.CONTENT_MATCHED ->
+                            "✅ ACL-Nachkontrolle erfolgreich: " +
+                                "Der zurückgelesene Serverzustand " +
+                                "entspricht den gewünschten Änderungen."
+
+                        completedForThisResponse &&
+                            writeVerification?.status ==
+                                MumbleAclWriteVerificationState.Status.CONTENT_MISMATCH ->
+                            "⚠️ ACL-Nachkontrolle fehlgeschlagen: " +
+                                "Der Serverzustand weicht vom Sollzustand ab."
+
+                        writeVerification?.channelId == snapshot.channelId &&
+                            writeVerification.status ==
+                                MumbleAclWriteVerificationState.Status.PENDING ->
+                            "⏳ ACL-Nachkontrolle läuft. " +
+                                "Serverantwort wird geprüft."
+
+                        else ->
+                            "✅ Kanal ${snapshot.channelId}: " +
+                                "${snapshot.groups.size} Gruppen, " +
+                                "${snapshot.rules.size} Berechtigungsregeln empfangen."
+                    }
                     latestAclSnapshot = snapshot
                     val existingDraft = aclDraft
                     if (
+                        (
+                            completedForThisResponse &&
+                            writeVerification?.status ==
+                                MumbleAclWriteVerificationState.Status.CONTENT_MATCHED
+                        ) ||
                         existingDraft == null ||
                         existingDraft.channelId != snapshot.channelId ||
                         !existingDraft.hasChanges()
@@ -7599,7 +8976,17 @@ class MainActivity : Activity() {
                                 snapshot
                             )
 
-                        aclStatus.text = if (unchanged) {
+                        val verificationHasPriority =
+                            writeVerification?.channelId == snapshot.channelId &&
+                            (
+                                writeVerification.status ==
+                                    MumbleAclWriteVerificationState.Status.PENDING ||
+                                writeVerification.status ==
+                                    MumbleAclWriteVerificationState.Status.READBACK_FAILED ||
+                                completedForThisResponse
+                            )
+
+                        if (!verificationHasPriority) aclStatus.text = if (unchanged) {
                             "ℹ️ Empfangene ACL-Daten stimmen mit dem " +
                             "ursprünglichen Stand überein. " +
                             "Lokale Änderungen bleiben erhalten. " +
@@ -7614,6 +9001,31 @@ class MainActivity : Activity() {
                     renderAclGroups(snapshot)
                     renderAclRights(snapshot)
                     renderAclInfo(snapshot)
+                        }
+                    }
+                }
+            }
+        }
+
+        mumbleManager?.onMumbleAclWriteVerificationTimeout = { verificationId ->
+            runOnUiThread {
+                val verification =
+                    mumbleManager?.getMumbleAclWriteVerificationState()
+
+                if (
+                    currentPage == "MUMBLE_ACL" &&
+                    verification != null &&
+                    verification.verificationId == verificationId &&
+                    verification.channelId == selectedChannelId &&
+                    verification.status ==
+                        MumbleAclWriteVerificationState.Status.TIMED_OUT
+                ) {
+                    aclStatus.text =
+                        "⚠️ ACL-Übernahme nicht bestätigt: " +
+                        "Innerhalb von 15 Sekunden wurde keine passende " +
+                        "Serverantwort beobachtet. Bitte den tatsächlichen " +
+                        "Serverzustand erneut abrufen, bevor weitere " +
+                        "Änderungen vorgenommen werden."
                 }
             }
         }
@@ -7717,6 +9129,13 @@ class MainActivity : Activity() {
         }
 
         showGatewayScreen(page)
+
+        // Bei Aufruf aus dem Kanal-Kontextmenü die vorhandene
+        // ACL-Abfrage für den vorausgewählten Kanal verwenden.
+        if (initialChannel != null) {
+            selectedChannel.text = initialChannel.name
+            aclRefreshButton.performClick()
+        }
     }
 
     private fun showMumbleBanList() {
@@ -10226,7 +11645,7 @@ class MainActivity : Activity() {
             frame.addView(subTabs)
         }
 
-        if (currentPage in listOf("Mumble", "MUMBLE_ROOMS", "MUMBLE_REGISTERED_USERS", "MUMBLE_CERTIFICATES", "MUMBLE_ADMIN",
+        if (currentPage in listOf("Mumble", "MUMBLE_ROOMS", "MUMBLE_REGISTERED_USERS", "MUMBLE_CERTIFICATES", "MUMBLE_CHAT", "MUMBLE_ADMIN",
             "MUMBLE_BAN_LIST", "MUMBLE_ACL")) {
             val subTabs = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -10236,16 +11655,32 @@ class MainActivity : Activity() {
             val sections = listOf(
                 "Verbindung" to "Mumble",
                 "Räume & Nutzer" to "MUMBLE_ROOMS",
+                "💬 Chat" to "MUMBLE_CHAT",
                 "🔐 Zertifikate" to "MUMBLE_CERTIFICATES",
                 "🛡️ Admin" to "MUMBLE_ADMIN"
             )
 
             sections.forEach { (title, page) ->
-                val tab = button(title) {
+                val unreadMumbleMessages =
+                    if (page == "MUMBLE_CHAT") {
+                        mumbleUnreadPrivateChats.values.sum()
+                    } else {
+                        0
+                    }
+
+                val tabTitle =
+                    if (unreadMumbleMessages > 0) {
+                        "$title ($unreadMumbleMessages)"
+                    } else {
+                        title
+                    }
+
+                val tab = button(tabTitle) {
                     when (page) {
                         "Mumble" -> showMumble()
                         "MUMBLE_ROOMS" -> showMumbleRooms()
                         "MUMBLE_CERTIFICATES" -> showMumbleCertificates()
+                        "MUMBLE_CHAT" -> showMumbleChat()
                         "MUMBLE_ADMIN" -> showMumbleAdmin()
                     }
                 }.apply {
@@ -10253,6 +11688,10 @@ class MainActivity : Activity() {
                     setPadding(dp(14), 0, dp(14), 0)
                     isSingleLine = true
                     if (currentPage == page) setTextColor(accent)
+                }
+
+                if (page == "MUMBLE_CHAT") {
+                    mumbleChatTabButton = tab
                 }
 
                 subTabs.addView(

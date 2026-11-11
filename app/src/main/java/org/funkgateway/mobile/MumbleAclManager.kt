@@ -66,7 +66,7 @@ class MumbleAclManager {
         }
     }
 
-    var onAclReceived: ((AclSnapshot) -> Unit)? = null
+    var onAclReceived: ((VersionedAclSnapshot) -> Unit)? = null
 
     // Originale Berechtigungsnachricht des Mumble-Servers.
     var onPermissionQueryReceived: ((Mumble.PermissionQuery) -> Unit)? = null
@@ -91,6 +91,17 @@ class MumbleAclManager {
     // Keine Bestätigung einer bestimmten Serveranfrage.
     private var aclReceiveVersion = 0L
 
+    data class VersionedAclSnapshot(
+        val version: Long,
+        val snapshot: AclSnapshot
+    )
+
+    private val latestAclSnapshots =
+        mutableMapOf<Int, VersionedAclSnapshot>()
+
+    fun getLatestAclSnapshot(channelId: Int): VersionedAclSnapshot? =
+        synchronized(aclLock) { latestAclSnapshots[channelId] }
+
     fun getAclReceiveVersion(): Long =
         synchronized(aclLock) { aclReceiveVersion }
 
@@ -105,6 +116,7 @@ class MumbleAclManager {
         val generation = synchronized(aclLock) {
             connection = newConnection
             aclReceiveVersion = 0L
+            latestAclSnapshots.clear()
             connectionGeneration
         }
 
@@ -116,6 +128,13 @@ class MumbleAclManager {
                 }
 
             override fun messagePermissionQuery(message: Mumble.PermissionQuery) {
+                Log.i(
+                    "FGW-Mumble-ACL",
+                    "PermissionQuery empfangen: " +
+                        "Kanal=${if (message.hasChannelId()) message.channelId else "fehlt"}, " +
+                        "Maske=${if (message.hasPermissions()) message.permissions else "fehlt"}, " +
+                        "Flush=${message.hasFlush() && message.flush}"
+                )
                 val callback = synchronized(aclLock) {
                     if (connection === newConnection &&
                         connectionGeneration == generation
@@ -148,11 +167,15 @@ class MumbleAclManager {
                         "${snapshot.rules.size} Regeln"
                 )
 
-                val callback = synchronized(aclLock) {
+                val result = synchronized(aclLock) {
                     if (connection === newConnection &&
                         connectionGeneration == generation
                     ) {
                         ++aclReceiveVersion
+                        val received = VersionedAclSnapshot(
+                            aclReceiveVersion, snapshot
+                        )
+                        latestAclSnapshots[snapshot.channelId] = received
                         if (requestState.observe(snapshot.channelId)) {
                             timeoutTask?.let {
                                 timeoutHandler.removeCallbacks(it)
@@ -164,10 +187,10 @@ class MumbleAclManager {
                                     "Kanal ${snapshot.channelId}"
                             )
                         }
-                        onAclReceived
+                        Pair(onAclReceived, received)
                     } else null
                 }
-                callback?.invoke(snapshot)
+                result?.first?.invoke(result.second)
             }
         }
 
@@ -182,6 +205,7 @@ class MumbleAclManager {
             connection = null
             listener = null
             aclReceiveVersion = 0L
+            latestAclSnapshots.clear()
             timeoutTask?.let { timeoutHandler.removeCallbacks(it) }
             timeoutTask = null
             requestState.reset()
@@ -190,6 +214,50 @@ class MumbleAclManager {
 
         if (oldListener != null) {
             oldConnection?.removeTCPMessageHandler(oldListener)
+        }
+    }
+
+    /**
+     * Technischer ACL-Schreibtransport.
+     *
+     * Darf ausschließlich nach zentraler Sicherheitsprüfung
+     * und ausdrücklicher Benutzerbestätigung aufgerufen werden.
+     * Ein erfolgreicher Versand bestätigt keine Serverübernahme.
+     */
+    internal fun sendPreparedAclWrite(
+        message: Mumble.ACL,
+        expectedConnection: HumlaConnection
+    ): Boolean {
+        if (!message.hasChannelId() ||
+            message.channelId < 0 ||
+            !message.hasQuery() ||
+            message.query
+        ) return false
+
+        val prepared = synchronized(aclLock) {
+            val active = connection?.takeIf {
+                it === expectedConnection && it.isSynchronized
+            } ?: return false
+            Pair(active, connectionGeneration)
+        }
+
+        val (active, generation) = prepared
+
+        return try {
+            synchronized(aclLock) {
+                if (connection !== active ||
+                    active !== expectedConnection ||
+                    connectionGeneration != generation ||
+                    !active.isSynchronized
+                ) {
+                    return false
+                }
+                active.sendTCPMessage(message, HumlaTCPMessageType.ACL)
+            }
+            true
+        } catch (e: Exception) {
+            Log.e("FGW-Mumble-ACL", "ACL-Übertragung fehlgeschlagen", e)
+            false
         }
     }
 

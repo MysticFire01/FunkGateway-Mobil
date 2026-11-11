@@ -78,6 +78,31 @@ class MumbleAclPreparationTest {
     }
 
     @Test
+    fun writePreparationRejectsDifferentChannel() {
+        val original = snapshot(channelId = 1)
+        val draft = MumbleAclDraft(original)
+        draft.setInheritance(false)
+
+        assertTrue(
+            MumbleAclPreparation.canPrepareChanges(draft, original)
+        )
+
+        assertFalse(
+            MumbleAclPreparation.canPrepareChanges(
+                draft,
+                snapshot(channelId = 2)
+            )
+        )
+
+        assertNull(
+            MumbleAclPreparation.prepareWriteMessage(
+                draft,
+                snapshot(channelId = 2)
+            )
+        )
+    }
+
+    @Test
     fun inheritedGroupsAreExcluded() {
         val inherited = Mumble.ACL.ChanGroup.newBuilder()
             .setName("admin")

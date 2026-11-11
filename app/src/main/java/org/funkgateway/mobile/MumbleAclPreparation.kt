@@ -77,7 +77,10 @@ object MumbleAclPreparation {
         draft: MumbleAclDraft,
         current: MumbleAclManager.AclSnapshot
     ): Boolean {
-        return draft.hasChanges() &&
+        return draft.channelId >= 0 &&
+            draft.channelId == current.channelId &&
+            draft.original.channelId == current.channelId &&
+            draft.hasChanges() &&
             isServerStateUnchanged(draft.original, current)
     }
 
