@@ -92,6 +92,27 @@ class MumbleAclDraft(
         inheritAcls = enabled
     }
 
+    /**
+     * Legt eine neue ACL-Gruppe ausschließlich im lokalen Entwurf an.
+     * Der Server wird erst über die bestehende ACL-Schreibfunktion geändert.
+     */
+    fun addGroup(name: String): Boolean {
+        val normalizedName = name.trim()
+
+        if (normalizedName.isEmpty()) return false
+        if (groups.any { it.name == normalizedName }) return false
+
+        val group = Mumble.ACL.ChanGroup.newBuilder()
+            .setName(normalizedName)
+            .setInherited(false)
+            .setInherit(false)
+            .setInheritable(true)
+            .build()
+
+        groups.add(group)
+        return true
+    }
+
     fun updateGroup(
         index: Int,
         group: Mumble.ACL.ChanGroup
@@ -101,6 +122,19 @@ class MumbleAclDraft(
         if (group.inherited) return false
 
         groups[index] = group
+        return true
+    }
+
+    /**
+     * Entfernt eine lokale ACL-Gruppe aus dem Entwurf.
+     * Geerbte Gruppen dürfen nicht gelöscht werden.
+     * Der Server bleibt bis zur bestätigten ACL-Übertragung unverändert.
+     */
+    fun removeGroup(index: Int): Boolean {
+        if (index !in groups.indices) return false
+        if (groups[index].inherited) return false
+
+        groups.removeAt(index)
         return true
     }
 

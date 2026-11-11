@@ -8358,13 +8358,6 @@ class MainActivity : Activity() {
                 14f, muted
             ))
 
-            if (snapshot.groups.isEmpty()) {
-                groupContainer.addView(label(
-                    "Keine Gruppen vom Server geliefert.",
-                    14f, muted
-                ))
-            }
-
             fun members(values: List<Int>): String =
                 if (values.isEmpty()) "Keine"
                 else values.joinToString("\n") { userId ->
@@ -8379,10 +8372,77 @@ class MainActivity : Activity() {
                 aclDraft?.takeIf { it.channelId == snapshot.channelId }
                     ?.getGroups() ?: snapshot.groups
 
+            groupContainer.addView(
+                button("➕ Neue Gruppe") {
+                    val nameInput = android.widget.EditText(this).apply {
+                        hint = "Name der neuen ACL-Gruppe"
+                        setSingleLine(true)
+                        setTextColor(Color.WHITE)
+                        setHintTextColor(muted)
+                        setPadding(dp(16), dp(12), dp(16), dp(12))
+                    }
+
+                    val dialog = android.app.AlertDialog.Builder(this)
+                        .setTitle("Neue Mumble-ACL-Gruppe")
+                        .setMessage(
+                            "Die Gruppe wird zunächst nur lokal angelegt. " +
+                            "Zum Speichern auf dem Server anschließend " +
+                            "die ACL-Änderungen bestätigen."
+                        )
+                        .setView(nameInput)
+                        .setNegativeButton("Abbrechen", null)
+                        .setPositiveButton("Gruppe anlegen", null)
+                        .create()
+
+                    dialog.setOnShowListener {
+                        styleMumbleDialog(dialog)
+                        dialog.getButton(
+                            android.app.AlertDialog.BUTTON_POSITIVE
+                        )?.setOnClickListener {
+                            val draft = aclDraft
+                            if (
+                                currentPage != "MUMBLE_ACL" ||
+                                selectedChannelId != snapshot.channelId ||
+                                draft == null ||
+                                draft.channelId != snapshot.channelId
+                            ) {
+                                nameInput.error = "ACL-Entwurf nicht mehr gültig"
+                            } else if (!draft.addGroup(nameInput.text.toString())) {
+                                nameInput.error =
+                                    "Name leer oder Gruppe bereits vorhanden"
+                            } else {
+                                dialog.dismiss()
+                                renderAclGroups(snapshot)
+                                aclStatus.text =
+                                    "✏️ Neue ACL-Gruppe lokal angelegt. " +
+                                    "Noch nicht auf dem Server gespeichert."
+                            }
+                        }
+                    }
+
+                    dialog.show()
+                },
+                LinearLayout.LayoutParams(-1, dp(48)).apply {
+                    topMargin = dp(12)
+                    bottomMargin = dp(8)
+                }
+            )
+
+            if (displayedGroups.isEmpty()) {
+                groupContainer.addView(label(
+                    "Noch keine ACL-Gruppen vorhanden.",
+                    14f, muted
+                ))
+            }
+
             displayedGroups.forEachIndexed { groupIndex, group ->
-                val originalGroup = snapshot.groups.getOrNull(groupIndex)
+                val originalGroup = snapshot.groups
+                    .firstOrNull {
+                        it.name == group.name &&
+                            it.inherited == group.inherited
+                    }
                 val locallyChanged =
-                    originalGroup != null && originalGroup != group
+                    originalGroup == null || originalGroup != group
 
                 val directCount = group.addList.size
                 val inheritedCount = group.inheritedMembersList.size
@@ -8464,16 +8524,7 @@ class MainActivity : Activity() {
                                 ?.getAclRegisteredUsers()
                                 .orEmpty()
 
-                            if (users.isEmpty()) {
-                                android.app.AlertDialog.Builder(this)
-                                    .setTitle("Keine Benutzerliste")
-                                    .setMessage(
-                                        "Der Server hat noch keine Liste " +
-                                        "registrierter Benutzer geliefert."
-                                    )
-                                    .setPositiveButton("OK", null)
-                                    .show().also { styleMumbleDialog(it) }
-                            } else {
+                            run {
                                 val original = group.addList.toSet()
                                 val selected = original.toMutableSet()
 
@@ -8853,6 +8904,44 @@ class MainActivity : Activity() {
                             addView(details)
                         })
                         .setPositiveButton("Schließen", null)
+                        .apply {
+                            if (!group.inherited) {
+                                setNegativeButton("🗑️ Gruppe löschen") { _, _ ->
+                                    android.app.AlertDialog.Builder(this@MainActivity)
+                                        .setTitle("ACL-Gruppe löschen?")
+                                        .setMessage(
+                                            "Die Gruppe '${group.name}' wird zunächst " +
+                                            "nur aus dem lokalen ACL-Entwurf entfernt. " +
+                                            "Erst nach ausdrücklicher ACL-Schreibfreigabe " +
+                                            "wird sie auf dem Mumble-Server gelöscht."
+                                        )
+                                        .setNegativeButton("Abbrechen", null)
+                                        .setPositiveButton("Lokal löschen") { _, _ ->
+                                            val draft = aclDraft
+                                            if (
+                                                currentPage == "MUMBLE_ACL" &&
+                                                selectedChannelId == snapshot.channelId &&
+                                                draft != null &&
+                                                draft.channelId == snapshot.channelId &&
+                                                draft.getGroups().getOrNull(groupIndex) == group &&
+                                                draft.removeGroup(groupIndex)
+                                            ) {
+                                                renderAclGroups(snapshot)
+                                                aclStatus.text =
+                                                    "✏️ ACL-Gruppe lokal entfernt. " +
+                                                    "Noch nicht auf dem Server gespeichert."
+                                            } else {
+                                                android.widget.Toast.makeText(
+                                                    this@MainActivity,
+                                                    "ACL-Entwurf nicht mehr gültig.",
+                                                    android.widget.Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                        }
+                                        .show().also { styleMumbleDialog(it) }
+                                }
+                            }
+                        }
                         .create()
 
                     dialog.setOnShowListener {

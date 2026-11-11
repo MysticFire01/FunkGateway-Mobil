@@ -22,8 +22,8 @@ android {
         applicationId = "org.funkgateway.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1030
-        versionName = "0.1.30"
+        versionCode = 1031
+        versionName = "0.1.31"
     }
 
     compileOptions {
